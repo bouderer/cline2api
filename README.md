@@ -28,8 +28,8 @@
 | WorkOS Client ID | `client_01K3A541FN8TA3EPPHTD2325AR` | 官方生产环境配置 |
 | 必需请求头 | `X-CLIENT-VERSION` / `X-CORE-VERSION` / `X-CLIENT-TYPE` / `X-IS-MULTIROOT` / `HTTP-Referer` / `X-Title` / `X-Task-ID` | `request-headers.ts` |
 
-> 两个常见误区已被证伪：
-> 1. **不需要** `cline-pass/` 前缀，模型 ID 直接使用目录里的值（如 `anthropic/claude-sonnet-4.6`）。
+> 两个容易踩的点：
+> 1. **两套模型 ID 并存**。`anthropic/claude-sonnet-4.6` 这类走 **Cline Credits** 计费；订阅（Cline Pass）只覆盖 `cline-pass/*` 前缀的那批 ID（`cline-pass/kimi-k3`、`cline-pass/glm-5.3` …）。用只有订阅、没有 Credits 的账号调不带前缀的名字会报 `Insufficient balance`。本网关把两套目录合并进 `/v1/models`，并用 `/admin/api/models` 的 `bucket` 字段标明每个模型走哪条计费（见第五节）。
 > 2. **不存在** `{success,data}` 外层包裹；那种解包只对 OpenRouter 的 `/images` 生效。本网关仍对非流式响应做一次防御性解包，以防上游将来变更。
 
 ---
@@ -120,9 +120,14 @@ for chunk in stream:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-export ANTHROPIC_API_KEY=sk-your-key
-# 注意：不要带 /v1，客户端会自己拼 /v1/messages
+export ANTHROPIC_AUTH_TOKEN=sk-your-key
+# 注意 1：不要带 /v1 后缀，客户端会自己拼 /v1/messages
+# 注意 2：AUTH_TOKEN 与 API_KEY 都能用——网关同时接受
+#         `Authorization: Bearer` 和 `x-api-key` 两种头
 ```
+
+模型名建议直接用 `cline-pass/*`（订阅覆盖，不吃 Credits），例如
+`cline-pass/kimi-k3`、`cline-pass/glm-5.3`。
 
 ### Cursor / NextChat / Cherry Studio
 
@@ -136,12 +141,12 @@ export ANTHROPIC_API_KEY=sk-your-key
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/models` | 上游实时模型目录（OpenAI 格式） |
+| GET | `/v1/models` | 上游实时模型目录（OpenAI 格式）。合并两个来源：`/api/v1/models`（计费模型）+ `/api/v1/ai/cline/recommended-models` 的 `free` / `clinePass` 桶（订阅与免费模型），按 ID 去重；计费桶信息只在 `/admin/api/models` 暴露，不污染 OpenAI 结构 |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions，支持 `stream` |
 | POST | `/v1/messages` | Anthropic Messages，支持 `stream`（含 tool_use / thinking） |
 | GET | `/healthz` | 存活探针 |
 | GET | `/` | 管理台（默认仅本机可访问） |
-| GET | `/admin/api/*` | 管理接口（登录编排、账号列表） |
+| GET | `/admin/api/*` | 管理接口（登录编排、账号、模型分桶、订阅、请求日志、试聊） |
 
 透传保留的上游特性：`reasoning_content`（DeepSeek/GLM 思考过程）、`cache_control`、工具调用。
 
@@ -225,7 +230,7 @@ tests/                   单元 + 集成测试（含 mock 上游）
 ## 十、测试
 
 ```bash
-npm test        # 31 项：单元 + 集成
+npm test        # 38 项：单元 + 集成
 npm run typecheck
 ```
 
@@ -243,6 +248,9 @@ npm run typecheck
 | 有响应但无打字机效果 | 前面的 nginx 没关 `proxy_buffering` |
 | 账号显示「需重新登录」 | refresh token 被撤销/过期，属于正常失效，重新登录即可 |
 | 模型名 404 | 用 `/v1/models` 返回的 ID，不要自己拼前缀 |
+| 调用返回 `empty response content` | 上游推理型模型在小 `max_tokens` 下把预算烧在思考上，正文为空。实测 `max_tokens: 16` 时 `cline-pass/glm-5.3`、`kimi-k3`、`deepseek-*`、`muse-spark` 都会这样，`qwen3.7-plus`、`minimax-m3`、`solar-pro4` 不会。调大 `max_tokens`（≥256）即可；关思考的开关（`reasoning_effort` / `thinking` / `enable_thinking`）实测都无效 |
+| new-api 渠道「测试」失败但实际能用 | new-api 的渠道测试固定发 `max_tokens: 16`，撞上上一条。把渠道的「测试模型」设成 `cline-pass/minimax-m3` 这类不吃预算的模型即可 |
+| new-api「获取模型列表」报 advanced custom 相关错误 | 渠道类型被设成了「高级自定义」（该分叉里 type=58）。这种类型必须自己配 `/v1/models` 路由，普通 OpenAI 兼容渠道用 type=1 就行 |
 
 ---
 
@@ -251,4 +259,161 @@ npm run typecheck
 - 本项目只做**协议转换与凭证托管**，不修改、不绕过上游任何验证；登录始终由账号本人在官方页面确认。
 - 使用前请确认符合 Cline 的服务条款；账号风险由使用者自行承担。
 - 建议只登录你本人有权使用的账号，并为 `data/` 目录做好权限与备份管理。
+
+---
+
+## 十三、管理台
+
+`http://127.0.0.1:8787/?token=<ADMIN_TOKEN>`（未设 `ADMIN_TOKEN` 时仅本机可访问）。
+左侧栏五个视图，地址栏带 hash（如 `#models`）可直接分享到某一页：
+
+| 视图 | 内容 |
+|---|---|
+| 概览 | 账号 / 模型统计磁贴、**账号配额**（`GET /admin/api/usage`：每个账号一行，5 小时 / 周 / 月三条进度条 + 重置时间）、OpenAI 与 Claude Code 接入片段（一键复制）、最近请求 |
+| 模型 | 全量目录，分桶筛选芯片 + 搜索，每条可复制 ID 或**就地测活**（显示可用/失败与耗时） |
+| 试聊 | 选模型 → SSE 流式对话（气泡视图、首字耗时、tokens/cost），走 `/admin/api/chat`；Ctrl/⌘+Enter 发送 |
+| 账号 | 设备码登录（二维码 + 链接 + 设备码）、账号列表、删除 |
+| 日志 | 最近 200 条请求（模型、状态、耗时、账号、错误），按成功/失败筛选，可 5 秒自动刷新；仅内存，重启清空 |
+
+令牌两种传法：URL 带 `?token=`（会存进本浏览器 localStorage，下次直接开），或首次打开时在页面上粘贴一次。
+
+对应管理接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/api/models` | 目录 + `bucket`（`pass` / `free` / `credits`）与三项计数 |
+| GET | `/admin/api/usage` | **每个账号**的套餐 + 5 小时 / 周 / 月 三个窗口的用量百分比与重置时间（每账号 60 秒缓存） |
+| GET | `/admin/api/subscription` | 首个可用账号的套餐状态（名称/周期/是否生效/到期日） |
+| GET | `/admin/api/requests?limit=100` | 最近请求 + 统计 |
+| POST | `/admin/api/chat` | 与 `/v1/chat/completions` 同一条链路，用管理令牌鉴权 |
+
+### 免费模型
+
+上游 `GET /api/v1/ai/cline/recommended-models` 的 `free` 桶（Cline 客户端「Free」页签渲染的就是它，
+不消耗 Cline Credits，也不占订阅额度）当前是这 6 个：
+
+```
+cline-free/deepseek-v4.1-flash        cline-free/muse-spark-1.3-contributor
+cline-free/solar-pro4                 z-ai/glm-5.3-flash
+stealth/union-alpha                   poolside/laguna-s-2.1:free
+```
+
+注意两点：
+
+1. **免费桶不都叫 `cline-free/` 前缀**。`z-ai/glm-5.3-flash`、`stealth/union-alpha`、
+   `poolside/laguna-s-2.1:free` 同时也在计价目录 `/api/v1/models` 里，靠名字猜会误判成要 Credits。
+   所以网关把**目录声明的桶**一路带下来（`/admin/api/models` 的 `bucket` 字段），不做启发式判断。
+2. 计价目录里另有约 20 个带 `:free` 后缀的模型（如 `google/gemma-4-31b-it:free`）——那是 OpenRouter
+   的免费档，**不在** Cline 的 free 桶里，网关按 Credits 归类，别混为一谈。
+
+实测（余额为负 `-$0.02` 的账号）：上面 6 个照常返回，且调用前后 `insufficient_credits` 错误里回显的
+`current_balance` / `total_spent` 完全没变。响应里的 `usage.cost` 是上游 provider 成本透传，不向本账号计费。
+
+> 免费桶与订阅桶常是**同一模型的两种 ID**（`cline-free/deepseek-v4.1-flash` 与
+> `cline-pass/deepseek-v4.1-flash`）。免费 ID 走共享池、易 429；要稳定就用订阅 ID。
+
+### 多账号与混合账号池
+
+管理台每点一次「登录新账号」就追加一个账号（同一账号重复登录只更新不重复）。请求按
+`AccountPool.candidates()` 轮询，401/403 静默续期并重放，仍失败则切换下一个账号。
+每个账号都必须由账号本人在官方页面确认一次，仓库不含批量开户。
+
+**账号能力并不一致**：一个号有 Cline Credits、另一个只有 Cline Pass 时，
+`anthropic/claude-*` 这类计费模型在前者成功、在后者返回 `insufficient_credits`。网关对此做了两件事：
+
+1. **计费类失败会转移**：上游返回 402（或错误体含 `insufficient_credits`）时，不把错误抛给客户端，
+   而是换下一个账号重试，全部失败才回报。
+2. **按「账号 + 模型」冷却 90 秒**：失败过的组合排到候选队列末尾，后续同类请求直接走能付钱的账号，
+   不会每次都在坏账号上白撞一次。
+
+### 混合账号池的失败转移规则（重要）
+
+账号池里各账号能力不同，所以「上游报错」要分两类看：
+
+| 类别 | 例子 | 处理 |
+|---|---|---|
+| **账号级**（换号可能成功） | `insufficient_credits`（没 Credits）、`INFERENCE_CAP_ERROR`、`Daily free limit reached` | 记入「账号+模型」冷却 90 秒，**自动换下一个账号重试** |
+| 请求级 / 供应商级 | 参数错误、共享池 429、上游 5xx | 直接返回，不换号（换号只是白等） |
+
+关键点：**免费桶的日限是按账号算的**。同一个免费模型如果池里每个账号当天都用过，轮询也救不了 ——
+这时要么等日限重置（错误里会带 `Try again in Xh`），要么改用 `cline-pass/*` 订阅版。
+
+### 上下文长度与 `max_tokens`
+
+上游目录（`/api/v1/models`、`recommended-models`）**不发布上下文长度**，new-api 的定价数据里也没有这些模型。实测（`cline-pass/kimi-k3`，用重复填充文本逐档加压，读返回里的 `prompt_tokens` 为准）：
+
+| 输入规模 | 结果 |
+|---|---|
+| 4,538 tok | OK |
+| 22,316 tok | OK |
+| 66,760 tok | OK |
+| 133,428 tok | OK |
+| 266,762 tok | OK |
+| **444,541 tok** | **OK** |
+
+即**至少 44 万 tokens 的输入可以正常处理**（读返回里的 `prompt_tokens` 为准），实际窗口大概率是 512k 或 1M。上游两个目录都不发布这个数字，所以只能实测；继续往上加压每次都要吃掉可观的订阅额度，就没再往上探了。
+
+**注意网关的上游超时**：`REQUEST_TIMEOUT_MS` 默认 30 秒，几万 tokens 的请求可能超过它而被中断（表现为连接被直接关闭，没有错误体）。需要长上下文时把它调大，例如 `REQUEST_TIMEOUT_MS=180000`。
+
+### new-api 接入配置（本机现网）
+
+两个渠道都指向本网关，各自暴露不同的模型集合：
+
+| 渠道 | 名称 | 类型 | 分组 | 模型 |
+|---|---|---|---|---|
+| 54 | `cline2api` | 高级自定义 (58) | `vip` | 22 个真名（16 × `cline-pass/*` + 6 × 免费桶原名） |
+| 55 | `cline2api_free` | 高级自定义 (58) | `vip,default` | 6 个短别名，靠 `model_mapping` 映射到免费桶真名 |
+
+两种渠道类型都试过，结论是**高级自定义 (58) 才是对的**，因为它能用 `advanced_routes` 显式声明三种协议：
+
+```json
+{"advanced_custom": {"advanced_routes": [
+  {"incoming_path": "/v1/chat/completions", "upstream_path": "/v1/chat/completions", "converter": "none",
+   "auth": {"type": "header", "name": "Authorization", "value": "Bearer {api_key}"}},
+  {"incoming_path": "/v1/responses", "upstream_path": "/v1/chat/completions",
+   "converter": "openai_responses_to_openai_chat_completions", "auth": {"...": "同上"}},
+  {"incoming_path": "/v1/messages", "upstream_path": "/v1/messages", "converter": "none", "auth": {"...": "同上"}},
+  {"incoming_path": "/v1/models", "upstream_path": "/v1/models", "converter": "none", "auth": {"...": "同上"}}
+]}}
+```
+
+要点：
+
+- 少了 `/v1/models` 这条路由，「获取模型列表」按钮会报 `advanced custom channel does not configure a /v1/models route`。
+- 少了 `/v1/messages` 这条路由，Claude Code / Anthropic SDK 走不通。
+- `/v1/responses` 用 `openai_responses_to_openai_chat_completions` 转换器，让 new-api 把 Responses 请求降级成 chat completions 打到本网关（本网关原生只讲 chat + messages）。
+- 路由里的 `auth` 必须显式写 `Bearer {api_key}`，否则 new-api 不一定带上渠道密钥。
+- 配好后 `GET /v1/models` 会给这些模型标注 `supported_endpoint_types: ["openai","openai-response","anthropic"]`（有 1 分钟定价缓存，改完稍等再刷）。
+- **别把渠道类型从「高级自定义」改回「OpenAI 兼容」**：换了类型 `advanced_routes` 直接失效，`/v1/responses` 会 404 `Unknown route`。
+- 渠道「测试」按钮固定发 `max_tokens: 16`，对推理型模型会返回空内容而判失败 —— 把渠道的「测试模型」设成 `cline-pass/minimax-m3` / `solar-pro4` 这类不吃预算的模型即可（见排障表）。
+
+### 反向代理部署（本机现网配置）
+
+本机服务跑在 Caddy（systemd，`/etc/caddy/Caddyfile`）后面，站点 `cline.tryanotherone.com`：
+
+```caddy
+cline.tryanotherone.com {
+	tls internal          # Cloudflare 橙云回源，自签即可（CF 侧 SSL 模式设为 Full）
+
+	@stream path /v1/* /admin/api/chat
+	handle @stream {
+		reverse_proxy 127.0.0.1:8787 {
+			flush_interval -1     # SSE 必须写入即 flush
+		}
+	}
+	handle {
+		encode gzip zstd
+		reverse_proxy 127.0.0.1:8787
+	}
+}
+```
+
+要点：
+
+- `flush_interval -1` 是流式的关键：不关掉写入缓冲，打字机效果会消失、长响应可能被缓冲到超时。
+- 流式路径不进 `encode`，避免压缩干扰分块传输。
+- 橙云 + `tls internal` + CF 侧 **Full** 即可，不需要 Let's Encrypt；想上 Full (strict) 就换成
+  CF 签发的 Origin Certificate，并把 `tls internal` 改成 `tls <cert> <key>`。
+- 别把 CF 设成 Flexible：那时 CF 走源站 80 端口，Caddy 会 301 到 https，形成重定向循环。
+- CF 代理下单个请求约 100 秒无数据会 524；正常 SSE 持续有输出不受影响。
 

@@ -11,7 +11,7 @@ import type { Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import { isAuthorized } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
-import { SSE_HEADERS, openaiError } from "./http.js";
+import { SSE_HEADERS, openaiError, sanitizeOpenAIMessages } from "./http.js";
 
 interface TextBlock { type: "text"; text: string }
 interface ImageBlock {
@@ -460,6 +460,9 @@ export function registerAnthropicRoutes(app: Hono, deps: OpenAIRouteDeps): void 
     }
 
     const openaiBody = anthropicToOpenAI(body);
+    // Empty tool results (or turns reduced to zero text) must be filled before
+    // forwarding; see sanitizeOpenAIMessages in http.ts.
+    openaiBody.messages = sanitizeOpenAIMessages(openaiBody.messages);
     const wantsStream = body.stream === true;
 
     const outcome = await callUpstreamWithFailover(deps, openaiBody, {

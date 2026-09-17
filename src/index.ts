@@ -16,6 +16,7 @@ import { loadConfig, type AppConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { AccountStore } from "./store.js";
 import { AccountPool } from "./services/accountPool.js";
+import { RequestLog } from "./services/requestLog.js";
 import { TokenManager } from "./cline/tokenManager.js";
 import { ModelCatalog } from "./cline/models.js";
 import { LoginService } from "./services/loginService.js";
@@ -31,8 +32,9 @@ export function createApp(config: AppConfig = loadConfig()) {
   const tokens = new TokenManager(store, config, logger);
   const catalog = new ModelCatalog(config, logger);
   const login = new LoginService(config, store, logger);
+  const requests = new RequestLog();
 
-  const deps = { config, logger, store, pool, tokens, catalog };
+  const deps = { config, logger, store, pool, tokens, catalog, requests };
   const app = new Hono();
 
   registerAdminRoutes(app, { ...deps, login });

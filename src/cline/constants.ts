@@ -37,6 +37,12 @@ export const DEFAULT_WORKOS_API_BASE_URL = "https://api.workos.com";
 export const CLINE_API_V1_PATH = "/api/v1";
 export const CLINE_CHAT_PATH = "/api/v1/chat/completions";
 export const CLINE_MODELS_PATH = "/api/v1/models";
+/**
+ * Second catalog source. Public like /api/v1/models, but it is the only place
+ * the subscription (`clinePass`) and `free` buckets are listed; the plain
+ * /api/v1/models catalog does not contain those ids at all.
+ */
+export const CLINE_RECOMMENDED_MODELS_PATH = "/api/v1/ai/cline/recommended-models";
 
 /** Stored/transport access tokens carry this prefix (cline.ts: t9 = "workos:"). */
 export const WORKOS_TOKEN_PREFIX = "workos:";
@@ -86,4 +92,43 @@ export const FALLBACK_MODEL_IDS: readonly string[] = [
   "meta/muse-spark-1.3",
   "minimax/minimax-m3",
   "x-ai/grok-4.6",
+];
+
+/**
+ * Fallback for the `free` bucket of recommended-models — the ids Cline's own
+ * UI shows under "Free" and the only ones that are free by upstream's
+ * definition. Snapshot only; the live list wins whenever it is reachable.
+ */
+export const FALLBACK_FREE_MODEL_IDS: readonly string[] = [
+  "cline-free/deepseek-v4.1-flash",
+  "cline-free/muse-spark-1.3-contributor",
+  "cline-free/solar-pro4",
+  "z-ai/glm-5.3-flash",
+  "stealth/union-alpha",
+  "poolside/laguna-s-2.1:free",
+];
+
+/**
+ * Fallback for the subscription bucket, used together with FALLBACK_MODEL_IDS
+ * only when both live catalog calls fail. Snapshot of the `clinePass` array of
+ * recommended-models: these ids bill against a Cline Pass subscription, while
+ * the models above bill against Cline Credits.
+ */
+export const FALLBACK_PASS_MODEL_IDS: readonly string[] = [
+  "cline-pass/kimi-k3",
+  "cline-pass/glm-5.3",
+  "cline-pass/deepseek-v4-pro",
+  "cline-pass/deepseek-v4-flash",
+  "cline-pass/qwen3.8-max",
+  "cline-pass/glm-5.2",
+  "cline-pass/deepseek-v4.1-flash",
+  "cline-pass/glm-5.3-flash",
+  "cline-pass/kimi-k2.6",
+  "cline-pass/kimi-k2.7-code",
+  "cline-pass/minimax-m3",
+  "cline-pass/qwen3.7-plus",
+  "cline-pass/qwen3.7-max",
+  "cline-pass/mimo-v2.5",
+  "cline-pass/mimo-v2.5-pro",
+  "cline-pass/muse-spark-1.3-contributor",
 ];
