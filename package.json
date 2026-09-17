@@ -1,0 +1,32 @@
+{
+  "name": "cline2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted OpenAI/Anthropic-compatible gateway in front of the Cline API (api.cline.bot), with WorkOS device-code login and automatic token rotation.",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "serve": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "login": "tsx src/cli/login.ts",
+    "accounts": "tsx src/cli/accounts.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.8",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}
+
