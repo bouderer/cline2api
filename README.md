@@ -1,6 +1,6 @@
 # cline2api
 
-自托管的 Cline 反代：把 `api.cline.bot` 的 Cline 账号能力暴露成 **OpenAI 兼容** 与 **Anthropic Messages** 两套 API，供 Cursor / NextChat / Claude Code / 任意 OpenAI SDK 使用。
+自托管的 Cline 反代：把 `api.cline.bot` 的 Cline 账号能力暴露成 **OpenAI Chat Completions**、**OpenAI Responses** 与 **Anthropic Messages** 三套 API，供 Cursor / NextChat / Claude Code / Codex / 任意 OpenAI SDK 使用。
 
 - **官方登录链路**：WorkOS OAuth Device Code Flow（RFC 8628），服务器无需浏览器。
 - **自动续期**：提前 5 分钟续期，单飞控制 + 刷新令牌轮换落盘。
@@ -129,6 +129,19 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-key
 模型名建议直接用 `cline-pass/*`（订阅覆盖，不吃 Credits），例如
 `cline-pass/kimi-k3`、`cline-pass/glm-5.3`。
 
+### Codex / Responses API
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=sk-your-key
+# Codex 走 /v1/responses，模型名同样填 /v1/models 里的 ID
+```
+
+网关原生讲 Responses 协议（不只是把它降级成 chat completions）：`instructions`、
+`input` 里的 `function_call` / `function_call_output` 往返、`tools`（Responses 方言）、
+`max_output_tokens`、流式事件（`response.output_text.delta`、`response.function_call_arguments.delta`、
+`response.completed` …）都会正确转换，思考过程以 `reasoning` item 返回。
+
 ### Cursor / NextChat / Cherry Studio
 
 - Base URL：`http://127.0.0.1:8787/v1`
@@ -143,12 +156,13 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-key
 |---|---|---|
 | GET | `/v1/models` | 上游实时模型目录（OpenAI 格式）。合并两个来源：`/api/v1/models`（计费模型）+ `/api/v1/ai/cline/recommended-models` 的 `free` / `clinePass` 桶（订阅与免费模型），按 ID 去重；计费桶信息只在 `/admin/api/models` 暴露，不污染 OpenAI 结构 |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions，支持 `stream` |
+| POST | `/v1/responses` | OpenAI Responses，支持 `stream`。请求侧 `instructions` / `input`（含 `function_call`、`function_call_output`）/ `tools` / `max_output_tokens` 都会翻译成 chat completions，响应再翻回 Responses 结构 |
 | POST | `/v1/messages` | Anthropic Messages，支持 `stream`（含 tool_use / thinking） |
 | GET | `/healthz` | 存活探针 |
 | GET | `/` | 管理台（默认仅本机可访问） |
 | GET | `/admin/api/*` | 管理接口（登录编排、账号、模型分桶、订阅、请求日志、试聊） |
 
-透传保留的上游特性：`reasoning_content`（DeepSeek/GLM 思考过程）、`cache_control`、工具调用。
+透传保留的上游特性：`reasoning` / `reasoning_content`（DeepSeek/GLM 思考过程，两种字段名都认，分别映射成 Anthropic 的 `thinking` 块与 Responses 的 `reasoning` item）、`cache_control`、工具调用。
 
 ---
 
@@ -218,9 +232,10 @@ src/
     loginService.ts      管理台登录会话编排
   api/
     openai.ts            /v1/models、/v1/chat/completions
+    responses.ts         /v1/responses 双向转换（含流式事件）
     anthropic.ts         /v1/messages 双向转换
     admin.ts             管理接口
-    http.ts              SSE 头、错误体、常量时间比较
+    http.ts              SSE 头、错误体、常量时间比较、思考字段识别
   cli/                   login.ts / accounts.ts
 tests/                   单元 + 集成测试（含 mock 上游）
 ```
@@ -230,11 +245,11 @@ tests/                   单元 + 集成测试（含 mock 上游）
 ## 十、测试
 
 ```bash
-npm test        # 38 项：单元 + 集成
+npm test        # 60 项：单元 + 集成
 npm run typecheck
 ```
 
-集成测试用本地 mock 上游覆盖了：流式逐字节透传、官方请求头、`{success,data}` 解包、401 → 静默续期 → 重放、refresh 被拒 → 账号禁用、Anthropic 流式事件转换、鉴权拦截。
+集成测试用本地 mock 上游覆盖了：流式逐字节透传、官方请求头、`{success,data}` 解包、401 → 静默续期 → 重放、refresh 被拒 → 账号禁用、Anthropic 流式事件转换、Responses 请求/响应/流式事件转换、小 `max_tokens` 触发空响应后的加预算重试、鉴权拦截。
 
 ---
 
@@ -248,8 +263,8 @@ npm run typecheck
 | 有响应但无打字机效果 | 前面的 nginx 没关 `proxy_buffering` |
 | 账号显示「需重新登录」 | refresh token 被撤销/过期，属于正常失效，重新登录即可 |
 | 模型名 404 | 用 `/v1/models` 返回的 ID，不要自己拼前缀 |
-| 调用返回 `empty response content` | 上游推理型模型在小 `max_tokens` 下把预算烧在思考上，正文为空。实测 `max_tokens: 16` 时 `cline-pass/glm-5.3`、`kimi-k3`、`deepseek-*`、`muse-spark` 都会这样，`qwen3.7-plus`、`minimax-m3`、`solar-pro4` 不会。调大 `max_tokens`（≥256）即可；关思考的开关（`reasoning_effort` / `thinking` / `enable_thinking`）实测都无效 |
-| new-api 渠道「测试」失败但实际能用 | new-api 的渠道测试固定发 `max_tokens: 16`，撞上上一条。把渠道的「测试模型」设成 `cline-pass/minimax-m3` 这类不吃预算的模型即可 |
+| 调用返回 `empty response content` | 上游推理型模型在小 `max_tokens` 下把预算烧在思考上，正文为空。实测 `max_tokens: 16` 时 `cline-pass/glm-5.3`、`kimi-k3`、`deepseek-*`、`muse-spark` 都会这样，`qwen3.7-plus`、`minimax-m3`、`solar-pro4` 不会。**网关现在会自动兜底**：收到这个错误且请求里的输出预算偏小时，用 `max_tokens: 2048` 原账号重试一次（见下节），所以客户端即使只给 16 也不会失败。要关掉这个行为只能改 `src/services/proxyChat.ts` 里的 `ESCALATED_MAX_TOKENS` |
+| new-api 渠道「测试」失败但实际能用 | new-api 的渠道测试固定发 `max_tokens: 16`。加了加预算重试后这条已基本消失（实测 `deepseek-v4.1-flash` 能通过）；若某个模型连 2048 也答不出正文，再把「测试模型」换成 `cline-pass/minimax-m3` 这类不吃预算的模型 |
 | new-api「获取模型列表」报 advanced custom 相关错误 | 渠道类型被设成了「高级自定义」（该分叉里 type=58）。这种类型必须自己配 `/v1/models` 路由，普通 OpenAI 兼容渠道用 type=1 就行 |
 
 ---
@@ -355,6 +370,24 @@ stealth/union-alpha                   poolside/laguna-s-2.1:free
 
 **注意网关的上游超时**：`REQUEST_TIMEOUT_MS` 默认 30 秒，几万 tokens 的请求可能超过它而被中断（表现为连接被直接关闭，没有错误体）。需要长上下文时把它调大，例如 `REQUEST_TIMEOUT_MS=180000`。
 
+### 小 `max_tokens` 的自动兜底（空响应重试）
+
+上游对"思考把预算吃光、正文为空"的请求直接回 400/500 `empty response content`，
+而不少客户端会把输出预算写死得很小（new-api 的渠道测试是 16，一些 UI 默认 512）。
+这类失败与账号无关 —— 换号、换协议都是一样的结果，唯一有效的做法是把预算调大。
+
+`src/services/proxyChat.ts` 因此加了一条一次性重试：**只要上游回了 `empty response content`，
+且本次请求显式设置过输出预算（`max_tokens` / `max_completion_tokens` / `max_output_tokens`）
+且小于 2048，就用 2048 在同一个账号上重试一次**；重试仍失败才把错误原样返回给客户端。
+三条协议（chat / responses / messages）共用这条路径，所以行为一致。
+
+两个刻意的取舍：
+
+- **只对显式设置过预算的请求生效**。请求里没有 `max_tokens` 时用的是上游默认值（比 2048 大），
+  这时补一个 2048 反而会缩小预算，所以不动。
+- **只在报错时重试，不做请求前的截断/改写**。正常情况下客户端的 `max_tokens` 原样透传，
+  只有请求即将彻底失败时才放宽。放宽后模型实际吐多少算多少，不会因为"额度给了 2048"就多计费。
+
 ### new-api 接入配置（本机现网）
 
 两个渠道都指向本网关，各自暴露不同的模型集合：
@@ -370,8 +403,8 @@ stealth/union-alpha                   poolside/laguna-s-2.1:free
 {"advanced_custom": {"advanced_routes": [
   {"incoming_path": "/v1/chat/completions", "upstream_path": "/v1/chat/completions", "converter": "none",
    "auth": {"type": "header", "name": "Authorization", "value": "Bearer {api_key}"}},
-  {"incoming_path": "/v1/responses", "upstream_path": "/v1/chat/completions",
-   "converter": "openai_responses_to_openai_chat_completions", "auth": {"...": "同上"}},
+  {"incoming_path": "/v1/responses", "upstream_path": "/v1/responses", "converter": "none",
+   "auth": {"...": "同上"}},
   {"incoming_path": "/v1/messages", "upstream_path": "/v1/messages", "converter": "none", "auth": {"...": "同上"}},
   {"incoming_path": "/v1/models", "upstream_path": "/v1/models", "converter": "none", "auth": {"...": "同上"}}
 ]}}
@@ -380,12 +413,15 @@ stealth/union-alpha                   poolside/laguna-s-2.1:free
 要点：
 
 - 少了 `/v1/models` 这条路由，「获取模型列表」按钮会报 `advanced custom channel does not configure a /v1/models route`。
-- 少了 `/v1/messages` 这条路由，Claude Code / Anthropic SDK 走不通。
-- `/v1/responses` 用 `openai_responses_to_openai_chat_completions` 转换器，让 new-api 把 Responses 请求降级成 chat completions 打到本网关（本网关原生只讲 chat + messages）。
+- 少了 `/v1/messages` 这条路由，Claude Code / Anthropic SDK 走不通；少了 `/v1/responses` 这条，Codex 走不通。
+- **三条协议现在都是 `converter: "none"` 直通**：本网关原生讲 chat / Responses / Anthropic 三套协议，
+  new-api 不需要做任何降级转换。之前 `/v1/responses` 走的是 `openai_responses_to_openai_chat_completions`，
+  那条路会把 `max_output_tokens` 丢掉（实测转出来的请求里是 `max_output_tokens: 0`），
+  客户端要多少输出完全不起作用 —— 现在原样透传。
 - 路由里的 `auth` 必须显式写 `Bearer {api_key}`，否则 new-api 不一定带上渠道密钥。
 - 配好后 `GET /v1/models` 会给这些模型标注 `supported_endpoint_types: ["openai","openai-response","anthropic"]`（有 1 分钟定价缓存，改完稍等再刷）。
 - **别把渠道类型从「高级自定义」改回「OpenAI 兼容」**：换了类型 `advanced_routes` 直接失效，`/v1/responses` 会 404 `Unknown route`。
-- 渠道「测试」按钮固定发 `max_tokens: 16`，对推理型模型会返回空内容而判失败 —— 把渠道的「测试模型」设成 `cline-pass/minimax-m3` / `solar-pro4` 这类不吃预算的模型即可（见排障表）。
+- 改 `advanced_routes` 可以直接改库里 `channels.settings` 的 JSON，**但 new-api 有内存渠道缓存，改完要 `docker restart new-api`** 才生效。
 
 ### 反向代理部署（本机现网配置）
 

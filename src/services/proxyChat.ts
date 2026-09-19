@@ -82,6 +82,42 @@ function describeAccountScopedError(status: number, text: string): string {
   return `upstream ${status}`;
 }
 
+/**
+ * Upstream's way of saying a reasoning model spent its whole token budget
+ * thinking and had nothing left to say (`{"error":"empty response content"}`).
+ *
+ * This is not the account's fault, so failing over to another account would
+ * just repeat it — the only thing that helps is asking for a bigger budget.
+ * Clients that hard-code a small `max_tokens` (a 16-token health check, a
+ * 512-token default in some UIs) otherwise see a hard failure on every
+ * thinking model while streaming requests, which have no such limit, keep
+ * working. Raising the ceiling cannot cost more than the model actually emits;
+ * it only stops the budget from being the thing that breaks the request.
+ */
+const EMPTY_CONTENT_ERROR = /empty response content/i;
+const ESCALATED_MAX_TOKENS = 2048;
+
+export function isEmptyContentError(text: string): boolean {
+  return EMPTY_CONTENT_ERROR.test(text);
+}
+
+/**
+ * Copy of a request body with a small output budget raised; null when the
+ * caller already asked for room to think, or when it set no budget at all —
+ * upstream's own default is larger than ours, so adding one would shrink it.
+ */
+export function withRaisedTokenBudget(body: unknown): unknown | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  const field = (["max_tokens", "max_completion_tokens", "max_output_tokens"] as const).find(
+    (name) => typeof record[name] === "number",
+  );
+  if (field === undefined) return null;
+  const current = record[field] as number;
+  if (current >= ESCALATED_MAX_TOKENS) return null;
+  return { ...record, [field]: ESCALATED_MAX_TOKENS };
+}
+
 export async function callUpstreamWithFailover(
   deps: ProxyChatDeps,
   body: unknown,
@@ -123,8 +159,19 @@ export async function callUpstreamWithFailover(
   ];
 
   for (const account of ordered) {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const forceRefresh = attempt === 1;
+    // Three ways out of this loop: success, a dead credential, or a failure
+    // that belongs to the request rather than the account. `refresh` forces one
+    // token rotation after a 401; `escalate` retries once with a bigger token
+    // budget when upstream reported an empty body.
+    let refreshTried = false;
+    let needRefresh = false;
+    let escalated = false;
+    let requestBody = body;
+
+    for (;;) {
+      const forceRefresh = needRefresh;
+      needRefresh = false;
+
       let authorization: string | null;
       try {
         authorization = await deps.tokens.getAuthorization(account.id, { forceRefresh });
@@ -143,7 +190,7 @@ export async function callUpstreamWithFailover(
 
       let upstream: Response;
       try {
-        upstream = await postChatCompletions(deps.config, body, {
+        upstream = await postChatCompletions(deps.config, requestBody, {
           authorization,
           taskId: options.taskId,
           ...(options.signal ? { signal: options.signal } : {}),
@@ -165,11 +212,33 @@ export async function callUpstreamWithFailover(
           status: upstream.status,
           detail: detail.slice(0, 200),
         });
-        continue;
+        if (!refreshTried) {
+          refreshTried = true;
+          needRefresh = true;
+          continue;
+        }
+        break;
       }
 
       if (!upstream.ok) {
         const text = await upstream.text().catch(() => "");
+
+        // The reasoning budget swallowed the answer: same account, bigger
+        // budget. Another account would only repeat the same model's behaviour.
+        if (!escalated && isEmptyContentError(text)) {
+          const raised = withRaisedTokenBudget(requestBody);
+          if (raised !== null) {
+            escalated = true;
+            requestBody = raised;
+            deps.logger.warn("upstream returned no text; retrying with a larger token budget", {
+              accountId: account.id,
+              model: options.model,
+              maxTokens: ESCALATED_MAX_TOKENS,
+            });
+            continue;
+          }
+        }
+
         // This account cannot serve this model (no credits, or its own daily
         // free quota is spent): another account in the pool may be able to, so
         // fail over instead of surfacing the per-account error.

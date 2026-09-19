@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Self-hosted OpenAI/Anthropic-compatible gateway in front of the Cline API (api.cline.bot), with WorkOS device-code login and automatic token rotation.",
+  "description": "Self-hosted OpenAI Chat Completions / Responses / Anthropic-compatible gateway in front of the Cline API (api.cline.bot), with WorkOS device-code login and automatic token rotation.",
   "engines": {
     "node": ">=20.11"
   },

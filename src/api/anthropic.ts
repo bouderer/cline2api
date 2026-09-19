@@ -11,7 +11,7 @@ import type { Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import { isAuthorized } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
-import { SSE_HEADERS, openaiError, sanitizeOpenAIMessages } from "./http.js";
+import { SSE_HEADERS, openaiError, readReasoning, sanitizeOpenAIMessages } from "./http.js";
 
 interface TextBlock { type: "text"; text: string }
 interface ImageBlock {
@@ -225,8 +225,8 @@ export function openAIToAnthropicMessage(completion: OpenAICompletion, model: st
   const choice = completion.choices?.[0];
   const blocks: Array<Record<string, unknown>> = [];
 
-  const reasoning = choice?.message?.reasoning_content;
-  if (typeof reasoning === "string" && reasoning.length > 0) {
+  const reasoning = readReasoning(choice?.message);
+  if (reasoning !== null) {
     blocks.push({ type: "thinking", thinking: reasoning });
   }
   const text = choice?.message?.content;
@@ -373,8 +373,8 @@ export function translateStreamToAnthropic(
           if (choice.finish_reason) stopReason = mapStopReason(choice.finish_reason);
 
           const d = (choice as { delta?: Record<string, unknown> }).delta ?? {};
-          const reasoning = d.reasoning_content;
-          if (typeof reasoning === "string" && reasoning.length > 0) {
+          const reasoning = readReasoning(d);
+          if (reasoning !== null) {
             if (openKind !== "thinking") {
               closeBlock();
               openBlock("thinking", { type: "thinking", thinking: "" });

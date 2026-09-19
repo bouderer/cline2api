@@ -4,6 +4,7 @@
  * Exposes:
  *   /v1/models            OpenAI model list (live upstream catalog)
  *   /v1/chat/completions  OpenAI chat completions
+ *   /v1/responses         OpenAI Responses API
  *   /v1/messages          Anthropic Messages API (for Claude Code)
  *   /                     admin UI (localhost, or ADMIN_TOKEN when exposed)
  *   /healthz              liveness
@@ -21,6 +22,7 @@ import { TokenManager } from "./cline/tokenManager.js";
 import { ModelCatalog } from "./cline/models.js";
 import { LoginService } from "./services/loginService.js";
 import { registerOpenAIRoutes } from "./api/openai.js";
+import { registerResponsesRoutes } from "./api/responses.js";
 import { registerAnthropicRoutes } from "./api/anthropic.js";
 import { registerAdminRoutes } from "./api/admin.js";
 
@@ -39,6 +41,7 @@ export function createApp(config: AppConfig = loadConfig()) {
 
   registerAdminRoutes(app, { ...deps, login });
   registerOpenAIRoutes(app, deps);
+  registerResponsesRoutes(app, deps);
   registerAnthropicRoutes(app, deps);
 
   app.get("/healthz", (c) => c.json({ ok: true }));

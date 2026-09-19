@@ -64,6 +64,25 @@ export const SSE_HEADERS: Record<string, string> = {
 };
 
 /**
+ * Reasoning text carried by an OpenAI-style message or delta, if any.
+ *
+ * The field name is not consistent across the providers behind Cline: its
+ * gateway sends `reasoning`, while DeepSeek-style clients and several other
+ * providers send `reasoning_content`. Both are the model's thinking, and both
+ * belong in an Anthropic `thinking` block or a Responses `reasoning` item —
+ * which is otherwise silently dropped, since neither API has that field.
+ */
+export function readReasoning(message: unknown): string | null {
+  if (typeof message !== "object" || message === null) return null;
+  const record = message as Record<string, unknown>;
+  for (const field of ["reasoning_content", "reasoning"]) {
+    const value = record[field];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+/**
  * Placeholder used when a message would otherwise carry no text at all.
  * Several upstreams (Vercel AI Gateway included) reject empty message content
  * with 400 (`user message must have content`), which surfaces to clients as a
