@@ -161,23 +161,42 @@ REGISTER_CONCURRENCY=3 node register.mjs --count 50
 
 `--concurrency N`（或环境变量 `REGISTER_CONCURRENCY`）决定**同时处理几个账号**。
 
-**每个并发 = 一个 Chrome 进程 + 一个本地回调端口**（回调模式从 `48801` 起顺序占用）。
+并发上限由 `REGISTER_MAX_CONCURRENCY` 控制，**默认 64**。内存充足可以往上调：
 
-| 并发 | 适用场景 | 说明 |
-|---|---|---|
-| `1` | 默认，最稳 | 跑一个完再跑下一个 |
-| `2–3` | 推荐区间 | 速度约翻倍，内存压力可控 |
-| `4–8` | 机器好、急着灌号 | 会同时开 N 个 Chrome，内存占用明显；上限保护在 8 |
+```env
+REGISTER_MAX_CONCURRENCY=128
+```
 
-几点注意：
+| 并发 | 适用场景 |
+|---|---|
+| `1` | 默认，最稳 |
+| `2–4` | 推荐区间，速度与内存平衡 |
+| `8–16` | 机器好、急灌号；界面会提示预估内存 |
+| `>16` | 界面标红警告，渲染进程会抢 CPU |
 
-- **设备码链路建议并发 1–2**。设备码更容易触发风控，并发高反而失败率上升。
-- **回调链路可以并发 2–4**，每个账号各占一个端口，互不干扰。
-- 日志会带 `[3/20]` 这样的序号前缀，并发时也能分清哪个账号在干什么。
-- 账号池写入做了串行互斥，多 worker 同时落盘不会互相覆盖。
-- 中途 Ctrl+C：已成功的账号已经写盘，不会丢；下次跑会跳过它们。
+### 浏览器复用
 
----
+默认**一个 Chromium + N 个隔离 context**（每个账号独立 cookie/storage，等价于独立无痕窗口）：
+
+```env
+REGISTER_SHARED_BROWSER=true    # 默认
+```
+
+省掉的是浏览器外壳（主进程 / GPU / 网络服务），但**每个页面仍是独立渲染进程**，所以内存不是线性下降——微软登录页 JS 很重，一个渲染进程约 200–300 MB。
+
+想退回「每账号独立 Chrome」（内存换隔离，但指纹和 IP 其实一样）：
+
+```env
+REGISTER_SHARED_BROWSER=false
+```
+
+### 几点注意
+
+- **设备码链路建议并发 1–2**，它更容易触发风控。
+- **回调链路**每个账号占一个端口，端口用完会自动归还复用（不会泄漏）。
+- 日志带 `[3/20]` 序号前缀，并发时能分清哪个账号在干什么。
+- 账号池写入串行互斥，多 worker 同时落盘不会互相覆盖。
+- 中途 Ctrl+C：已成功的账号已写盘，不会丢；下次跑会跳过。
 
 ## 常用命令
 
@@ -250,7 +269,9 @@ CLINE2API_ADMIN_TOKEN=<网关的 ADMIN_TOKEN>
 | `CLINE2API_IMPORT_PATH` | 否 | `/admin/api/accounts/import` | 导入接口路径 |
 | `CLINE2API_PUSH_TIMEOUT_MS` | 否 | `30000` | 推送超时 |
 | `CLINE2API_PROXY` | 否 | 空 | 推送/探测走的 HTTP 代理；留空则直连，缺省会依次回落到 `HTTPS_PROXY`、`HTTP_PROXY` |
-| `REGISTER_CONCURRENCY` | 否 | `1` | 并发数，等价于 `--concurrency N`，上限 8 |
+| `REGISTER_CONCURRENCY` | 否 | `1` | 并发数，等价于 `--concurrency N` |
+| `REGISTER_MAX_CONCURRENCY` | 否 | `64` | 并发上限；内存充足可调高，例如 `128` |
+| `REGISTER_SHARED_BROWSER` | 否 | `true` | `true`=一个 Chrome 开多个隔离标签（省内存）；`false`=每账号独立 Chrome |
 | `REGISTER_WEB_PORT` | 否 | `8788` | Web 控制台端口 |
 | `REGISTER_WEB_HOST` | 否 | `127.0.0.1` | Web 控制台监听地址（默认只本机） |
 
@@ -277,6 +298,7 @@ CLINE2API_ADMIN_TOKEN=<网关的 ADMIN_TOKEN>
 
 **推送报 413**
 单批记录太多（网关默认上限 2 MB / 5000 条）。注册机已自动按 500 条分批，正常不会触发。
+
 
 
 
