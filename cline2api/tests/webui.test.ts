@@ -27,7 +27,7 @@ const EXTERNALS = new Set([
   "fetch", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "confirm",
   "JSON", "String", "Number", "Boolean", "Array", "Object", "Math", "Date", "Map",
   "Set", "Promise", "Error", "RegExp", "TextDecoder", "URLSearchParams", "isNaN",
-  "parseInt", "parseFloat", "encodeURIComponent", "decodeURIComponent", "require",
+  "parseInt", "parseFloat", "isFinite", "encodeURIComponent", "decodeURIComponent", "require",
 ]);
 
 test("the admin page script parses", () => {
@@ -52,6 +52,14 @@ test("every helper the admin script calls is defined in it", () => {
   // `const name = (…) =>` and `var name = function` styles, if ever introduced.
   for (const m of code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:function|\()/g)) {
     defined.add(m[1]);
+  }
+  // Callback parameters are called like helpers but are not declared with
+  // `function`, so collect every parameter list too.
+  for (const m of code.matchAll(/function\s+[A-Za-z_$][\w$]*\s*\(([^)]*)\)/g)) {
+    for (const raw of (m[1] ?? "").split(",")) {
+      const name = raw.trim().split(/[=\s]/)[0];
+      if (name && /^[A-Za-z_$][\w$]*$/.test(name)) defined.add(name);
+    }
   }
 
   const called = new Set();

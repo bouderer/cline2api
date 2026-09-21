@@ -13,6 +13,7 @@ import type { Logger } from "../logger.js";
 import type { AccountStore } from "../store.js";
 import { formatAccessToken, getValidClineCredentials } from "./auth.js";
 import { defaultClineHeaders } from "./constants.js";
+import type { ProxyResolver } from "./proxy.js";
 import type { ClineCredentials } from "./types.js";
 
 export class TokenManager {
@@ -22,6 +23,8 @@ export class TokenManager {
     private readonly store: AccountStore,
     private readonly config: AppConfig,
     private readonly logger: Logger,
+    /** Optional: refresh through the account's assigned proxy. */
+    private readonly proxies?: ProxyResolver,
   ) {}
 
   /** Returns a ready-to-send `Authorization` header, or null if re-login is needed. */
@@ -35,7 +38,8 @@ export class TokenManager {
     return promise;
   }
 
-  private authOptions(): Parameters<typeof getValidClineCredentials>[1] {
+  private authOptions(accountId: string): Parameters<typeof getValidClineCredentials>[1] {
+    const dispatcher = this.proxies?.forAccount(accountId);
     return {
       clineApiBaseUrl: this.config.clineApiBaseUrl,
       workosApiBaseUrl: this.config.workosApiBaseUrl,
@@ -50,6 +54,7 @@ export class TokenManager {
         taskId: "auth",
       }),
       provider: "cline",
+      ...(dispatcher ? { dispatcher } : {}),
     };
   }
 
@@ -67,7 +72,7 @@ export class TokenManager {
       metadata: { provider: record.provider, tokenType: record.tokenType },
     };
 
-    const resolved = await getValidClineCredentials(current, this.authOptions(), {
+    const resolved = await getValidClineCredentials(current, this.authOptions(accountId), {
       forceRefresh,
       refreshBufferMs: this.config.refreshBufferMs,
       retryableTokenGraceMs: this.config.retryableTokenGraceMs,

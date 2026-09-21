@@ -7,6 +7,8 @@ import type { Logger } from "../logger.js";
 import type { AccountPool } from "./accountPool.js";
 import type { RequestLog } from "./requestLog.js";
 import type { TokenManager } from "../cline/tokenManager.js";
+import type { AccountStore } from "../store.js";
+import type { ProxyResolver } from "../cline/proxy.js";
 import { postChatCompletions } from "../cline/upstream.js";
 import { openaiError } from "../api/http.js";
 
@@ -15,6 +17,10 @@ export interface ProxyChatDeps {
   logger: Logger;
   pool: AccountPool;
   tokens: TokenManager;
+  /** Needed to resolve a pinned account by id, bypassing pool rotation. */
+  store: AccountStore;
+  /** Optional: when present, requests egress through the account's proxy. */
+  proxyResolver?: ProxyResolver;
   /** Optional: when present, every attempt is recorded for the admin UI. */
   requests?: RequestLog;
 }
@@ -121,7 +127,20 @@ export function withRaisedTokenBudget(body: unknown): unknown | null {
 export async function callUpstreamWithFailover(
   deps: ProxyChatDeps,
   body: unknown,
-  options: { taskId: string; model: string; stream: boolean; signal?: AbortSignal },
+  options: {
+    taskId: string;
+    model: string;
+    stream: boolean;
+    signal?: AbortSignal;
+    /**
+     * Pin the request to one account and disable failover.
+     *
+     * The admin account tester needs to know what *this* account does, so
+     * walking the pool would defeat the point — a failure on the pinned
+     * account has to surface as a failure, not be silently served by another.
+     */
+    onlyAccountId?: string;
+  },
 ): Promise<UpstreamOutcome> {
   const startedAt = Date.now();
   const record = (status: number, accountId: string | null, error: string | null): void => {
@@ -136,7 +155,12 @@ export async function callUpstreamWithFailover(
     });
   };
 
-  const candidates = deps.pool.candidates();
+  const candidates =
+    options.onlyAccountId === undefined
+      ? deps.pool.candidates()
+      : deps.store
+          .list()
+          .filter((account) => account.id === options.onlyAccountId);
   if (candidates.length === 0) {
     record(503, null, "no_accounts");
     return {
@@ -159,6 +183,10 @@ export async function callUpstreamWithFailover(
   ];
 
   for (const account of ordered) {
+    // Resolved once per account: the agent is pooled, and looking it up per
+    // attempt would rebuild the map lookup on every retry.
+    const dispatcher = deps.proxyResolver?.forAccount(account.id);
+
     // Three ways out of this loop: success, a dead credential, or a failure
     // that belongs to the request rather than the account. `refresh` forces one
     // token rotation after a 401; `escalate` retries once with a bigger token
@@ -193,6 +221,7 @@ export async function callUpstreamWithFailover(
         upstream = await postChatCompletions(deps.config, requestBody, {
           authorization,
           taskId: options.taskId,
+          ...(dispatcher ? { dispatcher } : {}),
           ...(options.signal ? { signal: options.signal } : {}),
         });
       } catch (error) {

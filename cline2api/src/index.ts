@@ -18,6 +18,8 @@ import { createLogger } from "./logger.js";
 import { AccountStore } from "./store.js";
 import { AccountPool } from "./services/accountPool.js";
 import { RequestLog } from "./services/requestLog.js";
+import { ProxyStore } from "./services/proxyStore.js";
+import { ProxyResolver } from "./cline/proxy.js";
 import { TokenManager } from "./cline/tokenManager.js";
 import { ModelCatalog } from "./cline/models.js";
 import { LoginService } from "./services/loginService.js";
@@ -31,13 +33,26 @@ export function createApp(config: AppConfig = loadConfig()) {
   const secrets = [...config.proxyApiKeys, ...(config.adminToken ? [config.adminToken] : [])];
   const logger = createLogger(config.logLevel, secrets);
   const store = new AccountStore(config.dataDir, logger);
+  const proxies = new ProxyStore(config.dataDir, logger);
   const pool = new AccountPool(store);
-  const tokens = new TokenManager(store, config, logger);
+  const resolver = new ProxyResolver({ proxies, store, logger });
+  const tokens = new TokenManager(store, config, logger, resolver);
   const catalog = new ModelCatalog(config, logger);
   const login = new LoginService(config, store, logger);
   const requests = new RequestLog();
 
-  const deps = { config, logger, store, pool, tokens, catalog, requests };
+  const deps = {
+    config,
+    logger,
+    store,
+    pool,
+    tokens,
+    catalog,
+    requests,
+    proxies,
+    resolver,
+    proxyResolver: resolver,
+  };
   const app = new Hono();
 
   // Security net for the whole public API namespace. Route handlers retain

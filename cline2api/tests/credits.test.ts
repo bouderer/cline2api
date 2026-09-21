@@ -17,9 +17,11 @@ import type { AddressInfo } from "node:net";
 import { loadConfig } from "../src/config.js";
 import { createLogger } from "../src/logger.js";
 import {
+  COST_UNITS_PER_USD,
   MICRO_USD,
   fetchAccountCredits,
   fetchUsagesSince,
+  resolveWindow,
   startOfLocalDay,
   sumUsage,
 } from "../src/cline/credits.js";
@@ -157,9 +159,21 @@ test("sumUsage adds every token and cost field", () => {
     completionTokens: 6,
     cachedTokens: 4,
     totalTokens: 36,
-    costMicroUsd: 300,
-    creditsUsed: 5,
+    costUnits: 300,
+    // costUsd is 1e8 per USD, NOT 1e6: 300 units is $0.000003, not $0.0003.
+    costUsd: 0.000003,
+    creditsMicroUsd: 5,
   });
+});
+
+test("costUsd and creditsUsed are 100x apart, as upstream reports them", () => {
+  // The real ratio measured across every paid record in the live ledger. A
+  // single shared divider silently overstates one of them by 100x, which is
+  // exactly the bug this pins down.
+  const paid = { costUnits: 3900, creditsMicroUsd: 39 };
+  assert.equal(paid.costUnits / COST_UNITS_PER_USD, 0.000039);
+  assert.equal(paid.creditsMicroUsd / MICRO_USD, 0.000039);
+  assert.equal(paid.costUnits / paid.creditsMicroUsd, 100);
 });
 
 test("usages page through the cursor until the window is covered", async () => {
@@ -208,9 +222,11 @@ test("account credits resolve the uid, then read balance and today's totals", as
     assert.equal(credits.balanceUsd, 0.5);
     // 1 credit = $0.01, so $0.50 is 50 credits.
     assert.equal(credits.balanceCredits, 50);
-    assert.equal(credits.today.requests, 3);
-    assert.equal(credits.today.totalTokens, 360);
-    assert.equal(credits.today.costMicroUsd, 3003);
+    assert.equal(credits.window.requests, 3);
+    assert.equal(credits.window.totalTokens, 360);
+    assert.equal(credits.window.costUnits, 3003);
+    // 3003 cost units at 1e8 per USD.
+    assert.equal(credits.window.costUsd, 0.00003003);
     assert.equal(credits.lastUsage?.model, "Deepseek-v4.1-Flash");
     // The balance path takes the uid, not "me".
     assert.ok(upstream.paths.some((p) => p === `/api/v1/users/${UID}/balance`));
@@ -244,7 +260,7 @@ test("a rejected balance lookup degrades to a null balance, keeping the rest", a
     assert.equal(credits.balanceMicroUsd, null);
     assert.equal(credits.balanceUsd, null);
     assert.equal(credits.balanceCredits, null);
-    assert.equal(credits.today.requests, 0);
+    assert.equal(credits.window.requests, 0);
     assert.equal(credits.error, null);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

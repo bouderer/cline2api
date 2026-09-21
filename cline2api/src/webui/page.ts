@@ -177,6 +177,27 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   .acct { display:flex; flex-direction:column; gap:2px; }
   .acct .mail { overflow-wrap:anywhere; }
 
+  /* Pager under a paginated table, and under the overview's usage card. */
+  .card-foot {
+    padding:11px 18px; border-top:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;
+    color:var(--muted); font-size:12.5px;
+  }
+  .card-foot:empty { display:none; }
+  .pager { display:flex; align-items:center; gap:7px; }
+  .pager button {
+    font:inherit; font-size:12.5px; cursor:pointer; padding:5px 10px;
+    border:1px solid var(--border-strong); border-radius:var(--radius-sm);
+    background:var(--surface); color:var(--text);
+  }
+  .pager button:disabled { opacity:.45; cursor:not-allowed; }
+  .pager .num { font-variant-numeric:tabular-nums; }
+  input[type=number] {
+    font:inherit; color:var(--text); background:var(--surface);
+    border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:7px 10px;
+  }
+  label.row > input[type=checkbox] { width:auto; }
+
   /* ---------- table ---------- */
   .table-wrap { max-height:min(62vh,620px); overflow:auto; border-radius:0 0 var(--radius) var(--radius); }
   table { width:100%; border-collapse:separate; border-spacing:0; }
@@ -268,6 +289,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 20v-1.5a4 4 0 00-4-4H7a4 4 0 00-4 4V20M9.5 10.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM21 20v-1.5a4 4 0 00-3-3.87M16.5 3.6a4 4 0 010 7.75"/></svg>
         账号
       </button>
+      <button data-view="proxies">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 100 18 9 9 0 000-18zM3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/></svg>
+        代理
+      </button>
       <button data-view="logs">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
         日志
@@ -331,15 +356,31 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
       <div class="card" style="margin-top:14px">
         <div class="card-head">
-          <h2>账号配额</h2>
+          <h2>账号用量</h2>
           <div class="row">
-            <span class="hint" id="usageHint">余额、今日 token 与 5 小时 / 周 / 月 三个窗口的用量</span>
+            <label class="field" style="margin:0">
+              <select id="winPreset" style="min-width:132px">
+                <option value="1">最近 1 小时</option>
+                <option value="6">最近 6 小时</option>
+                <option value="24" selected>最近 24 小时</option>
+                <option value="72">最近 3 天</option>
+                <option value="168">最近 7 天</option>
+                <option value="720">最近 30 天</option>
+                <option value="custom">自定义…</option>
+              </select>
+            </label>
+            <input type="number" id="winHours" min="0.1" max="720" step="0.5" value="24" style="width:88px; display:none" title="窗口长度（小时）" />
+            <label class="row xs muted" style="gap:5px; margin:0; cursor:pointer" title="按本地零点切分，而不是滚动窗口">
+              <input type="checkbox" id="winAnchorDay" style="width:auto; margin:0" />
+              按自然日
+            </label>
             <button class="btn small" id="usageReload">重新读取</button>
           </div>
         </div>
         <div class="card-body" id="usageBody">
           <div class="muted sm">读取中…</div>
         </div>
+        <div class="card-foot" id="usagePager"></div>
       </div>
 
       <div class="grid two" style="margin-top:14px">
@@ -514,11 +555,61 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       </div>
 
       <div class="card">
-        <div class="card-head"><h2>账号列表</h2><span class="hint">令牌只存在服务端 data/accounts.json（0600）</span></div>
+        <div class="card-head">
+          <h2>账号列表</h2>
+          <div class="row">
+            <select id="acctStatus" style="width:auto; min-width:110px">
+              <option value="all">全部状态</option>
+              <option value="active">仅可用</option>
+              <option value="disabled">仅停用</option>
+            </select>
+            <input type="text" id="acctSearch" placeholder="搜索邮箱 / 标签…" style="width:190px" />
+            <button class="btn small" id="acctReload">刷新</button>
+          </div>
+        </div>
         <div class="card-body tight">
           <table>
-            <thead><tr><th>账号</th><th class="nowrap">状态</th><th class="nowrap">令牌到期</th><th class="nowrap" style="width:70px"></th></tr></thead>
-            <tbody id="accountsBody"><tr><td colspan="4" class="empty sm">加载中…</td></tr></tbody>
+            <thead><tr><th>账号</th><th class="nowrap">状态</th><th class="nowrap">令牌到期</th><th class="nowrap">代理</th><th class="nowrap" style="min-width:250px">操作</th></tr></thead>
+            <tbody id="accountsBody"><tr><td colspan="5" class="empty sm">加载中…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card-foot" id="accountsPager"></div>
+      </div>
+    </section>
+
+    <!-- ============ 代理 ============ -->
+    <section class="view" id="view-proxies">
+      <div class="page-head">
+        <div>
+          <h1>上游代理</h1>
+          <p>给账号绑定出口代理，避免整池账号共用一个来源 IP。地址含密码，界面只显示打码形式。</p>
+        </div>
+        <div class="actions"><button class="btn primary" id="proxyAddBtn">新增代理</button></div>
+      </div>
+
+      <div class="card" id="proxyFormPanel" style="display:none">
+        <div class="card-head">
+          <div><h2>新增代理</h2><div class="hint">形如 <code>http://user:pass@host:port</code>，支持 http / https / socks4 / socks5。</div></div>
+          <button class="btn small ghost" id="proxyFormClose">关闭</button>
+        </div>
+        <div class="card-body">
+          <div class="grid two">
+            <label class="field"><span>代理地址</span><input type="text" id="proxyUrl" placeholder="http://user:pass@host:port" autocomplete="off" /></label>
+            <label class="field"><span>备注（可选）</span><input type="text" id="proxyLabel" placeholder="例如 美西住宅 / 提供商A" /></label>
+          </div>
+          <div class="row between" style="margin-top:12px">
+            <div class="sm err" id="proxyError" style="display:none; white-space:pre-wrap"></div>
+            <button class="btn primary" id="proxySubmit" style="margin-left:auto">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>代理列表</h2><button class="btn small" id="proxyReload">刷新</button></div>
+        <div class="card-body tight">
+          <table>
+            <thead><tr><th>备注 / 地址</th><th class="nowrap">状态</th><th class="nowrap">被引用</th><th class="nowrap" style="min-width:190px">操作</th></tr></thead>
+            <tbody id="proxiesBody"><tr><td colspan="4" class="empty sm">加载中…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -651,9 +742,13 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   function bucketLabel(b) { return b === "pass" ? "订阅" : (b === "free" ? "免费" : "Credits"); }
 
   /* ---------- credit / token formatting ---------- */
-  // Balances and costs arrive as micro-USD, so $0.50 is 500000. Cline's own UI
-  // divides by 1e4 and labels the result "credits" — 1 credit = $0.01. Both
-  // numbers are shown because the dashboard quotes the credit figure.
+  // Two dollar-ish scales come back from upstream and they are 100x apart, so
+  // each has its own constant here rather than one shared divider:
+  //   balance / creditsUsed -> micro-USD, 1e6 per USD
+  //   costUsd               -> 1e8 per USD
+  // The server already converts cost into dollars as costUsd; these helpers
+  // only deal with the micro-USD fields.
+  var COST_UNITS_PER_USD = 1e8;
   function fmtTok(n) {
     if (n === null || n === undefined) return "—";
     var v = Number(n) || 0;
@@ -666,6 +761,14 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (micro === null || micro === undefined) return "—";
     var v = Number(micro) / 1e6;
     return (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(4);
+  }
+  /** costUsd totals already arrive scaled to USD by the server. */
+  function fmtCost(usd) {
+    if (usd === null || usd === undefined) return "—";
+    var v = Number(usd) || 0;
+    if (v === 0) return "$0";
+    if (v < 0.01) return "$" + v.toFixed(5);
+    return "$" + v.toFixed(4);
   }
   function fmtCredits(micro) {
     if (micro === null || micro === undefined) return "—";
@@ -723,7 +826,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   }
 
   /* ---------- routing ---------- */
-  var views = ["overview", "models", "play", "accounts", "logs"];
+  var views = ["overview", "models", "play", "accounts", "proxies", "logs"];
   function show(name) {
     if (views.indexOf(name) < 0) name = "overview";
     views.forEach(function (v) {
@@ -736,6 +839,8 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (name === "models") loadModels();
     if (name === "play") loadPlayModels();
     if (name === "logs") loadLogs();
+    if (name === "accounts") { loadAccounts(); loadModels(); }
+    if (name === "proxies") loadProxyView();
     if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); }
   }
   var navButtons = document.querySelectorAll("#nav button");
@@ -770,6 +875,39 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   var WINDOW_LABEL = { five_hour: "5 小时", weekly: "本周", monthly: "本月" };
   var WINDOW_ORDER = ["five_hour", "weekly", "monthly"];
 
+  /**
+   * Render a pager into the host element.
+   *
+   * Paging is server-side: the usage and credits tables each cost upstream
+   * calls per row, so fetching the whole pool to display twenty would spend the
+   * upstream budget on rows nobody looks at. The pager therefore only reports
+   * and requests page numbers; it never slices client-side.
+   */
+  function renderPager(host, page, totalPages, total, pageSize, onGo) {
+    clear(host);
+    if (!total) return;
+    var from = (page - 1) * pageSize + 1;
+    var to = Math.min(page * pageSize, total);
+    var label = el("span", "xs muted",
+      (total > pageSize ? ("第 " + from + "–" + to + " 条，共 " + total + " 条") : ("共 " + total + " 条")));
+
+    var box = el("div", "pager");
+    function step(text, target, disabled) {
+      var b = el("button", null, text);
+      b.disabled = disabled;
+      if (!disabled) b.onclick = function () { onGo(target); };
+      box.appendChild(b);
+    }
+    step("首页", 1, page <= 1);
+    step("上一页", page - 1, page <= 1);
+    box.appendChild(el("span", "num xs", page + " / " + totalPages));
+    step("下一页", page + 1, page >= totalPages);
+    step("末页", totalPages, page >= totalPages);
+
+    host.appendChild(label);
+    host.appendChild(box);
+  }
+
   function quotaBar(limit) {
     var wrap = el("div", "q");
     wrap.appendChild(el("span", "lbl", WINDOW_LABEL[limit.type] || limit.type));
@@ -801,38 +939,58 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   }
 
   /**
-   * Credit rows keyed by account id.
+   * Usage window for the overview's consumption columns.
    *
-   * Loaded separately from the quota table because the two come from different
-   * upstream endpoints and fail independently: the usage-window call 404s on an
-   * account that has no plan, while the balance and today's token totals are
-   * still readable. A credits failure therefore leaves the quota table intact.
+   * Default is a rolling 24 hours rather than "today", because a rolling window
+   * is always full: two readings an hour apart are comparable, and the number
+   * does not drop to zero at midnight. "按自然日" restores the calendar view.
    */
+  var usageWindow = { hours: 24, anchorDay: false };
+  var usagePage = 1;
+  var usagePageSize = 20;
   var creditsById = {};
   var creditsLoaded = false;
   var creditsError = null;
 
-  function loadCredits(force) {
-    return api("/admin/api/credits" + (force ? "?refresh=1" : ""))
+  function windowQuery(extra) {
+    var parts = ["hours=" + encodeURIComponent(usageWindow.hours)];
+    if (usageWindow.anchorDay) parts.push("anchor=day");
+    if (extra) parts.push(extra);
+    return parts.join("&");
+  }
+
+  function windowLabel() {
+    var h = usageWindow.hours;
+    var span = h < 1 ? (Math.round(h * 60) + " 分钟")
+      : (h < 48 ? (h + " 小时") : (Math.round(h / 24) + " 天"));
+    return usageWindow.anchorDay ? ("本自然日（" + span + "）") : ("最近 " + span);
+  }
+
+  function loadCredits(force, page) {
+    var q = windowQuery("page=" + page + "&pageSize=" + usagePageSize + (force ? "&refresh=1" : ""));
+    return api("/admin/api/credits?" + q)
       .then(function (data) {
         var next = {};
         (data.accounts || []).forEach(function (row) { next[row.id] = row; });
         creditsById = next;
         creditsLoaded = true;
         creditsError = null;
+        return data;
       })
       .catch(function (e) {
         creditsError = e.message;
+        return null;
       });
   }
 
-  function renderUsage(data) {
+  function renderUsage(data, creditsMeta) {
     var body = $("usageBody");
     clear(body);
     var accounts = data.accounts || [];
     if (!accounts.length) {
       body.className = "muted sm";
       body.textContent = "还没有账号，先到「账号」页登录。";
+      renderPager($("usagePager"), 1, 1, 0, usagePageSize, function () {});
       return;
     }
     body.className = "";
@@ -847,8 +1005,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     var tbody = el("tbody");
     var worst = 0;
     var worstLabel = "";
-    var totalToday = 0;
-    var totalTodayCost = 0;
+    var totalTokens = 0;
+    var totalCost = 0;
+    var totalRequests = 0;
     var balanceSum = 0;
     var balanceKnown = 0;
 
@@ -865,33 +1024,35 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       if (a.error) tags.appendChild(el("span", "badge warn", summarize(a.error, 28)));
       if (tags.childNodes.length) acct.appendChild(tags);
 
-      // Today's token totals, per the overview's purpose: this is the line that
-      // answers "is this account actually doing work today".
-      var todayLine = el("div", "xs faint");
+      // Consumption over the selected window: the line that answers "is this
+      // account actually doing work", which a balance alone cannot.
+      var windowLine = el("div", "xs faint");
+      var creditWindow = credit ? credit.window : null;
       if (credit && credit.error) {
-        todayLine.className = "xs warn";
-        todayLine.textContent = "余额读取失败：" + summarize(credit.error, 40);
-      } else if (credit) {
-        totalToday += credit.today.totalTokens || 0;
-        totalTodayCost += credit.today.costMicroUsd || 0;
-        var bits = ["今日 " + fmtTok(credit.today.totalTokens) + " tok"];
-        bits.push((credit.today.requests || 0) + " 次");
-        if (credit.today.cachedTokens) bits.push("缓存 " + fmtTok(credit.today.cachedTokens));
-        if (credit.today.costMicroUsd) bits.push(fmtUsd(credit.today.costMicroUsd));
-        todayLine.textContent = bits.join(" · ");
-        acct.appendChild(todayLine);
+        windowLine.className = "xs warn";
+        windowLine.textContent = "余额读取失败：" + summarize(credit.error, 40);
+      } else if (creditWindow) {
+        totalTokens += creditWindow.totalTokens || 0;
+        totalCost += creditWindow.costUsd || 0;
+        totalRequests += creditWindow.requests || 0;
+        var bits = [windowLabel() + " " + fmtTok(creditWindow.totalTokens) + " tok"];
+        bits.push((creditWindow.requests || 0) + " 次");
+        if (creditWindow.cachedTokens) bits.push("缓存 " + fmtTok(creditWindow.cachedTokens));
+        if (creditWindow.costUsd) bits.push(fmtCost(creditWindow.costUsd));
+        windowLine.textContent = bits.join(" · ");
+        acct.appendChild(windowLine);
 
         var lastLine = el("div", "xs faint");
         if (credit.lastUsage) {
           lastLine.textContent = "最后 " + fmtAgo(credit.lastUsage.at) +
             (credit.lastUsage.model ? " · " + credit.lastUsage.model : "");
         } else {
-          lastLine.textContent = "今天暂无请求";
+          lastLine.textContent = "窗口内无请求";
         }
         acct.appendChild(lastLine);
       } else if (creditsLoaded && !creditsError) {
-        todayLine.textContent = "今日 —";
-        acct.appendChild(todayLine);
+        windowLine.textContent = windowLabel() + " —";
+        acct.appendChild(windowLine);
       }
       td1.appendChild(acct);
       tr.appendChild(td1);
@@ -957,24 +1118,35 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
     table.appendChild(tbody);
     body.appendChild(table);
-    var note = "用量来自上游 /api/v1/users/me/plan/usage-limits，余额与今日 token 来自 /api/v1/users/{uid}/balance 与 /usages；每账号 60 秒缓存一次。";
+    // Totals cover the rows on screen, not the whole pool — every other row
+    // would cost three more upstream calls for a number nobody reads.
+    var note = "用量来自 /api/v1/users/me/plan/usage-limits；余额与 token 来自 /v1/users/{uid}/balance 与 /usages（每账号 60 秒缓存）。本页合计仅统计当前页 " + accounts.length + " 个账号。";
     if (creditsError) note += " 本次余额读取失败：" + summarize(creditsError, 60);
     body.appendChild(el("div", "xs muted", note));
 
     $("sQuota").textContent = worst ? worst + "%" : "—";
     $("sQuotaHint").textContent = worstLabel || "三个窗口均未上报用量";
 
-    // Today's pool-wide token burn, shown where the balance total already lives.
-    $("sToday").textContent = fmtTok(totalToday);
-    var todayBits = ["跨 " + accounts.length + " 个账号"];
-    if (totalTodayCost) todayBits.push(fmtUsd(totalTodayCost));
+    $("sToday").textContent = fmtTok(totalTokens);
+    var todayBits = ["本页 " + accounts.length + " 个账号 · " + windowLabel()];
+    if (totalRequests) todayBits.push(totalRequests + " 次");
+    if (totalCost) todayBits.push(fmtCost(totalCost));
     if (balanceKnown) todayBits.push("合计余额 " + fmtUsd(balanceSum));
     $("sTodayHint").textContent = todayBits.join(" · ");
+
+    var meta = creditsMeta || { page: 1, pageSize: usagePageSize, total: accounts.length, totalPages: 1 };
+    renderPager($("usagePager"), meta.page, meta.totalPages, meta.total, meta.pageSize, function (p) {
+      usagePage = p;
+      loadUsage(false, p);
+    });
   }
 
-  function loadUsage(force) {
-    Promise.all([api("/admin/api/usage"), loadCredits(force)]).then(function (res) {
-      renderUsage(res[0]);
+  function loadUsage(force, page) {
+    var target = page || usagePage;
+    usagePage = target;
+    var usageUrl = "/admin/api/usage?page=" + target + "&pageSize=" + usagePageSize;
+    Promise.all([api(usageUrl), loadCredits(force, target)]).then(function (res) {
+      renderUsage(res[0], res[1]);
     }).catch(function (e) {
       var body = $("usageBody");
       clear(body);
@@ -984,6 +1156,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       $("sQuotaHint").textContent = "读取失败";
     });
   }
+
 
   function loadStatus() {
     api("/admin/api/status").then(function (data) {
@@ -1456,48 +1629,248 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       btn.disabled = false;
     });
   }
-  function loadAccounts() {
-    api("/admin/api/accounts").then(function (data) {
+  /* ---------- account list: paging, filtering, per-account actions ---------- */
+  var acctPage = 1;
+  var acctPageSize = 20;
+  var acctFilter = { q: "", status: "all" };
+  var proxiesById = {};
+
+  function loadProxies() {
+    return api("/admin/api/proxies").then(function (data) {
+      proxiesById = {};
+      (data.proxies || []).forEach(function (p) { proxiesById[p.id] = p; });
+      return data.proxies || [];
+    }).catch(function () {
+      proxiesById = {};
+      return [];
+    });
+  }
+
+  /** Pick which proxy an account egresses through. */
+  function proxySelect(a) {
+    var sel = el("select", "sm");
+    sel.style.width = "auto";
+    sel.style.minWidth = "104px";
+    var none = el("option", null, "直连");
+    none.value = "";
+    sel.appendChild(none);
+    Object.keys(proxiesById).forEach(function (id) {
+      var p = proxiesById[id];
+      var opt = el("option", null, (p.label || p.url) + (p.enabled ? "" : "（停用）"));
+      opt.value = id;
+      sel.appendChild(opt);
+    });
+    sel.value = a.proxyId || "";
+    sel.onchange = function () {
+      sel.disabled = true;
+      jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id), {
+        method: "PATCH",
+        body: JSON.stringify({ proxyId: sel.value || null }),
+      }).then(function () {
+        toast(sel.value ? "已绑定代理" : "已改为直连", "ok");
+        loadAccounts();
+      }).catch(function (e) {
+        toast("绑定失败：" + e.message, "err");
+        sel.value = a.proxyId || "";
+      }).finally(function () { sel.disabled = false; });
+    };
+    return sel;
+  }
+
+  function toggleAccount(a) {
+    var next = !a.disabled;
+    var verb = next ? "停用" : "启用";
+    if (next && !confirm("停用账号 " + (a.email || a.id) + " ？停用后该账号不再参与轮询。")) return;
+    jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id), {
+      method: "PATCH",
+      body: JSON.stringify({ disabled: next }),
+    }).then(function () {
+      toast(verb + "成功", "ok");
+      loadAccounts(); loadStatus();
+    }).catch(function (e) { toast(verb + "失败：" + e.message, "err"); });
+  }
+
+  /**
+   * Liveness check: forces a token refresh and calls /users/me.
+   *
+   * Costs no inference, which is the point — a pool full of accounts whose
+   * refresh token died silently can be triaged without spending a single
+   * credit on requests that were only ever going to fail.
+   */
+  function probeAccountRow(a, btn) {
+    var cell = btn.parentNode;
+    btn.disabled = true;
+    btn.textContent = "检测中…";
+    jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/probe", { method: "POST" })
+      .then(function (r) {
+        btn.textContent = r.ok ? "测活" : "重试";
+        if (r.ok) {
+          toast((a.email || a.id) + " 存活 · " + r.latencyMs + "ms", "ok");
+        } else {
+          toast((a.email || a.id) + " 无响应：" + summarize(r.error, 70), "err");
+        }
+        var badge = el("div", "xs " + (r.ok ? "ok" : "err"),
+          (r.ok ? "存活 " : "失败 ") + r.latencyMs + "ms" +
+          (r.stage === "credential" ? " · 令牌" : (r.stage === "identity" ? " · 上游" : "")));
+        var old = cell.querySelector(".probe-result");
+        if (old) old.remove();
+        badge.className += " probe-result";
+        badge.title = r.error || ("uid " + (r.uid || "-"));
+        cell.appendChild(badge);
+      })
+      .catch(function (e) {
+        btn.textContent = "测活";
+        toast("测活失败：" + e.message, "err");
+      })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  /**
+   * Send one real request through this account, for a chosen model.
+   *
+   * Pinned to the account, so the verdict describes it rather than whichever
+   * account in the pool happened to answer. Opens an inline panel with a model
+   * picker and a prompt box instead of firing immediately.
+   */
+  function openAccountTest(a, cell) {
+    var existing = cell.querySelector(".test-panel");
+    if (existing) { existing.remove(); return; }
+
+    var panel = el("div", "test-panel");
+    panel.style.cssText = "margin-top:8px; padding:10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2)";
+
+    var sel = el("select", "sm");
+    sel.style.width = "100%";
+    var groups = [["pass", "订阅可用"], ["free", "免费"], ["credits", "需 Cline Credits"]];
+    groups.forEach(function (g) {
+      var set = catalog.filter(function (m) { return m.bucket === g[0]; });
+      if (!set.length) return;
+      var og = document.createElement("optgroup");
+      og.label = g[1];
+      set.slice(0, 120).forEach(function (m) {
+        var o = el("option", null, m.id);
+        o.value = m.id;
+        og.appendChild(o);
+      });
+      sel.appendChild(og);
+    });
+    if (catalog.length) {
+      var preferred = catalog.find(function (m) { return m.bucket === "free"; }) || catalog[0];
+      sel.value = preferred.id;
+    }
+    panel.appendChild(el("div", "xs muted", "模型"));
+    panel.appendChild(sel);
+
+    var prompt = el("input", "sm");
+    prompt.type = "text";
+    prompt.value = "只回复两个字：可用";
+    prompt.style.marginTop = "6px";
+    panel.appendChild(el("div", "xs muted", "提示词"));
+    panel.appendChild(prompt);
+
+    var run = el("button", "btn small primary", "发送测试请求");
+    run.style.marginTop = "8px";
+    var out = el("div", "xs");
+    out.style.cssText = "margin-top:8px; white-space:pre-wrap; word-break:break-word";
+    panel.appendChild(run);
+    panel.appendChild(out);
+
+    run.onclick = function () {
+      run.disabled = true;
+      out.className = "xs muted";
+      out.textContent = "请求中…";
+      jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/test", {
+        method: "POST",
+        body: JSON.stringify({ model: sel.value, prompt: prompt.value }),
+      }).then(function (r) {
+        if (r.ok) {
+          out.className = "xs ok";
+          var tok = r.usage && r.usage.total_tokens ? (" · " + r.usage.total_tokens + " tok") : "";
+          out.textContent = "成功 " + r.latencyMs + "ms" + tok + "\n" + (r.content || "(空响应)");
+        } else {
+          out.className = "xs err";
+          out.textContent = "失败 HTTP " + r.status + " · " + r.latencyMs + "ms\n" + summarize(r.error, 400);
+        }
+      }).catch(function (e) {
+        out.className = "xs err";
+        out.textContent = "请求失败：" + e.message;
+      }).finally(function () { run.disabled = false; });
+    };
+
+    cell.appendChild(panel);
+  }
+
+  function loadAccounts(page) {
+    var target = page || acctPage;
+    acctPage = target;
+    var q = "?page=" + target + "&pageSize=" + acctPageSize +
+      "&status=" + encodeURIComponent(acctFilter.status) +
+      "&q=" + encodeURIComponent(acctFilter.q);
+
+    Promise.all([api("/admin/api/accounts" + q), loadProxies()]).then(function (res) {
+      var data = res[0];
       var body = $("accountsBody");
       clear(body);
-      $("accountsEmpty").style.display = data.accounts.length ? "none" : "block";
-      if (!data.accounts.length) {
-        var tr = el("tr");
-        var td = el("td", "empty sm", "还没有账号。");
-        td.colSpan = 4;
-        tr.appendChild(td);
-        body.appendChild(tr);
+      $("accountsEmpty").style.display = data.total ? "none" : "block";
+      var accounts = data.accounts || [];
+      if (!accounts.length) {
+        var tr0 = el("tr");
+        var td0 = el("td", "empty sm", acctFilter.q || acctFilter.status !== "all"
+          ? "没有匹配的账号。"
+          : "还没有账号。");
+        td0.colSpan = 5;
+        tr0.appendChild(td0);
+        body.appendChild(tr0);
+        renderPager($("accountsPager"), 1, 1, 0, acctPageSize, function () {});
         return;
       }
-      data.accounts.forEach(function (a) {
+
+      accounts.forEach(function (a) {
         var tr = el("tr");
         var td1 = el("td");
-        td1.appendChild(el("div", null, a.email || a.id));
+        td1.appendChild(el("div", null, a.label ? (a.label + " · " + (a.email || a.id)) : (a.email || a.id)));
         td1.appendChild(el("div", "xs faint mono", a.id));
         tr.appendChild(td1);
 
         var td2 = el("td", "nowrap");
-        td2.appendChild(el("span", "badge " + (a.disabled ? "err" : "pass"), a.disabled ? "需重新登录" : "可用"));
-        if (a.disabled && a.lastError) td2.appendChild(el("div", "xs muted", summarize(a.lastError, 50)));
+        td2.appendChild(el("span", "badge " + (a.disabled ? "err" : "pass"), a.disabled ? "已停用" : "可用"));
+        if (a.lastError) td2.appendChild(el("div", "xs muted", summarize(a.lastError, 50)));
         tr.appendChild(td2);
 
         var td3 = el("td", "nowrap sm num", fmtExpiry(a.expiresAt));
         tr.appendChild(td3);
 
+        var tdProxy = el("td", "nowrap");
+        tdProxy.appendChild(proxySelect(a));
+        tr.appendChild(tdProxy);
+
         var td4 = el("td", "nowrap");
+        var test = el("button", "btn small", "单号测试");
+        test.onclick = function () { openAccountTest(a, td4); };
+        var probe = el("button", "btn small", "测活");
+        probe.onclick = function () { probeAccountRow(a, probe); };
+        var toggle = el("button", "btn small", a.disabled ? "启用" : "停用");
+        toggle.onclick = function () { toggleAccount(a); };
         var del = el("button", "btn small danger", "删除");
         del.onclick = function () { removeAccount(a); };
-        td4.appendChild(del);
+        [test, probe, toggle, del].forEach(function (b) {
+          b.style.marginRight = "5px";
+          td4.appendChild(b);
+        });
         tr.appendChild(td4);
 
         body.appendChild(tr);
+      });
+
+      renderPager($("accountsPager"), data.page, data.totalPages, data.total, data.pageSize, function (p) {
+        loadAccounts(p);
       });
     }).catch(function (e) {
       var body = $("accountsBody");
       clear(body);
       var tr = el("tr");
       var td = el("td", "empty err sm", "账号读取失败：" + e.message);
-      td.colSpan = 4;
+      td.colSpan = 5;
       tr.appendChild(td);
       body.appendChild(tr);
     });
@@ -1508,6 +1881,96 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       toast("已删除", "ok");
       loadAccounts(); loadStatus(); loadUsage();
     }).catch(function (e) { toast("删除失败：" + e.message, "err"); });
+  }
+
+  /* ---------- proxies ---------- */
+  function loadProxyView() {
+    loadProxies().then(function (list) {
+      var body = $("proxiesBody");
+      clear(body);
+      if (!list.length) {
+        var tr = el("tr");
+        var td = el("td", "empty sm", "还没有配置代理。所有账号直连上游。");
+        td.colSpan = 4;
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+      }
+      list.forEach(function (p) {
+        var tr = el("tr");
+
+        var td1 = el("td");
+        td1.appendChild(el("div", null, p.label || "(无备注)"));
+        td1.appendChild(el("div", "xs faint mono", p.url));
+        if (p.lastError) td1.appendChild(el("div", "xs err", "最近错误：" + summarize(p.lastError, 70)));
+        tr.appendChild(td1);
+
+        var td2 = el("td", "nowrap");
+        td2.appendChild(el("span", "badge " + (p.enabled ? "pass" : "warn"), p.enabled ? "启用" : "停用"));
+        tr.appendChild(td2);
+
+        var td3 = el("td", "nowrap sm num", p.usedBy > 0 ? (p.usedBy + " 个账号") : "未使用");
+        tr.appendChild(td3);
+
+        var td4 = el("td", "nowrap");
+        var toggle = el("button", "btn small", p.enabled ? "停用" : "启用");
+        toggle.onclick = function () {
+          jsonApi("/admin/api/proxies/" + encodeURIComponent(p.id), {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: !p.enabled }),
+          }).then(function () { toast("已更新", "ok"); loadProxyView(); })
+            .catch(function (e) { toast("更新失败：" + e.message, "err"); });
+        };
+        var del = el("button", "btn small danger", "删除");
+        del.onclick = function () {
+          var msg = p.usedBy > 0
+            ? ("该代理被 " + p.usedBy + " 个账号引用。删除后这些账号会改为直连（从本机 IP 出网）。确定？")
+            : ("确定删除代理 " + (p.label || p.url) + " ？");
+          if (!confirm(msg)) return;
+          var path = "/admin/api/proxies/" + encodeURIComponent(p.id) + (p.usedBy > 0 ? "?force=1" : "");
+          api(path, { method: "DELETE" }).then(function (r) {
+            toast(r.unassigned ? ("已删除，解绑 " + r.unassigned + " 个账号") : "已删除", "ok");
+            loadProxyView();
+          }).catch(function (e) { toast("删除失败：" + e.message, "err"); });
+        };
+        [toggle, del].forEach(function (b) { b.style.marginRight = "5px"; td4.appendChild(b); });
+        tr.appendChild(td4);
+
+        body.appendChild(tr);
+      });
+    }).catch(function (e) {
+      var body = $("proxiesBody");
+      clear(body);
+      var tr = el("tr");
+      var td = el("td", "empty err sm", "代理读取失败：" + e.message);
+      td.colSpan = 4;
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  function submitProxy() {
+    var err = $("proxyError");
+    err.style.display = "none";
+    var url = $("proxyUrl").value.trim();
+    if (!url) {
+      err.textContent = "请填写代理地址";
+      err.style.display = "block";
+      return;
+    }
+    jsonApi("/admin/api/proxies", {
+      method: "POST",
+      body: JSON.stringify({ url: url, label: $("proxyLabel").value.trim() || null }),
+    }).then(function () {
+      toast("已保存", "ok");
+      $("proxyUrl").value = "";
+      $("proxyLabel").value = "";
+      $("proxyFormPanel").style.display = "none";
+      loadProxyView();
+    }).catch(function (e) {
+      err.textContent = e.message;
+      err.style.display = "block";
+    });
   }
   function setLoginState(text, kind) {
     var node = $("loginState");
@@ -1663,6 +2126,58 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   $("refreshAll").onclick = function () { loadStatus(); loadUsage(true); loadAccounts(); loadMiniLogs(); loadModels(true); toast("已刷新"); };
   // Forced, not cached: the button exists precisely to re-read upstream now.
   $("usageReload").onclick = function () { loadUsage(true); };
+
+  /* ---------- window + account filter controls ---------- */
+  function syncWindowControls() {
+    var preset = $("winPreset").value;
+    var custom = preset === "custom";
+    $("winHours").style.display = custom ? "inline-block" : "none";
+    if (!custom) usageWindow.hours = Number(preset);
+    else {
+      var v = Number($("winHours").value);
+      usageWindow.hours = (isFinite(v) && v > 0) ? Math.min(v, 720) : 24;
+    }
+  }
+  $("winPreset").onchange = function () {
+    syncWindowControls();
+    usagePage = 1;
+    loadUsage();
+  };
+  $("winHours").onchange = function () {
+    syncWindowControls();
+    usagePage = 1;
+    loadUsage();
+  };
+  $("winAnchorDay").onchange = function () {
+    usageWindow.anchorDay = this.checked;
+    usagePage = 1;
+    loadUsage();
+  };
+
+  $("acctStatus").onchange = function () {
+    acctFilter.status = this.value;
+    acctPage = 1;
+    loadAccounts(1);
+  };
+  var acctSearchTimer = null;
+  $("acctSearch").oninput = function () {
+    var value = this.value;
+    clearTimeout(acctSearchTimer);
+    acctSearchTimer = setTimeout(function () {
+      acctFilter.q = value.trim();
+      acctPage = 1;
+      loadAccounts(1);
+    }, 250);
+  };
+  $("acctReload").onclick = function () { loadAccounts(); toast("已刷新账号列表"); };
+
+  $("proxyAddBtn").onclick = function () {
+    $("proxyFormPanel").style.display = "block";
+    $("proxyUrl").focus();
+  };
+  $("proxyFormClose").onclick = function () { $("proxyFormPanel").style.display = "none"; };
+  $("proxySubmit").onclick = submitProxy;
+  $("proxyReload").onclick = function () { loadProxyView(); toast("已刷新代理列表"); };
 
   /* ---------- boot ---------- */
   fillSnippets();

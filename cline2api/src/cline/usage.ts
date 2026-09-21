@@ -12,9 +12,11 @@
  * (the internal plan reports 1e9, i.e. effectively uncapped), so the percentage
  * from this endpoint is what actually matters for display.
  */
+import type { Dispatcher } from "undici";
 import type { AppConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import { defaultClineHeaders } from "./constants.js";
+import { fetchWith } from "./proxy.js";
 
 export type UsageWindowType = "five_hour" | "weekly" | "monthly" | string;
 
@@ -34,23 +36,28 @@ export async function fetchUsageLimits(
   config: AppConfig,
   authorization: string,
   logger: Logger,
+  dispatcher?: Dispatcher,
 ): Promise<UsageLimitsResult> {
   try {
-    const response = await fetch(`${config.clineApiBaseUrl}/api/v1/users/me/plan/usage-limits`, {
-      headers: {
-        Authorization: authorization,
-        Accept: "application/json",
-        ...defaultClineHeaders({
-          clientName: config.clientName,
-          clientVersion: config.clientVersion,
-          platform: config.platform,
-          platformVersion: config.platformVersion,
-          coreVersion: config.coreVersion,
-          taskId: "admin-usage",
-        }),
+    const response = await fetchWith(
+      `${config.clineApiBaseUrl}/api/v1/users/me/plan/usage-limits`,
+      {
+        headers: {
+          Authorization: authorization,
+          Accept: "application/json",
+          ...defaultClineHeaders({
+            clientName: config.clientName,
+            clientVersion: config.clientVersion,
+            platform: config.platform,
+            platformVersion: config.platformVersion,
+            coreVersion: config.coreVersion,
+            taskId: "admin-usage",
+          }),
+        },
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
       },
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-    });
+      dispatcher,
+    );
     if (!response.ok) return { limits: [], error: `HTTP ${response.status}` };
 
     const payload = (await response.json()) as { data?: { limits?: unknown } };

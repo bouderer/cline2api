@@ -12,12 +12,14 @@
  *   - throws for transient failures once the token is already expired, so
  *     callers never wipe stored credentials over a network blip.
  */
+import type { Dispatcher } from "undici";
 import {
   CLINE_AUTH_ENDPOINTS,
   DEVICE_GRANT_TYPE,
   WORKOS_ENDPOINTS,
   WORKOS_TOKEN_PREFIX,
 } from "./constants.js";
+import { fetchWith } from "./proxy.js";
 import type {
   ClineCredentials,
   ClineTokenResponse,
@@ -61,6 +63,15 @@ export interface AuthEndpointOptions {
   requestTimeoutMs: number;
   headers?: Record<string, string>;
   provider?: string;
+  /**
+   * Egress through this dispatcher.
+   *
+   * Only the account-scoped calls (refresh, and register when re-registering a
+   * known account) have an account to take a proxy from; the device-code and
+   * callback steps run before an account exists, so they leave this unset and
+   * connect directly.
+   */
+  dispatcher?: Dispatcher;
 }
 
 export function resolveUrl(base: string, path: string): string {
@@ -450,18 +461,22 @@ export async function registerWorkOSTokens(
   workosTokens: DevicePollResult,
   options: AuthEndpointOptions,
 ): Promise<ClineCredentials> {
-  const response = await fetch(resolveUrl(options.clineApiBaseUrl, CLINE_AUTH_ENDPOINTS.register), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers ?? {}),
+  const response = await fetchWith(
+    resolveUrl(options.clineApiBaseUrl, CLINE_AUTH_ENDPOINTS.register),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers ?? {}),
+      },
+      body: JSON.stringify({
+        accessToken: workosTokens.accessToken,
+        refreshToken: workosTokens.refreshToken,
+      }),
+      signal: AbortSignal.timeout(options.requestTimeoutMs),
     },
-    body: JSON.stringify({
-      accessToken: workosTokens.accessToken,
-      refreshToken: workosTokens.refreshToken,
-    }),
-    signal: AbortSignal.timeout(options.requestTimeoutMs),
-  });
+    options.dispatcher,
+  );
   if (!response.ok) {
     const details = parseAuthError(await response.text().catch(() => ""));
     throw new ClineAuthError(
@@ -491,15 +506,19 @@ export async function refreshClineToken(
   current: ClineCredentials,
   options: AuthEndpointOptions,
 ): Promise<ClineCredentials> {
-  const response = await fetch(resolveUrl(options.clineApiBaseUrl, CLINE_AUTH_ENDPOINTS.refresh), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers ?? {}),
+  const response = await fetchWith(
+    resolveUrl(options.clineApiBaseUrl, CLINE_AUTH_ENDPOINTS.refresh),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers ?? {}),
+      },
+      body: JSON.stringify({ refreshToken: current.refresh, grantType: "refresh_token" }),
+      signal: AbortSignal.timeout(options.requestTimeoutMs),
     },
-    body: JSON.stringify({ refreshToken: current.refresh, grantType: "refresh_token" }),
-    signal: AbortSignal.timeout(options.requestTimeoutMs),
-  });
+    options.dispatcher,
+  );
   if (!response.ok) {
     const details = parseAuthError(await response.text().catch(() => ""));
     throw new ClineAuthError(

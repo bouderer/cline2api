@@ -47,6 +47,8 @@ export interface StoredAccount {
   expires: number;
   tokenType: string;
   provider: string;
+  /** Upstream proxy this account egresses through, or null for direct. */
+  proxyId?: string | null;
   createdAt: number;
   updatedAt: number;
   disabled: boolean;

@@ -1,11 +1,15 @@
 /** Upstream transport for Cline chat completions. */
+import type { Dispatcher } from "undici";
 import type { AppConfig } from "../config.js";
 import { CLINE_CHAT_PATH, defaultClineHeaders } from "./constants.js";
+import { fetchWith } from "./proxy.js";
 
 export interface UpstreamRequestContext {
   authorization: string;
   taskId: string;
   signal?: AbortSignal;
+  /** Egress through this dispatcher — the account's assigned proxy. */
+  dispatcher?: Dispatcher;
 }
 
 export function buildUpstreamHeaders(
@@ -37,10 +41,14 @@ export async function postChatCompletions(
   body: unknown,
   context: UpstreamRequestContext,
 ): Promise<Response> {
-  return fetch(chatCompletionsUrl(config), {
-    method: "POST",
-    headers: buildUpstreamHeaders(config, context),
-    body: JSON.stringify(body),
-    ...(context.signal ? { signal: context.signal } : { signal: AbortSignal.timeout(600_000) }),
-  });
+  return fetchWith(
+    chatCompletionsUrl(config),
+    {
+      method: "POST",
+      headers: buildUpstreamHeaders(config, context),
+      body: JSON.stringify(body),
+      ...(context.signal ? { signal: context.signal } : { signal: AbortSignal.timeout(600_000) }),
+    },
+    context.dispatcher,
+  );
 }

@@ -24,22 +24,66 @@
  *
  * `creditsUsed` is 0 on free-tier and Cline Pass traffic: those are billed to
  * the subscription, not drawn from the balance. Token counts are populated for
- * all of it, which is why the daily totals below are built from tokens rather
+ * all of it, which is why the window totals below are built from tokens rather
  * than from credits.
+ *
+ * The window defaults to the last 24 hours rather than "today": a rolling
+ * window is always full, so the number does not drop to zero at midnight, and
+ * two readings an hour apart are comparable. `snapToDay` restores the calendar
+ * behaviour when that is what is wanted.
  */
+import type { Dispatcher } from "undici";
 import type { AppConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import { defaultClineHeaders } from "./constants.js";
+import { fetchWith } from "./proxy.js";
 
-/** `balance` and `costUsd` arrive in millionths of a dollar. */
+/**
+ * Three dollar-ish numbers, in three different scales. Mixing them up is a
+ * silent 100x error, so each one is named for its own unit:
+ *
+ *   balance      1e-6 USD  — micro-USD. Proven by a live 402 whose body
+ *                            reports the same account as `$-0.02` for a
+ *                            balance of `-19229`.
+ *   creditsUsed  1e-6 USD  — micro-USD. Cline's own UI renders it as
+ *                            `creditsUsed / 1e6` with a `$` prefix.
+ *   costUsd      1e-8 USD  — two orders finer than the other two. Proven by
+ *                            cross-referencing one request: the chat response
+ *                            reported `cost_details.upstream_inference_cost:
+ *                            0.000039` for 8 prompt + 1 completion on
+ *                            claude-sonnet-4.6, and the usage ledger holds the
+ *                            same request with `costUsd: 3900`. 3900 / 1e8 =
+ *                            0.000039.
+ *
+ * The live ratio `costUsd / creditsUsed` is exactly 100 across every paid
+ * record, which is the 1e8 / 1e6 gap and confirms they are the same quantity.
+ */
 export const MICRO_USD = 1_000_000;
+/** Divisor for `costUsd`. NOT the same as MICRO_USD — see above. */
+export const COST_UNITS_PER_USD = 100_000_000;
 /** Cline's UI shows micro-USD / 1e4 and calls it credits, so 1 credit = $0.01. */
 export const MICRO_USD_PER_CREDIT = 10_000;
 
 /** Per-request page size. Upstream clamps anything larger down to 200. */
 const USAGE_PAGE_LIMIT = 200;
-/** Stop paging after this many pages even if the window is not covered yet. */
-const USAGE_MAX_PAGES = 5;
+
+/**
+ * Page cap, scaled to the window being read.
+ *
+ * A wider window covers more history, so a fixed cap would silently truncate
+ * the totals on the widest setting. The cap only ever binds on a very busy
+ * account: the walk stops as soon as it reaches the window start, so most
+ * reads finish on the first page.
+ */
+function maxPagesFor(windowMs: number): number {
+  const perHour = Math.ceil(windowMs / (60 * 60 * 1000));
+  return Math.max(5, Math.min(50, perHour));
+}
+
+/** Longest window the admin surface will read. Anything more is clamped. */
+export const MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+/** Default window: a rolling day, so it never resets to zero at midnight. */
+export const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface UsageRecord {
   id: string;
@@ -52,8 +96,14 @@ export interface UsageRecord {
   completionTokens: number;
   totalTokens: number;
   cachedTokens: number;
-  /** Micro-USD actually billed to the provider for this request. */
+  /**
+   * Upstream provider cost for this request, in 1e-8 USD.
+   *
+   * Named for what upstream calls the field (`costUsd`), which is misleading:
+   * see COST_UNITS_PER_USD for why this is not micro-USD.
+   */
   costMicroUsd: number;
+  /** Charged to the account, in micro-USD. Zero on free and Pass traffic. */
   creditsUsed: number;
 }
 
@@ -64,8 +114,12 @@ export interface UsageTotals {
   completionTokens: number;
   cachedTokens: number;
   totalTokens: number;
-  costMicroUsd: number;
-  creditsUsed: number;
+  /** Summed `costUsd` units, 1e8 per USD. Kept raw for exact totals. */
+  costUnits: number;
+  /** The same total in dollars, scaled once here so callers cannot mis-scale it. */
+  costUsd: number;
+  /** Summed `creditsUsed`, micro-USD. */
+  creditsMicroUsd: number;
 }
 
 export interface AccountCredits {
@@ -74,11 +128,22 @@ export interface AccountCredits {
   balanceMicroUsd: number | null;
   balanceUsd: number | null;
   balanceCredits: number | null;
-  /** Local-midnight-to-now totals for this account. */
-  today: UsageTotals;
+  /** Totals over the requested window for this account. */
+  window: UsageTotals;
+  /** Window bounds, epoch millis, echoed so the UI can label the column. */
+  since: number;
+  until: number;
+  windowMs: number;
+  /** True when the window was snapped to local midnight instead of rolling. */
+  snappedToDay: boolean;
   lastUsage: UsageRecord | null;
   /** Upstream failure that made part of this row unavailable. */
   error: string | null;
+}
+
+/** Window selection plus the egress the account is assigned to. */
+export interface AccountCreditsOptions extends UsageWindowRequest {
+  dispatcher?: Dispatcher;
 }
 
 function emptyTotals(): UsageTotals {
@@ -88,8 +153,9 @@ function emptyTotals(): UsageTotals {
     completionTokens: 0,
     cachedTokens: 0,
     totalTokens: 0,
-    costMicroUsd: 0,
-    creditsUsed: 0,
+    costUnits: 0,
+    costUsd: 0,
+    creditsMicroUsd: 0,
   };
 }
 
@@ -136,12 +202,17 @@ export async function fetchUserId(
   config: AppConfig,
   authorization: string,
   logger: Logger,
+  dispatcher?: Dispatcher,
 ): Promise<string | null> {
   try {
-    const response = await fetch(`${config.clineApiBaseUrl}/api/v1/users/me`, {
-      headers: headersFor(config, authorization, "admin-me"),
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-    });
+    const response = await fetchWith(
+      `${config.clineApiBaseUrl}/api/v1/users/me`,
+      {
+        headers: headersFor(config, authorization, "admin-me"),
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      },
+      dispatcher,
+    );
     if (!response.ok) {
       logger.warn("user lookup failed", { status: response.status });
       return null;
@@ -161,14 +232,16 @@ export async function fetchBalance(
   authorization: string,
   uid: string,
   logger: Logger,
+  dispatcher?: Dispatcher,
 ): Promise<number | null> {
   try {
-    const response = await fetch(
+    const response = await fetchWith(
       `${config.clineApiBaseUrl}/api/v1/users/${encodeURIComponent(uid)}/balance`,
       {
         headers: headersFor(config, authorization, "admin-balance"),
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       },
+      dispatcher,
     );
     if (!response.ok) {
       logger.warn("balance lookup failed", { status: response.status });
@@ -209,9 +282,8 @@ function toUsageRecord(raw: unknown): UsageRecord | null {
  * Usage records back to `since`, newest first.
  *
  * Upstream returns 200 items per page regardless of a larger `limit`, so this
- * walks the `cursor` until the window is covered. Bounded by USAGE_MAX_PAGES:
- * a busy account can otherwise page for a long time, and a slightly short
- * daily total is better than an admin page that never returns.
+ * walks the `cursor` until the window is covered. `windowMs` only sets the page
+ * cap — the walk itself stops at `since`.
  */
 export async function fetchUsagesSince(
   config: AppConfig,
@@ -219,11 +291,14 @@ export async function fetchUsagesSince(
   uid: string,
   since: number,
   logger: Logger,
+  windowMs: number = DEFAULT_WINDOW_MS,
+  dispatcher?: Dispatcher,
 ): Promise<UsageRecord[]> {
   const collected: UsageRecord[] = [];
   let cursor: string | null = null;
+  const maxPages = maxPagesFor(windowMs);
 
-  for (let page = 0; page < USAGE_MAX_PAGES; page += 1) {
+  for (let page = 0; page < maxPages; page += 1) {
     const url = new URL(
       `${config.clineApiBaseUrl}/api/v1/users/${encodeURIComponent(uid)}/usages`,
     );
@@ -232,10 +307,14 @@ export async function fetchUsagesSince(
 
     let payload: { data?: unknown };
     try {
-      const response = await fetch(url, {
-        headers: headersFor(config, authorization, "admin-usages"),
-        signal: AbortSignal.timeout(config.requestTimeoutMs),
-      });
+      const response = await fetchWith(
+        url,
+        {
+          headers: headersFor(config, authorization, "admin-usages"),
+          signal: AbortSignal.timeout(config.requestTimeoutMs),
+        },
+        dispatcher,
+      );
       if (!response.ok) {
         logger.warn("usage lookup failed", { status: response.status, page });
         break;
@@ -279,15 +358,57 @@ export function sumUsage(records: readonly UsageRecord[]): UsageTotals {
     totals.completionTokens += record.completionTokens;
     totals.cachedTokens += record.cachedTokens;
     totals.totalTokens += record.totalTokens;
-    totals.costMicroUsd += record.costMicroUsd;
-    totals.creditsUsed += record.creditsUsed;
+    totals.costUnits += record.costMicroUsd;
+    totals.creditsMicroUsd += record.creditsUsed;
   }
+  totals.costUsd = totals.costUnits / COST_UNITS_PER_USD;
   return totals;
 }
 
+/** The window an admin read covers, resolved from request options. */
+export interface UsageWindowRequest {
+  /** Window length in millis. Clamped to [1 minute, MAX_WINDOW_MS]. */
+  windowMs?: number;
+  /**
+   * Snap the start to local midnight instead of a rolling window. Only
+   * meaningful for a roughly day-long window; it is ignored otherwise.
+   */
+  snapToDay?: boolean;
+  /** Reference time, defaulting to now. Tests pass a fixed value. */
+  now?: number;
+}
+
+export interface ResolvedWindow {
+  since: number;
+  until: number;
+  windowMs: number;
+  snappedToDay: boolean;
+}
+
+const MIN_WINDOW_MS = 60 * 1000;
+
+/** Turn request options into concrete bounds, clamping anything out of range. */
+export function resolveWindow(options: UsageWindowRequest = {}): ResolvedWindow {
+  const until = options.now ?? Date.now();
+  const requested = options.windowMs ?? DEFAULT_WINDOW_MS;
+  const windowMs = Math.max(
+    MIN_WINDOW_MS,
+    Math.min(MAX_WINDOW_MS, Number.isFinite(requested) ? requested : DEFAULT_WINDOW_MS),
+  );
+
+  // Snapping only makes sense for a day-scale window: for a 15-minute window it
+  // would return however much of today has elapsed instead of the last 15
+  // minutes, which is the opposite of what was asked for.
+  const dayish = windowMs >= 23 * 60 * 60 * 1000 && windowMs <= 25 * 60 * 60 * 1000;
+  if (options.snapToDay === true && dayish) {
+    return { since: startOfLocalDay(until), until, windowMs, snappedToDay: true };
+  }
+  return { since: until - windowMs, until, windowMs, snappedToDay: false };
+}
+
 /**
- * Everything the admin UI shows for one account: balance, today's totals and
- * the most recent request. `authorization` must already be resolved by the
+ * Everything the admin UI shows for one account: balance, the window's totals
+ * and the most recent request. `authorization` must already be resolved by the
  * caller, so a dead credential surfaces as an error here rather than a
  * confusing empty row.
  */
@@ -295,25 +416,37 @@ export async function fetchAccountCredits(
   config: AppConfig,
   authorization: string,
   logger: Logger,
-  options: { now?: number } = {},
+  options: AccountCreditsOptions = {},
 ): Promise<AccountCredits> {
-  const uid = await fetchUserId(config, authorization, logger);
+  const window = resolveWindow(options);
+  const uid = await fetchUserId(config, authorization, logger, options.dispatcher);
   if (uid === null) {
     return {
       uid: null,
       balanceMicroUsd: null,
       balanceUsd: null,
       balanceCredits: null,
-      today: emptyTotals(),
+      window: emptyTotals(),
+      since: window.since,
+      until: window.until,
+      windowMs: window.windowMs,
+      snappedToDay: window.snappedToDay,
       lastUsage: null,
       error: "user lookup failed",
     };
   }
 
-  const since = startOfLocalDay(options.now ?? Date.now());
   const [balanceMicroUsd, usages] = await Promise.all([
-    fetchBalance(config, authorization, uid, logger),
-    fetchUsagesSince(config, authorization, uid, since, logger),
+    fetchBalance(config, authorization, uid, logger, options.dispatcher),
+    fetchUsagesSince(
+      config,
+      authorization,
+      uid,
+      window.since,
+      logger,
+      window.windowMs,
+      options.dispatcher,
+    ),
   ]);
 
   return {
@@ -322,7 +455,11 @@ export async function fetchAccountCredits(
     balanceUsd: balanceMicroUsd === null ? null : balanceMicroUsd / MICRO_USD,
     balanceCredits:
       balanceMicroUsd === null ? null : balanceMicroUsd / MICRO_USD_PER_CREDIT,
-    today: sumUsage(usages),
+    window: sumUsage(usages),
+    since: window.since,
+    until: window.until,
+    windowMs: window.windowMs,
+    snappedToDay: window.snappedToDay,
     lastUsage: usages[0] ?? null,
     error: null,
   };

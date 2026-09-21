@@ -5,13 +5,20 @@ import type { LoginMode, LoginService } from "../services/loginService.js";
 import { extractBearer, safeEqual } from "./http.js";
 import type { CredentialSaveInput } from "../store.js";
 import { ADMIN_PAGE } from "../webui/page.js";
-import { chatCompletion } from "./openai.js";
+import { chatCompletion, unwrapEnvelope } from "./openai.js";
+import { callUpstreamWithFailover } from "../services/proxyChat.js";
+import { probeAccount } from "../services/accountCheck.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
-import { fetchAccountCredits, type AccountCredits } from "../cline/credits.js";
+import { fetchAccountCredits, resolveWindow, type AccountCredits, type ResolvedWindow, type UsageWindowRequest } from "../cline/credits.js";
+import { ProxyStore, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
+import type { ProxyResolver } from "../cline/proxy.js";
 
 export interface AdminRouteDeps extends OpenAIRouteDeps {
   login: LoginService;
+  proxies: ProxyStore;
+  /** Resolves an account's assigned proxy to a dispatcher. */
+  resolver: ProxyResolver;
 }
 
 function remoteAddress(c: Context): string | undefined {
@@ -64,6 +71,41 @@ function isAdminAuthorized(c: Context, deps: AdminRouteDeps): boolean {
   return provided !== null && safeEqual(provided, token);
 }
 
+/**
+ * Server-side pagination for the account-backed lists.
+ *
+ * A pool of a few hundred accounts makes an unpaginated table both slow to
+ * render and expensive to build: every row costs upstream calls, so fetching
+ * all of them to display twenty wastes the upstream budget. Both the usage and
+ * credits routes slice the same `store.list()` order with the same parameters,
+ * which is what keeps the two tables aligned row-for-row in the overview.
+ */
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 200;
+
+interface PageRequest {
+  page: number;
+  pageSize: number;
+  offset: number;
+}
+
+interface PageMeta extends PageRequest {
+  total: number;
+  totalPages: number;
+}
+
+function resolvePage(query: (name: string) => string | undefined, total: number): PageMeta {
+  const rawSize = Number.parseInt(query("pageSize") ?? "", 10);
+  const pageSize =
+    Number.isFinite(rawSize) && rawSize > 0 ? Math.min(rawSize, MAX_PAGE_SIZE) : DEFAULT_PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const rawPage = Number.parseInt(query("page") ?? "", 10);
+  // Clamp rather than reject: a page past the end is what a shrinking pool
+  // looks like, and the UI recovers by simply showing the last page.
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.min(rawPage, totalPages) : 1;
+  return { page, pageSize, offset: (page - 1) * pageSize, total, totalPages };
+}
+
 /** One account's plan + usage windows, as shown in the admin UI. */
 interface AccountUsageRow {
   id: string;
@@ -78,49 +120,51 @@ interface AccountUsageRow {
 const USAGE_CACHE_TTL_MS = 60_000;
 const usageCache = new Map<string, { at: number; row: AccountUsageRow }>();
 
-async function collectUsage(deps: AdminRouteDeps): Promise<{ accounts: AccountUsageRow[] }> {
-  const accounts = deps.store.list();
-  const rows = await Promise.all(
-    accounts.map(async (account): Promise<AccountUsageRow> => {
-      const cached = usageCache.get(account.id);
-      if (cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) return cached.row;
+async function collectUsage(
+  deps: AdminRouteDeps,
+  page: PageMeta,
+): Promise<{ accounts: AccountUsageRow[] } & Omit<PageMeta, "offset">> {
+  const accounts = deps.store.list().slice(page.offset, page.offset + page.pageSize);
+  const rows = await mapWithConcurrency(accounts, CREDITS_CONCURRENCY, async (account) => {
+    const cached = usageCache.get(account.id);
+    if (cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) return cached.row;
 
-      const row: AccountUsageRow = {
-        id: account.id,
-        email: account.email,
-        disabled: account.disabled,
-        lastError: account.lastError,
-        plan: null,
-        limits: [],
-        error: null,
-      };
+    const row: AccountUsageRow = {
+      id: account.id,
+      email: account.email,
+      disabled: account.disabled,
+      lastError: account.lastError,
+      plan: null,
+      limits: [],
+      error: null,
+    };
 
-      const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
-      if (!authorization) {
-        row.error = "re-login required";
-        return row;
-      }
-      const [plan, usage] = await Promise.all([
-        fetchSubscription(deps.config, authorization, deps.logger),
-        fetchUsageLimits(deps.config, authorization, deps.logger),
-      ]);
-      row.plan = plan;
-      row.limits = usage.limits;
-      row.error = plan.error ?? usage.error;
-      usageCache.set(account.id, { at: Date.now(), row });
+    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
+    if (!authorization) {
+      row.error = "re-login required";
       return row;
-    }),
-  );
-  return { accounts: rows };
+    }
+    const dispatcher = deps.resolver.forAccount(account.id);
+    const [plan, usage] = await Promise.all([
+      fetchSubscription(deps.config, authorization, deps.logger, dispatcher),
+      fetchUsageLimits(deps.config, authorization, deps.logger, dispatcher),
+    ]);
+    row.plan = plan;
+    row.limits = usage.limits;
+    row.error = plan.error ?? usage.error;
+    usageCache.set(account.id, { at: Date.now(), row });
+    return row;
+  });
+  return { accounts: rows, page: page.page, pageSize: page.pageSize, total: page.total, totalPages: page.totalPages };
 }
 
 /**
- * Credit balances and today's token totals, one row per account.
+ * Credit balances and window token totals, one row per account.
  *
- * Each row costs three upstream calls (uid, balance, usages), so a 70-account
- * pool is 210 requests; they are capped at CREDITS_CONCURRENCY at a time and
- * the whole result is cached for CREDITS_CACHE_TTL_MS. The cache is what makes
- * this affordable to call on every overview refresh.
+ * Each row costs three upstream calls (uid, balance, usages), so a 90-account
+ * pool is 270 requests; pagination keeps that to the rows actually on screen,
+ * CREDITS_CONCURRENCY bounds the burst, and the whole result is cached for
+ * CREDITS_CACHE_TTL_MS.
  */
 interface AccountCreditsRow extends AccountCredits {
   id: string;
@@ -153,52 +197,80 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+/** An all-zero credits row, for an account whose token cannot be resolved. */
+function emptyCreditsRow(
+  base: { id: string; email: string | null; disabled: boolean; lastError: string | null },
+  window: ResolvedWindow,
+  error: string,
+): AccountCreditsRow {
+  return {
+    ...base,
+    uid: null,
+    balanceMicroUsd: null,
+    balanceUsd: null,
+    balanceCredits: null,
+    window: {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 0,
+      costUnits: 0,
+      costUsd: 0,
+      creditsMicroUsd: 0,
+    },
+    since: window.since,
+    until: window.until,
+    windowMs: window.windowMs,
+    snappedToDay: window.snappedToDay,
+    lastUsage: null,
+    error,
+  };
+}
+
 async function collectCredits(
   deps: AdminRouteDeps,
-  options: { force?: boolean } = {},
-): Promise<{ accounts: AccountCreditsRow[] }> {
-  const accounts = deps.store.list();
+  page: PageMeta,
+  options: { force?: boolean; window?: UsageWindowRequest } = {},
+): Promise<{ accounts: AccountCreditsRow[] } & Omit<PageMeta, "offset">> {
+  const resolved = resolveWindow(options.window ?? {});
+  const accounts = deps.store.list().slice(page.offset, page.offset + page.pageSize);
   const rows = await mapWithConcurrency(accounts, CREDITS_CONCURRENCY, async (account) => {
-    const cached = creditsCache.get(account.id);
-    if (!options.force && cached && Date.now() - cached.at < CREDITS_CACHE_TTL_MS) {
-      return cached.row;
-    }
-
     const base = {
       id: account.id,
       email: account.email,
       disabled: account.disabled,
       lastError: account.lastError,
     };
-    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
-    if (!authorization) {
-      return {
-        ...base,
-        uid: null,
-        balanceMicroUsd: null,
-        balanceUsd: null,
-        balanceCredits: null,
-        today: {
-          requests: 0,
-          promptTokens: 0,
-          completionTokens: 0,
-          cachedTokens: 0,
-          totalTokens: 0,
-          costMicroUsd: 0,
-          creditsUsed: 0,
-        },
-        lastUsage: null,
-        error: "re-login required",
-      } satisfies AccountCreditsRow;
+    const cached = creditsCache.get(account.id);
+    // The cache key includes the window: a cached 1-hour total must not be
+    // served for a 7-day request under the same account id.
+    if (
+      !options.force &&
+      cached &&
+      cached.row.windowMs === resolved.windowMs &&
+      cached.row.snappedToDay === resolved.snappedToDay &&
+      Date.now() - cached.at < CREDITS_CACHE_TTL_MS
+    ) {
+      return cached.row;
     }
 
-    const credits = await fetchAccountCredits(deps.config, authorization, deps.logger);
+    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
+    if (!authorization) {
+      return emptyCreditsRow(base, resolved, "re-login required");
+    }
+
+    const credits = await fetchAccountCredits(deps.config, authorization, deps.logger, {
+      ...(options.window ?? {}),
+      dispatcher: deps.resolver.forAccount(account.id),
+    });
     const row: AccountCreditsRow = { ...base, ...credits };
     creditsCache.set(account.id, { at: Date.now(), row });
     return row;
   });
-  return { accounts: rows };
+  return { accounts: rows, page: page.page, pageSize: page.pageSize, total: page.total, totalPages: page.totalPages };
 }
+
 
 const MAX_IMPORT_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_IMPORT_ACCOUNTS = 5_000;
@@ -279,6 +351,22 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
   const guard = (c: Context): Response | null =>
     isAdminAuthorized(c, deps) ? null : c.json({ error: "unauthorized" }, 401);
 
+  /**
+   * Window selection for the credits routes.
+   *
+   * `hours` is a float so the UI can offer 0.5h as well as 168h; `anchor=day`
+   * switches from the default rolling window to local midnight. Out-of-range
+   * values are clamped rather than rejected — a slider at the end of its track
+   * should read the widest allowed window, not error.
+   */
+  const windowQuery = (c: Context): UsageWindowRequest => {
+    const hours = Number.parseFloat(c.req.query("hours") ?? "");
+    return {
+      ...(Number.isFinite(hours) && hours > 0 ? { windowMs: hours * 60 * 60 * 1000 } : {}),
+      snapToDay: c.req.query("anchor") === "day",
+    };
+  };
+
   app.get("/admin/api/status", async (c) => {
     const denied = guard(c);
     if (denied) return denied;
@@ -298,21 +386,105 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
     });
   });
 
-  app.get("/admin/api/accounts", (c) => {
+  /**
+ * Account list, paginated and filterable.
+ *
+ * Filtering happens before pagination so `total` counts what the filter
+ * matches, not the whole pool — otherwise a search that matches three accounts
+ * still reports a dozen pages.
+ */
+app.get("/admin/api/accounts", (c) => {
     const denied = guard(c);
     if (denied) return denied;
+
+    const query = (c.req.query("q") ?? "").trim().toLowerCase();
+    const status = c.req.query("status") ?? "all";
+    const filtered = deps.store.list().filter((account) => {
+      if (status === "active" && account.disabled) return false;
+      if (status === "disabled" && !account.disabled) return false;
+      if (query.length === 0) return true;
+      const haystack = `${account.email ?? ""} ${account.label ?? ""} ${account.id}`.toLowerCase();
+      return haystack.includes(query);
+    });
+
+    const page = resolvePage((name) => c.req.query(name), filtered.length);
     return c.json({
-      accounts: deps.store.list().map((account) => ({
+      accounts: filtered.slice(page.offset, page.offset + page.pageSize).map((account) => ({
         id: account.id,
         email: account.email,
         label: account.label,
         provider: account.provider,
         disabled: account.disabled,
         lastError: account.lastError,
+        proxyId: account.proxyId ?? null,
         expiresAt: account.expires,
         createdAt: account.createdAt,
         updatedAt: account.updatedAt,
       })),
+      page: page.page,
+      pageSize: page.pageSize,
+      total: page.total,
+      totalPages: page.totalPages,
+    });
+  });
+
+  /**
+   * Toggle an account, or relabel it.
+   *
+   * Disabling is a manual override that survives token refreshes: the store
+   * writes `disabled` on the record, and TokenManager honours it. Re-enabling
+   * clears `lastError` too, because that field is what put the account out of
+   * rotation in the first place and leaving it set would make the UI show a
+   * healthy account as broken.
+   */
+  app.patch("/admin/api/accounts/:id", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { disabled?: unknown; label?: unknown; proxyId?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+
+    const patch: {
+      disabled?: boolean;
+      label?: string | null;
+      lastError?: string | null;
+      proxyId?: string | null;
+    } = {};
+    if (typeof body.disabled === "boolean") {
+      patch.disabled = body.disabled;
+      if (!body.disabled) patch.lastError = null;
+    }
+    if (body.label === null || typeof body.label === "string") patch.label = body.label;
+    if (body.proxyId === null) {
+      patch.proxyId = null;
+    } else if (typeof body.proxyId === "string" && body.proxyId.length > 0) {
+      // Validated here rather than at request time: an account pointing at a
+      // proxy that does not exist would fail open (direct egress) and look
+      // configured in the UI while doing nothing.
+      if (!deps.proxies.get(body.proxyId)) {
+        return c.json({ error: "unknown proxy" }, 400);
+      }
+      patch.proxyId = body.proxyId;
+    }
+    if (Object.keys(patch).length === 0) {
+      return c.json({ error: "nothing to update: pass `disabled`, `label` or `proxyId`" }, 400);
+    }
+
+    const updated = deps.store.update(c.req.param("id"), patch);
+    if (!updated) return c.json({ error: "unknown account" }, 404);
+    return c.json({
+      account: {
+        id: updated.id,
+        email: updated.email,
+        label: updated.label,
+        disabled: updated.disabled,
+        lastError: updated.lastError,
+        proxyId: updated.proxyId ?? null,
+      },
     });
   });
 
@@ -479,11 +651,12 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
   app.get("/admin/api/usage", async (c) => {
     const denied = guard(c);
     if (denied) return denied;
-    return c.json(await collectUsage(deps));
+    const page = resolvePage((name) => c.req.query(name), deps.store.count());
+    return c.json(await collectUsage(deps, page));
   });
 
   /**
-   * Per-account credit balance plus today's token totals.
+   * Per-account credit balance plus the window's token totals.
    *
    * Separate from /admin/api/usage because the two answer different questions
    * and fail differently: usage windows 404 on an account with no plan (most
@@ -493,8 +666,231 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
   app.get("/admin/api/credits", async (c) => {
     const denied = guard(c);
     if (denied) return denied;
+    const page = resolvePage((name) => c.req.query(name), deps.store.count());
     const force = c.req.query("refresh") === "1";
-    return c.json(await collectCredits(deps, { force }));
+    return c.json(await collectCredits(deps, page, { force, window: windowQuery(c) }));
+  });
+
+  /**
+   * Liveness check for one account: does its credential still work?
+   *
+   * Forces a token refresh and calls `/users/me`, so it costs no inference.
+   * This is what separates "the account is fine" from "the account has not
+   * been used since its refresh token was revoked".
+   */
+  app.post("/admin/api/accounts/:id/probe", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const result = await probeAccount(
+      { config: deps.config, logger: deps.logger, store: deps.store, tokens: deps.tokens },
+      c.req.param("id"),
+    );
+    return c.json(result, result.ok ? 200 : 200);
+  });
+
+  /**
+   * Send one real request through one specific account, for a chosen model.
+   *
+   * Pinned: failover is disabled so the result describes this account rather
+   * than whichever account in the pool could answer. `stream` is forced off —
+   * a streaming body would be buffered here purely to measure it, and the
+   * caller wants a verdict, not text.
+   */
+  app.post("/admin/api/accounts/:id/test", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { model?: unknown; prompt?: unknown; maxTokens?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    const model = typeof body.model === "string" ? body.model.trim() : "";
+    if (model.length === 0) return c.json({ error: "`model` is required" }, 400);
+
+    const accountId = c.req.param("id");
+    if (!deps.store.get(accountId)) return c.json({ error: "unknown account" }, 404);
+
+    const prompt =
+      typeof body.prompt === "string" && body.prompt.trim().length > 0
+        ? body.prompt.trim()
+        : "只回复两个字：可用";
+    // Reasoning models can spend a small budget entirely on thinking and
+    // return nothing, which would read as a broken account. Give them room.
+    const maxTokens =
+      typeof body.maxTokens === "number" && Number.isFinite(body.maxTokens) && body.maxTokens > 0
+        ? Math.min(Math.floor(body.maxTokens), 8192)
+        : 2048;
+
+    const startedAt = Date.now();
+    const outcome = await callUpstreamWithFailover(
+      deps,
+      {
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: maxTokens,
+        stream: false,
+      },
+      { taskId: `admin-test-${accountId}`, model, stream: false, onlyAccountId: accountId },
+    );
+    const latencyMs = Date.now() - startedAt;
+
+    if (outcome.kind === "error") {
+      const text = await outcome.response.text().catch(() => "");
+      return c.json({
+        ok: false,
+        accountId,
+        model,
+        latencyMs,
+        status: outcome.response.status,
+        error: text.slice(0, 500) || `HTTP ${outcome.response.status}`,
+      });
+    }
+
+    const raw = await outcome.response.text().catch(() => "");
+    let content: string | null = null;
+    let usage: unknown = null;
+    try {
+      const parsed = unwrapEnvelope(JSON.parse(raw)) as {
+        choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: unknown;
+      };
+      const first = parsed.choices?.[0]?.message?.content;
+      content = typeof first === "string" ? first : null;
+      usage = parsed.usage ?? null;
+    } catch {
+      // A 200 with an unparseable body is still a working account; report the
+      // account as up and leave the content empty rather than failing it.
+    }
+
+    return c.json({
+      ok: true,
+      accountId,
+      model,
+      latencyMs,
+      status: 200,
+      content: content === null ? "" : content.slice(0, 500),
+      usage,
+      error: null,
+    });
+  });
+
+  /**
+   * Upstream proxy pool.
+   *
+   * URLs come back redacted — the stored form carries credentials in the
+   * userinfo, so echoing it would put proxy passwords in browser history and
+   * in any screenshot of the admin page. `usedBy` lets the UI warn before a
+   * delete and makes an idle proxy visible.
+   */
+  app.get("/admin/api/proxies", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const accounts = deps.store.list();
+    return c.json({
+      proxies: deps.proxies.list().map((proxy) => ({
+        id: proxy.id,
+        label: proxy.label,
+        url: redactProxyUrl(proxy.url),
+        enabled: proxy.enabled,
+        createdAt: proxy.createdAt,
+        updatedAt: proxy.updatedAt,
+        lastError: proxy.lastError,
+        usedBy: accounts.filter((account) => account.proxyId === proxy.id).length,
+      })),
+    });
+  });
+
+  app.post("/admin/api/proxies", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { url?: unknown; label?: unknown; enabled?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    if (typeof body.url !== "string") return c.json({ error: "`url` is required" }, 400);
+
+    const parsed = parseProxyUrl(body.url);
+    if ("error" in parsed) return c.json({ error: parsed.error }, 400);
+
+    const duplicate = deps.proxies.list().find((proxy) => proxy.url === parsed.url);
+    if (duplicate) return c.json({ error: "this proxy is already configured", id: duplicate.id }, 409);
+
+    const created = deps.proxies.add({
+      url: parsed.url,
+      label: typeof body.label === "string" ? body.label : null,
+      enabled: body.enabled !== false,
+    });
+    deps.logger.info("proxy added", { proxyId: created.id });
+    return c.json({ proxy: { ...created, url: redactProxyUrl(created.url) } }, 201);
+  });
+
+  app.patch("/admin/api/proxies/:id", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { url?: unknown; label?: unknown; enabled?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+
+    const patch: { url?: string; label?: string | null; enabled?: boolean; lastError?: string | null } = {};
+    if (typeof body.url === "string") {
+      const parsed = parseProxyUrl(body.url);
+      if ("error" in parsed) return c.json({ error: parsed.error }, 400);
+      patch.url = parsed.url;
+      // A new URL invalidates the old transport failure: leaving it set would
+      // show a working proxy as broken until something failed again.
+      patch.lastError = null;
+    }
+    if (body.label === null || typeof body.label === "string") patch.label = body.label;
+    if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (Object.keys(patch).length === 0) {
+      return c.json({ error: "nothing to update: pass `url`, `label` or `enabled`" }, 400);
+    }
+
+    const updated = deps.proxies.update(c.req.param("id"), patch);
+    if (!updated) return c.json({ error: "unknown proxy" }, 404);
+    return c.json({ proxy: { ...updated, url: redactProxyUrl(updated.url) } });
+  });
+
+  /**
+   * Delete a proxy.
+   *
+   * Refused while accounts still reference it. Deleting anyway would leave
+   * those accounts silently egressing from the host's own IP, which is the
+   * exact thing the proxy existed to prevent — and it would not be visible
+   * anywhere afterwards. `?force=1` reassigns them to direct in one step.
+   */
+  app.delete("/admin/api/proxies/:id", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    const proxyId = c.req.param("id");
+    if (!deps.proxies.get(proxyId)) return c.json({ error: "unknown proxy" }, 404);
+
+    const holders = deps.store.list().filter((account) => account.proxyId === proxyId);
+    const force = c.req.query("force") === "1";
+    if (holders.length > 0 && !force) {
+      return c.json(
+        {
+          error: `proxy is in use by ${holders.length} account(s)`,
+          usedBy: holders.length,
+          hint: "reassign them first, or repeat with ?force=1 to unassign",
+        },
+        409,
+      );
+    }
+    for (const account of holders) deps.store.update(account.id, { proxyId: null });
+    const removed = deps.proxies.remove(proxyId);
+    deps.logger.info("proxy removed", { proxyId, unassigned: holders.length });
+    return c.json({ removed, unassigned: holders.length });
   });
 
   /** Recent requests, newest first. */

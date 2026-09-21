@@ -9,9 +9,11 @@
  *     entitlements: { cline_pass: { enabled: true } } }, subscriptionId,
  *     currentPeriodStart, currentPeriodEnd }, success: true }
  */
+import type { Dispatcher } from "undici";
 import type { AppConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import { defaultClineHeaders } from "./constants.js";
+import { fetchWith } from "./proxy.js";
 
 export interface SubscriptionInfo {
   displayName: string | null;
@@ -32,6 +34,7 @@ export async function fetchSubscription(
   config: AppConfig,
   authorization: string,
   logger: Logger,
+  dispatcher?: Dispatcher,
 ): Promise<SubscriptionInfo> {
   const empty: SubscriptionInfo = {
     displayName: null,
@@ -44,21 +47,25 @@ export async function fetchSubscription(
   };
 
   try {
-    const response = await fetch(`${config.clineApiBaseUrl}/api/v1/users/me/plan`, {
-      headers: {
-        Authorization: authorization,
-        Accept: "application/json",
-        ...defaultClineHeaders({
-          clientName: config.clientName,
-          clientVersion: config.clientVersion,
-          platform: config.platform,
-          platformVersion: config.platformVersion,
-          coreVersion: config.coreVersion,
-          taskId: "admin-plan",
-        }),
+    const response = await fetchWith(
+      `${config.clineApiBaseUrl}/api/v1/users/me/plan`,
+      {
+        headers: {
+          Authorization: authorization,
+          Accept: "application/json",
+          ...defaultClineHeaders({
+            clientName: config.clientName,
+            clientVersion: config.clientVersion,
+            platform: config.platform,
+            platformVersion: config.platformVersion,
+            coreVersion: config.coreVersion,
+            taskId: "admin-plan",
+          }),
+        },
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
       },
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-    });
+      dispatcher,
+    );
     if (!response.ok) {
       return { ...empty, error: `HTTP ${response.status}` };
     }

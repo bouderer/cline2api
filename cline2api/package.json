@@ -20,7 +20,8 @@
   "dependencies": {
     "@hono/node-server": "^2.1.1",
     "hono": "^4.13.8",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@types/node": "^22.20.3",
@@ -29,4 +30,3 @@
     "typescript": "^7.0.2"
   }
 }
-
