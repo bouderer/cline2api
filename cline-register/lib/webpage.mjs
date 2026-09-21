@@ -82,9 +82,9 @@ export const PAGE = String.raw`<!doctype html>
         <input type="number" id="count" min="0" value="10" />
       </div>
       <div class="field">
-        <label>并发数 <span id="concVal" class="hint">2</span></label>
-        <input type="range" id="concurrency" min="1" max="8" value="2" />
-        <span class="hint">每个并发 = 一个 Chrome</span>
+        <label>并发数 <span id="concVal" class="hint">4</span></label>
+        <input type="range" id="concurrency" min="1" max="64" value="4" />
+        <span class="hint" id="concHint">每个并发 = 一个浏览器标签，稳妥区间</span>
       </div>
       <div class="field">
         <label>范围</label>
@@ -199,7 +199,7 @@ async function refreshState(){
     $('sBad').textContent = snap.failed;
     $('sPending').textContent = snap.pending;
     $('sPushed').textContent = snap.pushed;
-    $('concurrency').max = String(snap.maxConcurrency || 8);
+    $('concurrency').max = String(snap.maxConcurrency || 64);
     $('remoteNote').innerHTML = snap.remote.configured
       ? '远端网关：<b>' + snap.remote.base + '</b>（成功即推送）'
       : '<span style="color:var(--warn)">未配置远端网关</span> -- 只写本地，稍后可 npm run push';
@@ -235,7 +235,16 @@ async function refreshAccounts(){
   } catch (e) {}
 }
 
-$('concurrency').addEventListener('input', function(e){ $('concVal').textContent = e.target.value; });
+function updateConcHint(){
+  var n = Number($('concurrency').value) || 1;
+  $('concVal').textContent = n;
+  var h = $('concHint');
+  if (n <= 4)      { h.textContent = '每个并发 = 一个浏览器标签，稳妥区间'; h.style.color = ''; }
+  else if (n <= 8) { h.textContent = '每个并发 = 一个浏览器标签，约 ' + (n*0.25).toFixed(1) + ' GB 内存'; h.style.color = ''; }
+  else if (n <= 16){ h.textContent = '较高：约 ' + (n*0.25).toFixed(1) + ' GB 内存，机器可能变卡'; h.style.color = 'var(--warn)'; }
+  else             { h.textContent = '很高：约 ' + (n*0.25).toFixed(1) + ' GB 内存，可能把机器拖死'; h.style.color = 'var(--err)'; }
+}
+$('concurrency').addEventListener('input', updateConcHint);
 
 $('startBtn').addEventListener('click', async function(){
   lastSeq = 0;
@@ -326,4 +335,6 @@ setInterval(refreshState, 3000);
 </script>
 </body>
 </html>`;
+
+
 
