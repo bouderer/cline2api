@@ -904,6 +904,84 @@ app.get("/admin/api/accounts", (c) => {
   });
 
   /**
+   * Client API keys.
+   *
+   * The plaintext is returned exactly once, inside the create/rotate response.
+   * Listing and updates never carry it — an operator who can read the admin
+   * token could already exfiltrate by other means, but nothing in this surface
+   * should make it easier, and a key table that echoes secrets ends up in
+   * screenshots and browser history.
+   */
+  app.get("/admin/api/keys", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    return c.json({ keys: deps.apiKeys.list() });
+  });
+
+  app.post("/admin/api/keys", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { label?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      body = {};
+    }
+    const label = typeof body.label === "string" && body.label.trim().length > 0
+      ? body.label.trim().slice(0, 120)
+      : null;
+    const { record, plaintext } = deps.apiKeys.create(label);
+    return c.json({ key: record, plaintext }, 201);
+  });
+
+  app.patch("/admin/api/keys/:id", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { enabled?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    if (typeof body.enabled !== "boolean") {
+      return c.json({ error: "`enabled` must be a boolean" }, 400);
+    }
+    const result = deps.apiKeys.setEnabled(c.req.param("id"), body.enabled);
+    if (result === null) return c.json({ error: "unknown key" }, 404);
+    if ("error" in result) return c.json({ error: result.error }, 409);
+    return c.json({ key: result });
+  });
+
+  /**
+   * Rotate: the old secret stops working and a new one is returned once.
+   *
+   * Rotation is not delete-then-create, because there is a moment in between
+   * where a racing in-flight request would fail with 401 for no operational
+   * reason. The row (label, id, created-at) survives; only the secret and its
+   * usage counters are replaced.
+   */
+  app.post("/admin/api/keys/:id/rotate", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const result = deps.apiKeys.rotate(c.req.param("id"));
+    if (!result) return c.json({ error: "unknown key" }, 404);
+    return c.json({ key: result.record, plaintext: result.plaintext });
+  });
+
+  app.delete("/admin/api/keys/:id", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const result = deps.apiKeys.remove(c.req.param("id"));
+    if (result === false) return c.json({ error: "unknown key" }, 404);
+    if (typeof result === "object" && "error" in result) {
+      return c.json({ error: result.error }, 409);
+    }
+    return c.json({ removed: true });
+  });
+
+  /**
    * Playground: same chat path as /v1, authenticated with the admin token
    * instead of the client key so the browser never needs the client key.
    */

@@ -16,6 +16,7 @@ import type { AccountStore } from "../store.js";
 import type { AccountPool } from "../services/accountPool.js";
 import type { RequestLog } from "../services/requestLog.js";
 import type { TokenManager } from "../cline/tokenManager.js";
+import type { ApiKeyManager } from "../services/apiKeys.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
 import { SSE_HEADERS, extractApiKey, openaiError, safeEqual, sanitizeOpenAIMessages } from "./http.js";
 
@@ -26,6 +27,7 @@ export interface OpenAIRouteDeps {
   store: AccountStore;
   pool: AccountPool;
   tokens: TokenManager;
+  apiKeys: ApiKeyManager;
   /** Rolling request log shown in the admin UI. */
   requests?: RequestLog;
 }
@@ -33,8 +35,32 @@ export interface OpenAIRouteDeps {
 /**
  * Both API surfaces share this check: OpenAI clients send `Authorization:
  * Bearer`, Anthropic-native ones (Claude Code included) send `x-api-key`.
+ *
+ * Matching runs against the on-disk key table, not the env config, and it
+ * records last-use so the admin UI can show which key each client actually
+ * uses. Reads and writes are per-request with no key cache, so a key disabled
+ * in the admin UI stops working immediately.
  */
-export function isAuthorized(c: Context, deps: { config: AppConfig }): boolean {
+export function isAuthorized(c: Context, deps: { apiKeys: ApiKeyManager }): boolean {
+  const provided = extractApiKey(c.req.header("authorization"), c.req.header("x-api-key"));
+  if (!provided) return false;
+  return deps.apiKeys.matches(provided) !== null;
+}
+
+/**
+ * Same check, recording which model the key was used for.
+ *
+ * Called after the request has been validated, so the recorded model is the
+ * one that was actually served rather than whatever the client typed.
+ */
+export function recordKeyUse(deps: { apiKeys: ApiKeyManager }, c: Context, model: string): void {
+  const provided = extractApiKey(c.req.header("authorization"), c.req.header("x-api-key"));
+  if (!provided) return;
+  deps.apiKeys.verify(provided, model);
+}
+
+/** Backwards-compatible helper for routes constructed without a key manager. */
+export function isAuthorizedByConfig(c: Context, deps: { config: AppConfig }): boolean {
   const provided = extractApiKey(c.req.header("authorization"), c.req.header("x-api-key"));
   if (!provided) return false;
   return deps.config.proxyApiKeys.some((key) => safeEqual(provided, key));
@@ -75,7 +101,7 @@ export function registerOpenAIRoutes(app: Hono, deps: OpenAIRouteDeps): void {
     if (!isAuthorized(c, deps)) {
       return openaiError("Missing or invalid API key.", 401, { code: "invalid_api_key" });
     }
-    return chatCompletion(c, deps);
+    return chatCompletion(c, deps, { recordKeyUse: true });
   });
 }
 
@@ -84,7 +110,11 @@ export function registerOpenAIRoutes(app: Hono, deps: OpenAIRouteDeps): void {
  * and the admin playground (`/admin/api/chat`, admin auth) so the two cannot
  * drift apart. Callers are responsible for authenticating first.
  */
-export async function chatCompletion(c: Context, deps: OpenAIRouteDeps): Promise<Response> {
+export async function chatCompletion(
+  c: Context,
+  deps: OpenAIRouteDeps,
+  options: { recordKeyUse?: boolean } = {},
+): Promise<Response> {
   let body: ChatBody;
   try {
     body = (await c.req.json()) as ChatBody;
@@ -123,6 +153,9 @@ export async function chatCompletion(c: Context, deps: OpenAIRouteDeps): Promise
     ...(c.req.raw.signal ? { signal: c.req.raw.signal } : {}),
   });
   if (outcome.kind === "error") return outcome.response;
+  // Authenticated with the client key, so this is genuine usage of that key —
+  // unlike the admin playground, which authenticates with the admin token.
+  if (options.recordKeyUse) recordKeyUse(deps, c, body.model);
 
   const { response: upstream, accountId } = outcome;
   if (wantsStream) {

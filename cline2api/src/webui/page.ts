@@ -296,6 +296,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 100 18 9 9 0 000-18zM3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/></svg>
         代理
       </button>
+      <button data-view="keys">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 11-7.78 7.78 5.5 5.5 0 017.78-7.78zm0 0L19 3.5m-3.5 3.5L18 9.5"/></svg>
+        密钥
+      </button>
       <button data-view="logs">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
         日志
@@ -669,6 +673,58 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         </div>
       </div>
     </section>
+
+    <!-- ============ 密钥 ============ -->
+    <section class="view" id="view-keys">
+      <div class="page-head">
+        <div>
+          <h1>请求密钥</h1>
+          <p>客户端调用 /v1/* 用的密钥。明文只在创建或轮换时显示一次，之后无法找回，只能重新轮换。</p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="keyReload">刷新</button>
+          <button class="btn primary" id="keyAddBtn">新建密钥</button>
+        </div>
+      </div>
+
+      <div class="grid cols" id="keyStats">
+        <div class="stat"><div class="k">密钥总数</div><div class="v num" id="kTotal">—</div></div>
+        <div class="stat"><div class="k">启用中</div><div class="v num" id="kEnabled">—</div></div>
+        <div class="stat"><div class="k">累计调用</div><div class="v num" id="kUses">—</div></div>
+      </div>
+
+      <div class="card" id="keyFormPanel" style="display:none; margin-top:14px">
+        <div class="card-head">
+          <div><h2>新建密钥</h2><div class="hint">备注用来区分用途，例如 Cursor / NextChat / 朋友。</div></div>
+          <button class="btn small ghost" id="keyFormClose">关闭</button>
+        </div>
+        <div class="card-body">
+          <label class="field" style="max-width:460px"><span>备注（可选）</span>
+            <input type="text" id="keyLabel" placeholder="例如 给 Cursor 的" />
+          </label>
+          <div class="row between" style="margin-top:12px">
+            <div class="sm err" id="keyError" style="display:none; white-space:pre-wrap"></div>
+            <button class="btn primary" id="keySubmit" style="margin-left:auto">生成</button>
+          </div>
+          <div id="keyResult" style="display:none; margin-top:12px">
+            <div class="sm ok">密钥已生成，只显示这一次，复制后妥善保存：</div>
+            <div class="row" style="margin-top:8px">
+              <code class="mono pre" id="keyPlaintext" style="flex:1">-</code>
+              <button class="btn small" id="keyCopy">复制</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-body tight">
+          <table>
+            <thead><tr><th>备注 / 前缀</th><th class="nowrap">状态</th><th class="nowrap">调用</th><th class="nowrap">最后使用</th><th class="nowrap" style="min-width:210px">操作</th></tr></thead>
+            <tbody id="keysBody"><tr><td colspan="5" class="empty sm">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -868,7 +924,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   }
 
   /* ---------- routing ---------- */
-  var views = ["overview", "models", "play", "accounts", "proxies", "logs"];
+  var views = ["overview", "models", "play", "accounts", "proxies", "keys", "logs"];
   function show(name) {
     if (views.indexOf(name) < 0) name = "overview";
     views.forEach(function (v) {
@@ -883,6 +939,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (name === "logs") loadLogs();
     if (name === "accounts") { loadAccounts(); loadModels(); }
     if (name === "proxies") loadProxyView();
+    if (name === "keys") loadKeys();
     if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); }
   }
   var navButtons = document.querySelectorAll("#nav button");
@@ -2109,6 +2166,140 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     }).catch(function (e) { toast("删除失败：" + e.message, "err"); });
   }
 
+  /* ---------- client API keys ---------- */
+  /**
+   * Render a key row. The server never sends the plaintext, so there is no
+   * "show" action here — creation and rotation are the only moments the secret
+   * exists in the browser, and both display it in a dismissible panel next to
+   * the form rather than in the table.
+   */
+  function renderKeys(list) {
+    var body = $("keysBody");
+    clear(body);
+    var enabled = list.filter(function (k) { return k.enabled; }).length;
+    var uses = list.reduce(function (sum, k) { return sum + (k.useCount || 0); }, 0);
+    $("kTotal").textContent = list.length;
+    $("kEnabled").textContent = enabled;
+    $("kUses").textContent = uses;
+
+    if (!list.length) {
+      var tr0 = el("tr");
+      var td0 = el("td", "empty sm", "还没有密钥。点右上角「新建密钥」。");
+      td0.colSpan = 5;
+      tr0.appendChild(td0);
+      body.appendChild(tr0);
+      return;
+    }
+
+    list.forEach(function (k) {
+      var tr = el("tr");
+
+      var td1 = el("td");
+      td1.appendChild(el("div", null, k.label || "(无备注)"));
+      var meta = el("div", "xs faint mono", k.prefix + "… · " + k.id.slice(0, 8));
+      if (k.source === "env") meta.textContent += " · 来自环境变量";
+      td1.appendChild(meta);
+      tr.appendChild(td1);
+
+      var td2 = el("td", "nowrap");
+      td2.appendChild(el("span", "badge " + (k.enabled ? "pass" : "warn"), k.enabled ? "启用" : "停用"));
+      tr.appendChild(td2);
+
+      var td3 = el("td", "nowrap sm num");
+      td3.textContent = k.useCount > 0 ? (k.useCount + " 次") : "未使用";
+      if (k.lastUsedModel) td3.appendChild(el("div", "xs faint", k.lastUsedModel));
+      tr.appendChild(td3);
+
+      var td4 = el("td", "nowrap sm num");
+      td4.textContent = k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : "—";
+      tr.appendChild(td4);
+
+      var td5 = el("td", "nowrap");
+      var toggle = el("button", "btn small", k.enabled ? "停用" : "启用");
+      toggle.onclick = function () { toggleKey(k, !k.enabled); };
+      td5.appendChild(toggle);
+      toggle.style.marginRight = "5px";
+
+      var rotate = el("button", "btn small", "轮换");
+      rotate.title = "旧密钥立即失效，新密钥只显示一次";
+      rotate.onclick = function () { rotateKey(k); };
+      td5.appendChild(rotate);
+      rotate.style.marginRight = "5px";
+
+      var del = el("button", "btn small danger", "删除");
+      del.title = k.source === "env" ? "来自环境变量的密钥需先在环境中移除" : "删除后使用该密钥的客户端立即 401";
+      del.onclick = function () { deleteKey(k); };
+      td5.appendChild(del);
+      tr.appendChild(td5);
+
+      body.appendChild(tr);
+    });
+  }
+
+  function loadKeys() {
+    api("/admin/api/keys").then(function (data) {
+      renderKeys(data.keys || []);
+      // Hide a stale one-time secret: navigating back must not re-show it.
+      $("keyResult").style.display = "none";
+    }).catch(function (e) {
+      var body = $("keysBody");
+      clear(body);
+      var tr = el("tr");
+      var td = el("td", "empty err sm", "密钥读取失败：" + e.message);
+      td.colSpan = 5;
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  function showPlaintextOnce(plaintext) {
+    var box = $("keyResult");
+    box.style.display = "block";
+    $("keyPlaintext").textContent = plaintext;
+    $("keyCopy").onclick = function () { copy(plaintext, "密钥已复制，妥善保存"); };
+  }
+
+  function submitKey() {
+    var err = $("keyError");
+    err.style.display = "none";
+    jsonApi("/admin/api/keys", { label: $("keyLabel").value.trim() || null })
+      .then(function (data) {
+        toast("已生成", "ok");
+        $("keyLabel").value = "";
+        showPlaintextOnce(data.plaintext);
+        loadKeys();
+      })
+      .catch(function (e) {
+        err.textContent = e.message;
+        err.style.display = "block";
+      });
+  }
+
+  function toggleKey(k, next) {
+    if (!next && !confirm("停用密钥「" + (k.label || k.prefix) + "」？使用它的客户端会立即 401。")) return;
+    jsonApi("/admin/api/keys/" + encodeURIComponent(k.id), { enabled: next }, "PATCH")
+      .then(function () { toast(next ? "已启用" : "已停用", "ok"); loadKeys(); })
+      .catch(function (e) { toast("更新失败：" + e.message, "err"); });
+  }
+
+  function rotateKey(k) {
+    if (!confirm("轮换密钥「" + (k.label || k.prefix) + "」？旧密钥立即失效，新密钥只显示一次。")) return;
+    api("/admin/api/keys/" + encodeURIComponent(k.id) + "/rotate", { method: "POST" })
+      .then(function (data) {
+        toast("已轮换，旧密钥已失效", "ok");
+        showPlaintextOnce(data.plaintext);
+        loadKeys();
+      })
+      .catch(function (e) { toast("轮换失败：" + e.message, "err"); });
+  }
+
+  function deleteKey(k) {
+    if (!confirm("删除密钥「" + (k.label || k.prefix) + "」？使用它的客户端会立即 401，且无法撤销。")) return;
+    api("/admin/api/keys/" + encodeURIComponent(k.id), { method: "DELETE" })
+      .then(function () { toast("已删除", "ok"); loadKeys(); })
+      .catch(function (e) { toast("删除失败：" + e.message, "err"); });
+  }
+
   /**
    * Add every account already known to have failed to the selection.
    *
@@ -2443,6 +2634,15 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   $("proxyFormClose").onclick = function () { $("proxyFormPanel").style.display = "none"; };
   $("proxySubmit").onclick = submitProxy;
   $("proxyReload").onclick = function () { loadProxyView(); toast("已刷新代理列表"); };
+
+  $("keyAddBtn").onclick = function () {
+    $("keyFormPanel").style.display = "block";
+    $("keyResult").style.display = "none";
+    $("keyLabel").focus();
+  };
+  $("keyFormClose").onclick = function () { $("keyFormPanel").style.display = "none"; };
+  $("keySubmit").onclick = submitKey;
+  $("keyReload").onclick = function () { loadKeys(); toast("已刷新密钥列表"); };
 
   /* ---------- boot ---------- */
   fillSnippets();

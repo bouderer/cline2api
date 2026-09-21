@@ -54,10 +54,14 @@ npm run build && npm run serve   # 编译产物运行
 - OpenAI Base URL：`http://127.0.0.1:8787/v1`
 - 健康检查：<http://127.0.0.1:8787/healthz>
 
-未设置 `PROXY_API_KEY` 时会自动生成一个，写入 `$DATA_DIR/proxy-api-key.txt`（不会打印到日志）：
+未设置任何密钥时首次启动会自动生成一个（存 `$DATA_DIR/apikeys.json`，明文只在启动日志出现一次）。
+之后在管理台「密钥」页新建、轮换、停用；用到的 `PROXY_API_KEY` 会被导入密钥表：
 
 ```bash
-cat data/proxy-api-key.txt
+# 明文只在返回里出现一次，列表页永远不回显
+curl -X POST http://127.0.0.1:8787/admin/api/keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"label":"给 Cursor 的"}'
 ```
 
 ### Docker

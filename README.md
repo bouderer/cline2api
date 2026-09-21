@@ -57,7 +57,7 @@ npm run dev
 - Anthropic Base URL：`http://127.0.0.1:8787`
 - 健康检查：`http://127.0.0.1:8787/healthz`
 
-> 不设 `PROXY_API_KEY` 时网关会自动生成一个，写到 `$DATA_DIR/proxy-api-key.txt`（0600，不打印到日志）。
+> 客户端密钥现在由密钥表管理：首次启动时自动生成一个（存 `$DATA_DIR/apikeys.json`，明文只在启动日志出现一次），也可以在管理台「密钥」页新建、轮换、停用。`PROXY_API_KEY` 仍可用，会被导入密钥表。
 
 ### 2. 登录账号
 

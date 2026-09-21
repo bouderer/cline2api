@@ -15,7 +15,7 @@
 import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
-import { isAuthorized, unwrapEnvelope } from "./openai.js";
+import { isAuthorized, recordKeyUse, unwrapEnvelope } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
 import { SSE_HEADERS, openaiError, readReasoning, sanitizeOpenAIMessages } from "./http.js";
 
@@ -705,6 +705,7 @@ export function registerResponsesRoutes(app: Hono, deps: OpenAIRouteDeps): void 
       ...(c.req.raw.signal ? { signal: c.req.raw.signal } : {}),
     });
     if (outcome.kind === "error") return outcome.response;
+    recordKeyUse(deps, c, body.model);
 
     const { response: upstream, accountId } = outcome;
     if (wantsStream && upstream.body) {

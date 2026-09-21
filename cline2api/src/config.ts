@@ -2,8 +2,6 @@
  * Runtime configuration. Everything is environment-driven so that no secret
  * ever has to live in the repository.
  */
-import { randomBytes } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -12,6 +10,14 @@ export interface AppConfig {
   readonly host: string;
   readonly port: number;
   readonly dataDir: string;
+  /**
+   * Client API keys as configured in the environment.
+   *
+   * These are a *seed*, not the table of record: on boot each value is
+   * imported into the on-disk key store and authentication reads from the
+   * store. Keeping the config field means existing deployments keep working
+   * with no action — the first boot imports what they already have.
+   */
   readonly proxyApiKeys: readonly string[];
   readonly adminToken: string | null;
   /** Upstream Cline API origin, e.g. https://api.cline.bot */
@@ -61,25 +67,18 @@ function stripTrailingSlash(value: string): string {
 }
 
 /**
- * Resolve the client-facing API keys. If none are configured we mint one and
- * persist it with 0600 permissions instead of printing it to the console.
+ * Client API keys as configured in the environment.
+ *
+ * No minting anymore: an empty PROXY_API_KEY simply means "nothing is
+ * seeded from the environment". The on-disk key store mints its own key on
+ * first boot if there is nothing to import, which covers the same cold-start
+ * case without coupling key generation to config loading.
  */
-function resolveProxyApiKeys(env: NodeJS.ProcessEnv, dataDir: string): string[] {
-  const configured = (readString(env, "PROXY_API_KEY") ?? "")
+function resolveProxyApiKeys(env: NodeJS.ProcessEnv): string[] {
+  return (readString(env, "PROXY_API_KEY") ?? "")
     .split(",")
     .map((part) => part.trim())
     .filter((part) => part.length > 0);
-  if (configured.length > 0) return configured;
-
-  const keyFile = path.join(dataDir, "proxy-api-key.txt");
-  if (fs.existsSync(keyFile)) {
-    const existing = fs.readFileSync(keyFile, "utf8").trim();
-    if (existing.length > 0) return [existing];
-  }
-  const generated = `sk-cline-${randomBytes(24).toString("hex")}`;
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(keyFile, `${generated}\n`, { encoding: "utf8", mode: 0o600 });
-  return [generated];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -88,7 +87,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     host: readString(env, "HOST") ?? "127.0.0.1",
     port: readInt(env, "PORT", 8787),
     dataDir,
-    proxyApiKeys: resolveProxyApiKeys(env, dataDir),
+    proxyApiKeys: resolveProxyApiKeys(env),
     adminToken: readString(env, "ADMIN_TOKEN") ?? null,
     clineApiBaseUrl: stripTrailingSlash(
       readString(env, "CLINE_API_BASE_URL") ?? "https://api.cline.bot",

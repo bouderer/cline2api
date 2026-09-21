@@ -107,6 +107,11 @@ Cline2API 是一个自托管反代网关：客户端只访问本网关，网关�
 | `GET` | `/admin/api/usage` | 管理令牌 | 每个账号的套餐与用量窗口 |
 | `GET` | `/admin/api/requests` | 管理令牌 | 最近请求日志 |
 | `POST` | `/admin/api/chat` | 管理令牌 | 管理台试聊，与 OpenAI 对话链路相同 |
+| `GET` | `/admin/api/keys` | 管理令牌 | 密钥列表（不含明文与哈希） |
+| `POST` | `/admin/api/keys` | 管理令牌 | 新建密钥，明文只在本次响应里返回 |
+| `PATCH` | `/admin/api/keys/:id` | 管理令牌 | 启用 / 停用密钥 |
+| `POST` | `/admin/api/keys/:id/rotate` | 管理令牌 | 轮换密钥，旧密钥立即失效 |
+| `DELETE` | `/admin/api/keys/:id` | 管理令牌 | 删除密钥（环境变量来源的除外） |
 
 ---
 
@@ -164,17 +169,9 @@ ADMIN_TOKEN=replace-with-a-long-random-token
 PROXY_API_KEY=sk-key-for-cursor,sk-key-for-nextchat
 ```
 
-如果未设置 `PROXY_API_KEY`，网关首次启动时会生成一个 key，并保存到：
-
-```text
-$DATA_DIR/proxy-api-key.txt
-```
-
-文件权限按 `0600` 创建，日志不会打印生成出来的 key。查看方式：
-
-```bash
-cat data/proxy-api-key.txt
-```
+如果未设置任何密钥，网关首次启动时会生成一个，保存到 `$DATA_DIR/apikeys.json`
+（文件 `0600`），明文只在启动日志出现一次。`PROXY_API_KEY` 的值会被导入同一张表。
+密钥的增删改查见「管理台 API → 密钥」。
 
 ### 2.4 第一条请求
 
@@ -1775,6 +1772,24 @@ curl http://127.0.0.1:8787/admin/api/chat \
 
 ---
 
+### 6.16 密钥管理（`/admin/api/keys`）
+
+客户端密钥存在 `$DATA_DIR/apikeys.json`（`0600`），只存 SHA-256 哈希，不存明文。
+`PROXY_API_KEY` 的值在启动时被导入同一张表，标记为 `source: "env"`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/admin/api/keys` | 列表。每行含 `label`、`prefix`（前 8 位，仅用于辨认）、`enabled`、`useCount`、`lastUsedAt`、`lastUsedModel`；不含明文与哈希 |
+| `POST` | `/admin/api/keys` | 新建。请求体可选 `{"label":"给 Cursor 的"}`。明文（`plaintext`）只在本次响应里返回，之后无法找回 |
+| `PATCH` | `/admin/api/keys/:id` | `{"enabled":false}` 停用，`true` 启用。停用最后一个启用的密钥会被拒绝（409），避免把自己锁在门外 |
+| `POST` | `/admin/api/keys/:id/rotate` | 轮换。旧密钥立即失效，新明文只在本次响应里返回；备注与创建时间保留，使用计数清零 |
+| `DELETE` | `/admin/api/keys/:id` | 删除。`source: "env"` 的行拒绝删除（409），需先在环境变量里移除 |
+
+每次 `/v1/*` 调用成功后，对应密钥的 `useCount` 加一并记录 `lastUsedModel` 与
+`lastUsedAt`。停用的密钥在三条协议路径（chat / messages / responses）上都被拒绝。
+
+---
+
 ## 7. 登录与账号生命周期
 
 当前支持两种交互登录模式：
@@ -2152,11 +2167,11 @@ quota exceeded
 
 | 变量 | 必填 | 默认值 | 作用 |
 |---|---|---|---|
-| `PROXY_API_KEY` | 否 | 无；首次启动自动生成 | 客户端访问 `/v1/*` 的 key；支持逗号分隔多个 key；生成值写入 `$DATA_DIR/proxy-api-key.txt` |
+| `PROXY_API_KEY` | 否 | 无；首次启动自动生成 | 客户端访问 `/v1/*` 的 key；支持逗号分隔多个 key；会被导入 `$DATA_DIR/apikeys.json` 的密钥表，此后以表为准 |
 | `ADMIN_TOKEN` | 否，但公网部署必须设置 | 无 | 管理台和 `/admin/api/*` 令牌；未设置时仅允许 loopback |
 | `HOST` | 否 | `127.0.0.1` | HTTP 监听地址；容器内使用 `0.0.0.0` |
 | `PORT` | 否 | `8787` | HTTP 监听端口 |
-| `DATA_DIR` | 否 | `./data`（`path.resolve` 后的绝对路径） | `accounts.json` 和自动生成的 proxy key 文件目录 |
+| `DATA_DIR` | 否 | `./data`（`path.resolve` 后的绝对路径） | `accounts.json`、`apikeys.json`、`proxies.json` 的目录 |
 | `LOG_LEVEL` | 否 | `info` | 日志级别：`debug`、`info`、`warn`、`error`；无法识别时回退 `info` |
 | `CLINE_API_BASE_URL` | 否 | `https://api.cline.bot` | Cline 上游 base URL；会去掉末尾 `/` |
 | `WORKOS_API_BASE_URL` | 否 | `https://api.workos.com` | WorkOS base URL；会去掉末尾 `/` |
@@ -2240,7 +2255,7 @@ docker compose logs -f cline2api
 
 ```text
 ./data/accounts.json
-./data/proxy-api-key.txt
+./data/apikeys.json
 ```
 
 不要只备份容器，不备份 `DATA_DIR`。容器重建后账号和自动生成的客户端 key 需要从该卷恢复。
