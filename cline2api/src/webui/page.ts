@@ -197,6 +197,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:7px 10px;
   }
   label.row > input[type=checkbox] { width:auto; }
+  /* A row whose last liveness check failed, so a sweep stays readable. */
+  tr.row-failed td { background:var(--err-soft); }
+  tr.row-failed td:first-child { box-shadow:inset 3px 0 0 var(--err); }
 
   /* ---------- table ---------- */
   .table-wrap { max-height:min(62vh,620px); overflow:auto; border-radius:0 0 var(--radius) var(--radius); }
@@ -567,10 +570,25 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
             <button class="btn small" id="acctReload">刷新</button>
           </div>
         </div>
+        <div class="card-body" id="batchBar" style="display:none; padding-bottom:0">
+          <div class="row" style="gap:8px">
+            <span class="sm" id="batchCount">已选 0 个</span>
+            <span class="spacer"></span>
+            <button class="btn small" id="batchProbe">批量测活</button>
+            <button class="btn small" id="batchSelectFailed" title="把已知失败的账号加入选择">选择失败</button>
+            <button class="btn small" id="batchDisable">批量停用</button>
+            <button class="btn small danger" id="batchDelete">批量删除</button>
+            <button class="btn small ghost" id="batchClear">取消选择</button>
+          </div>
+          <div class="xs muted" id="batchStatus" style="margin-top:8px; white-space:pre-wrap"></div>
+        </div>
         <div class="card-body tight">
           <table>
-            <thead><tr><th>账号</th><th class="nowrap">状态</th><th class="nowrap">令牌到期</th><th class="nowrap">代理</th><th class="nowrap" style="min-width:250px">操作</th></tr></thead>
-            <tbody id="accountsBody"><tr><td colspan="5" class="empty sm">加载中…</td></tr></tbody>
+            <thead><tr>
+              <th class="nowrap" style="width:34px"><input type="checkbox" id="acctSelectAll" title="选中本页全部" /></th>
+              <th>账号</th><th class="nowrap">状态</th><th class="nowrap">令牌到期</th><th class="nowrap">代理</th><th class="nowrap" style="min-width:220px">操作</th>
+            </tr></thead>
+            <tbody id="accountsBody"><tr><td colspan="6" class="empty sm">加载中…</td></tr></tbody>
           </table>
         </div>
         <div class="card-foot" id="accountsPager"></div>
@@ -783,6 +801,17 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     return Math.round(secs / 86400) + " 天前";
   }
 
+  /** Run fn after ms of quiet, so a burst of keystrokes costs one call. */
+  function debounce(fn, ms) {
+    var timer = null;
+    return function () {
+      var self = this;
+      var args = arguments;
+      clearTimeout(timer);
+      timer = setTimeout(function () { fn.apply(self, args); }, ms);
+    };
+  }
+
   function api(path, options) {
     var opts = options || {};
     var h = opts.headers || {};
@@ -794,8 +823,21 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       return res.status === 204 ? null : res.json();
     });
   }
+  /**
+   * POST a JSON body (or PATCH/DELETE when a method is given).
+   *
+   * The body is passed as an object, not a pre-stringified one. An earlier
+   * version whose signature was path/body/method had four call sites written
+   * in the path/options shape instead, which silently sent the wrapper object
+   * as the payload; the route then failed with a confusing "model is required"
+   * or "Unknown route" rather than anything pointing at the caller.
+   */
   function jsonApi(path, body, method) {
-    return api(path, { method: method || "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return api(path, {
+      method: method || "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
   }
 
   function showTokenPrompt() {
@@ -1635,6 +1677,179 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   var acctFilter = { q: "", status: "all" };
   var proxiesById = {};
 
+  /**
+   * Selection and liveness, both keyed by account id and kept across pages.
+   *
+   * Cross-page persistence matters for the batch flow: the point of "select
+   * failure" is to sweep a pool that does not fit on one page, and a selection
+   * that reset on every page turn would make that impossible without raising
+   * the page size past what the upstream calls are worth.
+   */
+  var selectedIds = {};
+  /** accountId -> last known liveness. Missing means never tested. */
+  var probeCache = {};
+  /** accountId -> account row, so batch actions do not need the row on screen. */
+  var knownAccounts = {};
+
+  function selectedList() { return Object.keys(selectedIds); }
+
+  function updateBatchBar() {
+    var ids = selectedList();
+    $("batchBar").style.display = ids.length ? "block" : "none";
+    $("batchCount").textContent = "已选 " + ids.length + " 个";
+  }
+
+  function setSelected(id, on) {
+    if (on) selectedIds[id] = true;
+    else delete selectedIds[id];
+    updateBatchBar();
+  }
+
+  function markRowFailed(id) {
+    var row = document.getElementById("acct-row-" + id);
+    if (row) row.classList.add("row-failed");
+  }
+
+  function probeOne(id) {
+    return jsonApi("/admin/api/accounts/" + encodeURIComponent(id) + "/probe", {})
+      .then(function (r) {
+        probeCache[id] = r.ok === true;
+        if (!r.ok) markRowFailed(id);
+        return { id: id, ok: r.ok === true, error: r.error, latencyMs: r.latencyMs, stage: r.stage };
+      })
+      .catch(function (e) {
+        probeCache[id] = false;
+        markRowFailed(id);
+        return { id: id, ok: false, error: e.message, latencyMs: 0, stage: "request" };
+      });
+  }
+
+  /**
+   * Sweep a set of accounts with a small in-flight cap.
+   *
+   * A forced refresh per account means an unbounded fan-out would burst the
+   * upstream auth endpoint; the cap keeps a 100-account sweep civilised while
+   * still finishing in seconds.
+   */
+  function probeMany(ids, onProgress) {
+    var queue = ids.slice();
+    var results = [];
+    var done = 0;
+    var CONCURRENCY = 5;
+
+    function worker() {
+      if (!queue.length) return Promise.resolve();
+      var id = queue.shift();
+      return probeOne(id).then(function (r) {
+        results.push(r);
+        done += 1;
+        if (onProgress) onProgress(done, ids.length, r);
+        return worker();
+      });
+    }
+    var runners = [];
+    for (var i = 0; i < Math.min(CONCURRENCY, ids.length); i++) runners.push(worker());
+    return Promise.all(runners).then(function () { return results; });
+  }
+
+  function batchProbe() {
+    var ids = selectedList();
+    if (!ids.length) return;
+    var status = $("batchStatus");
+    var started = Date.now();
+    status.textContent = "批量测活 0/" + ids.length + "…";
+    $("batchProbe").disabled = true;
+    probeMany(ids, function (done, total) {
+      status.textContent = "批量测活 " + done + "/" + total + "…";
+    }).then(function (results) {
+      var failed = results.filter(function (r) { return !r.ok; });
+      $("batchProbe").disabled = false;
+      status.className = "xs " + (failed.length ? "err" : "ok");
+      status.textContent = "测活完成：" + (results.length - failed.length) + " 存活 · " +
+        failed.length + " 失败 · 用时 " + (Date.now() - started) + "ms" +
+        (failed.length ? "\n失败：" + failed.map(function (f) {
+          return (knownAccounts[f.id] ? (knownAccounts[f.id].email || f.id) : f.id) +
+            "（" + summarize(f.error, 60) + "）";
+        }).join("；") : "");
+      // Leave only the failures selected: the next move after a sweep is
+      // almost always to act on exactly those.
+      if (failed.length) {
+        selectedIds = {};
+        failed.forEach(function (f) { selectedIds[f.id] = true; });
+        updateBatchBar();
+        syncRowCheckboxes();
+      }
+    });
+  }
+
+  function batchDisable() {
+    var ids = selectedList();
+    if (!ids.length) return;
+    if (!confirm("停用选中的 " + ids.length + " 个账号？停用后不再参与轮询。")) return;
+    var status = $("batchStatus");
+    status.className = "xs muted";
+    status.textContent = "停用中…";
+    var queue = ids.slice();
+    var done = 0;
+    function step() {
+      if (!queue.length) {
+        status.className = "xs ok";
+        status.textContent = "已停用 " + done + " 个";
+        loadAccounts(); loadStatus();
+        return Promise.resolve();
+      }
+      var id = queue.shift();
+      return jsonApi("/admin/api/accounts/" + encodeURIComponent(id), { disabled: true }, "PATCH")
+        .then(function () { done += 1; status.textContent = "停用中… " + done + "/" + ids.length; })
+        .catch(function () { /* reported by the final count */ })
+        .then(step);
+    }
+    step();
+  }
+
+  function batchDelete() {
+    var ids = selectedList();
+    if (!ids.length) return;
+    if (!confirm("删除选中的 " + ids.length + " 个账号？删除后需要重新登录，且无法撤销。")) return;
+    var status = $("batchStatus");
+    status.className = "xs muted";
+    status.textContent = "删除中…";
+    var queue = ids.slice();
+    var done = 0;
+    function step() {
+      if (!queue.length) {
+        status.className = "xs ok";
+        status.textContent = "已删除 " + done + " 个";
+        selectedIds = {};
+        updateBatchBar();
+        loadAccounts(); loadStatus();
+        return Promise.resolve();
+      }
+      var id = queue.shift();
+      return api("/admin/api/accounts/" + encodeURIComponent(id), { method: "DELETE" })
+        .then(function () {
+          done += 1;
+          delete selectedIds[id];
+          updateBatchBar();
+          status.textContent = "删除中… " + done + "/" + ids.length;
+        })
+        .catch(function () { /* reported by the final count */ })
+        .then(step);
+    }
+    step();
+  }
+
+  function syncRowCheckboxes() {
+    var boxes = document.querySelectorAll("#accountsBody input.row-check");
+    var all = boxes.length > 0;
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].checked = selectedIds[boxes[i].getAttribute("data-id")] === true;
+      if (!boxes[i].checked) all = false;
+    }
+    var master = $("acctSelectAll");
+    if (master) master.checked = all;
+  }
+
   function loadProxies() {
     return api("/admin/api/proxies").then(function (data) {
       proxiesById = {};
@@ -1663,10 +1878,11 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     sel.value = a.proxyId || "";
     sel.onchange = function () {
       sel.disabled = true;
-      jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id), {
-        method: "PATCH",
-        body: JSON.stringify({ proxyId: sel.value || null }),
-      }).then(function () {
+      jsonApi(
+        "/admin/api/accounts/" + encodeURIComponent(a.id),
+        { proxyId: sel.value || null },
+        "PATCH"
+      ).then(function () {
         toast(sel.value ? "已绑定代理" : "已改为直连", "ok");
         loadAccounts();
       }).catch(function (e) {
@@ -1681,48 +1897,14 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     var next = !a.disabled;
     var verb = next ? "停用" : "启用";
     if (next && !confirm("停用账号 " + (a.email || a.id) + " ？停用后该账号不再参与轮询。")) return;
-    jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id), {
-      method: "PATCH",
-      body: JSON.stringify({ disabled: next }),
-    }).then(function () {
+    jsonApi(
+      "/admin/api/accounts/" + encodeURIComponent(a.id),
+      { disabled: next },
+      "PATCH"
+    ).then(function () {
       toast(verb + "成功", "ok");
       loadAccounts(); loadStatus();
     }).catch(function (e) { toast(verb + "失败：" + e.message, "err"); });
-  }
-
-  /**
-   * Liveness check: forces a token refresh and calls /users/me.
-   *
-   * Costs no inference, which is the point — a pool full of accounts whose
-   * refresh token died silently can be triaged without spending a single
-   * credit on requests that were only ever going to fail.
-   */
-  function probeAccountRow(a, btn) {
-    var cell = btn.parentNode;
-    btn.disabled = true;
-    btn.textContent = "检测中…";
-    jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/probe", { method: "POST" })
-      .then(function (r) {
-        btn.textContent = r.ok ? "测活" : "重试";
-        if (r.ok) {
-          toast((a.email || a.id) + " 存活 · " + r.latencyMs + "ms", "ok");
-        } else {
-          toast((a.email || a.id) + " 无响应：" + summarize(r.error, 70), "err");
-        }
-        var badge = el("div", "xs " + (r.ok ? "ok" : "err"),
-          (r.ok ? "存活 " : "失败 ") + r.latencyMs + "ms" +
-          (r.stage === "credential" ? " · 令牌" : (r.stage === "identity" ? " · 上游" : "")));
-        var old = cell.querySelector(".probe-result");
-        if (old) old.remove();
-        badge.className += " probe-result";
-        badge.title = r.error || ("uid " + (r.uid || "-"));
-        cell.appendChild(badge);
-      })
-      .catch(function (e) {
-        btn.textContent = "测活";
-        toast("测活失败：" + e.message, "err");
-      })
-      .finally(function () { btn.disabled = false; });
   }
 
   /**
@@ -1775,26 +1957,55 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     panel.appendChild(run);
     panel.appendChild(out);
 
+    /**
+     * Two stages, so a dead account is not misread as a dead model.
+     *
+     * Stage 1 refreshes the credential and calls /users/me — no inference, and
+     * the only step that can see a revoked refresh token. If it fails the
+     * account is the problem and stage 2 is skipped, which is also what makes
+     * this work as the liveness check: there is no separate 测活 button,
+     * because running one on every row would just repeat stage 1.
+     */
     run.onclick = function () {
       run.disabled = true;
       out.className = "xs muted";
-      out.textContent = "请求中…";
-      jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/test", {
-        method: "POST",
-        body: JSON.stringify({ model: sel.value, prompt: prompt.value }),
-      }).then(function (r) {
-        if (r.ok) {
-          out.className = "xs ok";
-          var tok = r.usage && r.usage.total_tokens ? (" · " + r.usage.total_tokens + " tok") : "";
-          out.textContent = "成功 " + r.latencyMs + "ms" + tok + "\n" + (r.content || "(空响应)");
-        } else {
+      out.textContent = "1/2 检查凭据…";
+      var t0 = Date.now();
+      jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/probe", {})
+        .then(function (p) {
+          if (!p.ok) {
+            out.className = "xs err";
+            out.textContent = "凭据失败 · " + p.latencyMs + "ms\n" +
+              (p.stage === "credential" ? "令牌刷新被拒：" : "上游拒绝该凭据：") +
+              summarize(p.error, 300);
+            probeCache[a.id] = false;
+            markRowFailed(a.id);
+            return null;
+          }
+          out.textContent = "1/2 凭据正常（" + p.latencyMs + "ms）· 2/2 请求模型…";
+          return jsonApi("/admin/api/accounts/" + encodeURIComponent(a.id) + "/test", {
+            model: sel.value,
+            prompt: prompt.value,
+          });
+        })
+        .then(function (r) {
+          if (!r) return;
+          if (r.ok) {
+            out.className = "xs ok";
+            var tok = r.usage && r.usage.total_tokens ? (" · " + r.usage.total_tokens + " tok") : "";
+            out.textContent = "可用 · 共 " + (Date.now() - t0) + "ms" + tok + "\n" + (r.content || "(空响应)");
+            probeCache[a.id] = true;
+          } else {
+            out.className = "xs err";
+            out.textContent = "模型失败 HTTP " + r.status + " · " + r.latencyMs + "ms\n" + summarize(r.error, 400);
+            probeCache[a.id] = false;
+            markRowFailed(a.id);
+          }
+        })
+        .catch(function (e) {
           out.className = "xs err";
-          out.textContent = "失败 HTTP " + r.status + " · " + r.latencyMs + "ms\n" + summarize(r.error, 400);
-        }
-      }).catch(function (e) {
-        out.className = "xs err";
-        out.textContent = "请求失败：" + e.message;
-      }).finally(function () { run.disabled = false; });
+          out.textContent = "请求失败：" + e.message;
+        }).finally(function () { run.disabled = false; });
     };
 
     cell.appendChild(panel);
@@ -1818,7 +2029,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         var td0 = el("td", "empty sm", acctFilter.q || acctFilter.status !== "all"
           ? "没有匹配的账号。"
           : "还没有账号。");
-        td0.colSpan = 5;
+        td0.colSpan = 6;
         tr0.appendChild(td0);
         body.appendChild(tr0);
         renderPager($("accountsPager"), 1, 1, 0, acctPageSize, function () {});
@@ -1826,7 +2037,21 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       }
 
       accounts.forEach(function (a) {
+        knownAccounts[a.id] = a;
         var tr = el("tr");
+        tr.id = "acct-row-" + a.id;
+        if (probeCache[a.id] === false) tr.classList.add("row-failed");
+
+        var tdCheck = el("td", "nowrap");
+        var box = el("input");
+        box.type = "checkbox";
+        box.className = "row-check";
+        box.setAttribute("data-id", a.id);
+        box.checked = selectedIds[a.id] === true;
+        box.onchange = function () { setSelected(a.id, box.checked); syncRowCheckboxes(); };
+        tdCheck.appendChild(box);
+        tr.appendChild(tdCheck);
+
         var td1 = el("td");
         td1.appendChild(el("div", null, a.label ? (a.label + " · " + (a.email || a.id)) : (a.email || a.id)));
         td1.appendChild(el("div", "xs faint mono", a.id));
@@ -1847,13 +2072,11 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         var td4 = el("td", "nowrap");
         var test = el("button", "btn small", "单号测试");
         test.onclick = function () { openAccountTest(a, td4); };
-        var probe = el("button", "btn small", "测活");
-        probe.onclick = function () { probeAccountRow(a, probe); };
         var toggle = el("button", "btn small", a.disabled ? "启用" : "停用");
         toggle.onclick = function () { toggleAccount(a); };
         var del = el("button", "btn small danger", "删除");
         del.onclick = function () { removeAccount(a); };
-        [test, probe, toggle, del].forEach(function (b) {
+        [test, toggle, del].forEach(function (b) {
           b.style.marginRight = "5px";
           td4.appendChild(b);
         });
@@ -1865,12 +2088,13 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       renderPager($("accountsPager"), data.page, data.totalPages, data.total, data.pageSize, function (p) {
         loadAccounts(p);
       });
+      syncRowCheckboxes();
     }).catch(function (e) {
       var body = $("accountsBody");
       clear(body);
       var tr = el("tr");
       var td = el("td", "empty err sm", "账号读取失败：" + e.message);
-      td.colSpan = 5;
+      td.colSpan = 6;
       tr.appendChild(td);
       body.appendChild(tr);
     });
@@ -1878,9 +2102,33 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   function removeAccount(a) {
     if (!confirm("确定删除账号 " + (a.email || a.id) + " ？删除后需要重新登录。")) return;
     api("/admin/api/accounts/" + encodeURIComponent(a.id), { method: "DELETE" }).then(function () {
+      delete selectedIds[a.id];
+      updateBatchBar();
       toast("已删除", "ok");
       loadAccounts(); loadStatus(); loadUsage();
     }).catch(function (e) { toast("删除失败：" + e.message, "err"); });
+  }
+
+  /**
+   * Add every account already known to have failed to the selection.
+   *
+   * Reads the liveness cache and each row's lastError, so accounts flagged by
+   * a previous sweep or by the gateway itself can be swept up without testing
+   * the whole pool again.
+   */
+  function selectFailed() {
+    var added = 0;
+    Object.keys(knownAccounts).forEach(function (id) {
+      var a = knownAccounts[id];
+      var failed = probeCache[id] === false || Boolean(a && a.lastError) || Boolean(a && a.disabled);
+      if (failed && !selectedIds[id]) { selectedIds[id] = true; added += 1; }
+    });
+    updateBatchBar();
+    syncRowCheckboxes();
+    $("batchStatus").className = "xs muted";
+    $("batchStatus").textContent = added
+      ? ("已加入 " + added + " 个已知失败账号（含停用与带错误信息的）")
+      : "本页没有已知失败的账号";
   }
 
   /* ---------- proxies ---------- */
@@ -1915,10 +2163,11 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         var td4 = el("td", "nowrap");
         var toggle = el("button", "btn small", p.enabled ? "停用" : "启用");
         toggle.onclick = function () {
-          jsonApi("/admin/api/proxies/" + encodeURIComponent(p.id), {
-            method: "PATCH",
-            body: JSON.stringify({ enabled: !p.enabled }),
-          }).then(function () { toast("已更新", "ok"); loadProxyView(); })
+          jsonApi(
+            "/admin/api/proxies/" + encodeURIComponent(p.id),
+            { enabled: !p.enabled },
+            "PATCH"
+          ).then(function () { toast("已更新", "ok"); loadProxyView(); })
             .catch(function (e) { toast("更新失败：" + e.message, "err"); });
         };
         var del = el("button", "btn small danger", "删除");
@@ -1959,8 +2208,8 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       return;
     }
     jsonApi("/admin/api/proxies", {
-      method: "POST",
-      body: JSON.stringify({ url: url, label: $("proxyLabel").value.trim() || null }),
+      url: url,
+      label: $("proxyLabel").value.trim() || null,
     }).then(function () {
       toast("已保存", "ok");
       $("proxyUrl").value = "";
@@ -2159,17 +2408,33 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     acctPage = 1;
     loadAccounts(1);
   };
-  var acctSearchTimer = null;
-  $("acctSearch").oninput = function () {
-    var value = this.value;
-    clearTimeout(acctSearchTimer);
-    acctSearchTimer = setTimeout(function () {
-      acctFilter.q = value.trim();
-      acctPage = 1;
-      loadAccounts(1);
-    }, 250);
-  };
+  $("acctSearch").oninput = debounce(function (event) {
+    acctFilter.q = event.target.value.trim();
+    acctPage = 1;
+    loadAccounts(1);
+  }, 250);
   $("acctReload").onclick = function () { loadAccounts(); toast("已刷新账号列表"); };
+
+  $("acctSelectAll").onchange = function () {
+    var on = this.checked;
+    var boxes = document.querySelectorAll("#accountsBody input.row-check");
+    for (var i = 0; i < boxes.length; i++) {
+      setSelected(boxes[i].getAttribute("data-id"), on);
+    }
+    syncRowCheckboxes();
+  };
+  $("batchProbe").onclick = batchProbe;
+  $("batchSelectFailed").onclick = selectFailed;
+  $("batchDisable").onclick = batchDisable;
+  $("batchDelete").onclick = batchDelete;
+  $("batchClear").onclick = function () {
+    selectedIds = {};
+    probeCache = {};
+    updateBatchBar();
+    syncRowCheckboxes();
+    $("batchStatus").textContent = "";
+    loadAccounts();
+  };
 
   $("proxyAddBtn").onclick = function () {
     $("proxyFormPanel").style.display = "block";
