@@ -5,7 +5,8 @@ dist/
 
 # 运行时数据与密钥
 .env
-.env.local
+.env.*
+!.env.example
 data/
 data-verify/
 .cache/
