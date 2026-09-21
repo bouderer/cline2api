@@ -17,7 +17,11 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     volumes:
       # Holds accounts.json and the generated client key. Back this up.
-      - ./data:/data
+      # Defaults to ./data; set DATA_DIR_HOST when the live accounts live
+      # somewhere else (e.g. a repo root that predates this subdirectory).
+      # A mismatched path silently mounts an empty directory and the gateway
+      # comes up with no accounts at all.
+      - ${DATA_DIR_HOST:-./data}:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

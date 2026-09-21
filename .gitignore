@@ -9,6 +9,9 @@ dist/
 !.env.example
 data/
 data-verify/
+# 手工备份的账号目录（data.bak.<时间戳>、data-backup 等），同样含真实凭据
+data.bak*/
+data-backup*/
 .cache/
 *.log
 
