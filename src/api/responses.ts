@@ -107,6 +107,37 @@ export function toChatTools(tools: unknown): Json[] {
     .filter((tool): tool is Json => tool !== null);
 }
 
+/**
+ * Tools for the echoed `tools` field of a Responses object.
+ *
+ * Responses declares a tool flat (`{type:"function", name, parameters}`) while
+ * chat nests it under `function`. The echo must stay in the dialect the caller
+ * sent: clients such as codex read this field back and re-send it, so handing
+ * them the chat shape makes them send a tool whose name lives at
+ * `function.name` — which then parses as an unnamed tool and disappears.
+ * Non-function tools (web_search, mcp, …) are passed through untouched.
+ */
+export function toResponsesTools(tools: unknown): Json[] {
+  return asArray(tools)
+    .map((tool): Json | null => {
+      if (!isObject(tool)) return null;
+      if (tool.type !== "function") return tool;
+      // Already flat (the shape Responses clients send).
+      if (typeof tool.name === "string" && tool.name.length > 0) return tool;
+      // Chat-shaped input: lift `function` back up to the top level.
+      const fn = tool.function;
+      if (!isObject(fn) || typeof fn.name !== "string" || fn.name.length === 0) return null;
+      return {
+        type: "function",
+        name: fn.name,
+        ...(typeof fn.description === "string" ? { description: fn.description } : {}),
+        parameters: isObject(fn.parameters) ? fn.parameters : { type: "object", properties: {} },
+        ...(fn.strict === undefined ? {} : { strict: fn.strict }),
+      };
+    })
+    .filter((tool): tool is Json => tool !== null);
+}
+
 function toChatToolChoice(choice: unknown): unknown {
   if (typeof choice === "string") return choice;
   if (!isObject(choice)) return undefined;
@@ -228,7 +259,13 @@ interface OpenAICompletion {
   created?: number;
   model?: string;
   choices?: OpenAIChoice[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
 }
 
 function messageItem(text: string): Json {
@@ -260,14 +297,24 @@ function functionCallItem(call: OpenAIToolCall): Json {
   };
 }
 
+/**
+ * Chat-completion usage -> Responses usage.
+ *
+ * Both sides are the same OpenAI shape here, so the totals agree: `input_tokens`
+ * is the whole prompt and `cached_tokens` is a subset of it, which is where this
+ * differs from the Anthropic translation (see toAnthropicUsage in anthropic.ts,
+ * where the cache read is carved out of `input_tokens` instead).
+ */
 function toResponsesUsage(usage: OpenAICompletion["usage"]): Json {
   const input = usage?.prompt_tokens ?? 0;
   const output = usage?.completion_tokens ?? 0;
   return {
     input_tokens: input,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: usage?.prompt_tokens_details?.cached_tokens ?? 0 },
     output_tokens: output,
-    output_tokens_details: { reasoning_tokens: 0 },
+    output_tokens_details: {
+      reasoning_tokens: usage?.completion_tokens_details?.reasoning_tokens ?? 0,
+    },
     total_tokens: usage?.total_tokens ?? input + output,
   };
 }
@@ -315,7 +362,7 @@ function responseEnvelope(input: {
     temperature: typeof request.temperature === "number" ? request.temperature : null,
     text: { format: { type: "text" } },
     tool_choice: typeof request.tool_choice === "string" ? request.tool_choice : "auto",
-    tools: toChatTools(request.tools),
+    tools: toResponsesTools(request.tools),
     top_p: typeof request.top_p === "number" ? request.top_p : null,
     truncation: "disabled",
     usage: input.usage ?? null,
@@ -403,6 +450,8 @@ export function translateStreamToResponses(
   const toolItems = new Map<number, number>();
   let promptTokens = 0;
   let completionTokens = 0;
+  let cachedTokens = 0;
+  let reasoningTokens = 0;
   let status: "completed" | "incomplete" = "completed";
 
   return new ReadableStream<Uint8Array>({
@@ -423,6 +472,8 @@ export function translateStreamToResponses(
                 usage: toResponsesUsage({
                   prompt_tokens: promptTokens,
                   completion_tokens: completionTokens,
+                  prompt_tokens_details: { cached_tokens: cachedTokens },
+                  completion_tokens_details: { reasoning_tokens: reasoningTokens },
                 }),
                 ...(state === "incomplete" ? { incompleteReason: "max_output_tokens" } : {}),
               }),
@@ -511,8 +562,14 @@ export function translateStreamToResponses(
             continue;
           }
           if (chunk.usage) {
+            // Last-write-wins per field, and only for fields actually present:
+            // a trailing chunk carrying just the totals must not wipe out the
+            // cache/reasoning breakdown an earlier one already reported.
             promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
             completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+            cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+            reasoningTokens =
+              chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
           }
           const choice = chunk.choices?.[0];
           if (!choice) continue;

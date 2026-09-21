@@ -67,6 +67,28 @@ test("a plain string input becomes a single user message", () => {
   assert.equal("max_tokens" in chat, false);
 });
 
+test("the echoed tools field stays in the Responses dialect", () => {
+  // codex reads `tools` back off the response and re-sends it, so a chat-shaped
+  // echo would make it send a tool whose name sits at function.name.
+  const flat = {
+    type: "function",
+    name: "read",
+    description: "read a file",
+    parameters: { type: "object", properties: {} },
+  };
+  const echoed = openAIToResponses(
+    { id: "resp_1", choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }] },
+    "m",
+    { model: "m", input: "hi", tools: [flat] },
+  ) as { tools: unknown[] };
+
+  assert.deepEqual(echoed.tools, [flat]);
+  // The chat shape an upstream needs is still produced for the request body.
+  assert.deepEqual(responsesToOpenAI({ model: "m", input: "hi", tools: [flat] }).tools, [
+    { type: "function", function: { name: "read", description: "read a file", parameters: { type: "object", properties: {} } } },
+  ]);
+});
+
 test("reasoning items echoed back are dropped, not forwarded as messages", () => {
   const chat = responsesToOpenAI({
     model: "m",
@@ -119,6 +141,54 @@ test("a chat completion becomes a responses object", () => {
     output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: 14,
   });
+});
+
+test("a cache read and reasoning tokens survive into usage", () => {
+  // Responses keeps OpenAI semantics: input_tokens is the whole prompt and the
+  // cache read is a subset of it, unlike the Anthropic translation which
+  // subtracts. The upstream Cline gateway reports both breakdowns.
+  const response = openAIToResponses(
+    {
+      choices: [{ message: { content: "ok", reasoning_content: "think" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 2036,
+        completion_tokens: 12,
+        prompt_tokens_details: { cached_tokens: 1920 },
+        completion_tokens_details: { reasoning_tokens: 9 },
+      },
+    },
+    "m",
+  );
+  assert.deepEqual(response.usage, {
+    input_tokens: 2036,
+    input_tokens_details: { cached_tokens: 1920 },
+    output_tokens: 12,
+    output_tokens_details: { reasoning_tokens: 9 },
+    total_tokens: 2048,
+  });
+});
+
+test("a later chunk without details does not erase the breakdown", async () => {
+  const text = await translate(
+    [
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 2,
+          prompt_tokens_details: { cached_tokens: 64 },
+          completion_tokens_details: { reasoning_tokens: 1 },
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { total_tokens: 102 } })}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n"),
+  );
+  assert.match(text, /"cached_tokens":64/);
+  assert.match(text, /"reasoning_tokens":1/);
 });
 
 test("a length-truncated completion is reported as incomplete", () => {
