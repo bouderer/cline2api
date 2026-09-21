@@ -203,7 +203,41 @@ interface OpenAICompletion {
   id?: string;
   model?: string;
   choices?: OpenAIChoice[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: OpenAIUsage;
+}
+
+/** Upstream usage, including the prompt-cache breakdown Cline reports. */
+interface OpenAIUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cache_creation_input_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+}
+
+/**
+ * Upstream usage -> Anthropic usage.
+ *
+ * The two APIs disagree about what `input_tokens` counts: OpenAI's
+ * `prompt_tokens` is the *whole* prompt, while Anthropic's `input_tokens`
+ * excludes both the cache read and the cache write, which travel in their own
+ * fields (total = input_tokens + cache_read + cache_creation).
+ *
+ * Reporting the total as `input_tokens` while also reporting a cache read makes
+ * the two overlap, and callers that bill or display the sum double-count the
+ * cached prefix — new-api, for one, derives cache-creation as
+ * `total - input_tokens - cached_tokens`, which goes negative on that shape. So
+ * subtract here and let each field keep its own meaning.
+ */
+export function toAnthropicUsage(usage: OpenAIUsage | undefined): Record<string, number> {
+  const total = usage?.prompt_tokens ?? 0;
+  const cacheRead = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
+  return {
+    input_tokens: Math.max(0, total - cacheRead - cacheCreation),
+    output_tokens: usage?.completion_tokens ?? 0,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreation,
+  };
 }
 
 function mapStopReason(finishReason: string | null | undefined): string {
@@ -256,10 +290,7 @@ export function openAIToAnthropicMessage(completion: OpenAICompletion, model: st
     content: blocks,
     stop_reason: mapStopReason(choice?.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: completion.usage?.prompt_tokens ?? 0,
-      output_tokens: completion.usage?.completion_tokens ?? 0,
-    },
+    usage: toAnthropicUsage(completion.usage),
   };
 }
 
@@ -301,8 +332,13 @@ export function translateStreamToAnthropic(
   let openIndex = -1;
   let openKind: "text" | "thinking" | "tool" | null = null;
   let stopReason = "end_turn";
-  let inputTokens = 0;
-  let outputTokens = 0;
+  // Kept separately rather than folded into a single counter: the cache fields
+  // have to stay distinct all the way out, since Anthropic reports them
+  // alongside `input_tokens` instead of inside it.
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let cachedTokens = 0;
+  let cacheCreationTokens = 0;
   let started = false;
 
   return new ReadableStream<Uint8Array>({
@@ -365,8 +401,14 @@ export function translateStreamToAnthropic(
             continue;
           }
           if (chunk.usage) {
-            inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
-            outputTokens = chunk.usage.completion_tokens ?? outputTokens;
+            // Upstream sends the whole usage block in one trailing chunk (and
+            // repeats it on some providers), so each field is last-write-wins
+            // but only when actually present — a later chunk omitting the cache
+            // breakdown must not zero out what an earlier one reported.
+            promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
+            completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+            cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+            cacheCreationTokens = chunk.usage.cache_creation_input_tokens ?? cacheCreationTokens;
           }
           const choice = chunk.choices?.[0];
           if (!choice) continue;
@@ -419,7 +461,12 @@ export function translateStreamToAnthropic(
           sse("message_delta", {
             type: "message_delta",
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+            usage: toAnthropicUsage({
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              cache_creation_input_tokens: cacheCreationTokens,
+              prompt_tokens_details: { cached_tokens: cachedTokens },
+            }),
           }),
         );
         write(sse("message_stop", { type: "message_stop" }));

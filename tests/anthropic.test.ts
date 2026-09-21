@@ -97,7 +97,52 @@ test("a buffered completion becomes an Anthropic message", () => {
   assert.equal(msg.model, "m");
   assert.deepEqual(msg.content, [{ type: "text", text: "hi there" }]);
   assert.equal(msg.stop_reason, "end_turn");
-  assert.deepEqual(msg.usage, { input_tokens: 7, output_tokens: 3 });
+  assert.deepEqual(msg.usage, {
+    input_tokens: 7,
+    output_tokens: 3,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  });
+});
+
+test("a prompt-cache read is carved out of input_tokens", () => {
+  // Anthropic counts the cache read *beside* input_tokens, not inside it, while
+  // upstream's prompt_tokens is the whole prompt. Reporting the total as
+  // input_tokens too would make the two overlap for anything that bills the sum.
+  const msg = openAIToAnthropicMessage(
+    {
+      choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 2036,
+        completion_tokens: 12,
+        cache_creation_input_tokens: 100,
+        prompt_tokens_details: { cached_tokens: 1920 },
+      },
+    },
+    "m",
+  );
+  assert.deepEqual(msg.usage, {
+    input_tokens: 16,
+    output_tokens: 12,
+    cache_read_input_tokens: 1920,
+    cache_creation_input_tokens: 100,
+  });
+});
+
+test("a cache breakdown larger than the prompt cannot go negative", () => {
+  const msg = openAIToAnthropicMessage(
+    {
+      choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 1,
+        cache_creation_input_tokens: 60,
+        prompt_tokens_details: { cached_tokens: 60 },
+      },
+    },
+    "m",
+  );
+  assert.equal(msg.usage.input_tokens, 0);
 });
 
 test("tool calls in a buffered completion become tool_use blocks", () => {
@@ -173,6 +218,49 @@ test("streamed text is re-framed as Anthropic SSE events", async () => {
   assert.match(text, /"text_delta","text":"lo"/);
   assert.match(text, /"stop_reason":"end_turn"/);
   assert.match(text, /"output_tokens":2/);
+});
+
+test("streamed cache usage survives into message_delta", async () => {
+  const other = translateStreamToAnthropic(
+    openAIStream([
+      { choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] },
+      {
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: {
+          prompt_tokens: 2036,
+          completion_tokens: 12,
+          cache_creation_input_tokens: 0,
+          prompt_tokens_details: { cached_tokens: 1920 },
+        },
+      },
+    ]),
+    "m",
+  );
+  const text = await drain(other);
+  assert.match(
+    text,
+    /"usage":\{"input_tokens":116,"output_tokens":12,"cache_read_input_tokens":1920,"cache_creation_input_tokens":0\}/,
+  );
+});
+
+test("a later chunk without details does not erase the cache breakdown", async () => {
+  const other = translateStreamToAnthropic(
+    openAIStream([
+      {
+        choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 2,
+          prompt_tokens_details: { cached_tokens: 64 },
+        },
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { total_tokens: 166 } },
+    ]),
+    "m",
+  );
+  const text = await drain(other);
+  assert.match(text, /"cache_read_input_tokens":64/);
+  assert.match(text, /"input_tokens":36/);
 });
 
 test("streamed reasoning_content becomes a thinking block", async () => {
