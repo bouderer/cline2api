@@ -162,7 +162,21 @@ export OPENAI_API_KEY=sk-your-key
 | GET | `/` | 管理台（默认仅本机可访问） |
 | GET | `/admin/api/*` | 管理接口（登录编排、账号、模型分桶、订阅、请求日志、试聊） |
 
-透传保留的上游特性：`reasoning` / `reasoning_content`（DeepSeek/GLM 思考过程，两种字段名都认，分别映射成 Anthropic 的 `thinking` 块与 Responses 的 `reasoning` item）、`cache_control`、工具调用。
+透传保留的上游特性：`reasoning` / `reasoning_content`（DeepSeek/GLM 思考过程，两种字段名都认，分别映射成 Anthropic 的 `thinking` 块与 Responses 的 `reasoning` item）、工具调用。
+
+### 提示缓存（prompt cache）
+
+缓存由上游按前缀自动命中，不需要客户端打 `cache_control` 标记；本网关**不转发**该标记，只负责把上游的命中量如实报出来：
+
+| 上游字段 | Anthropic（`/v1/messages`） | Responses（`/v1/responses`） |
+|---|---|---|
+| `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` | `input_tokens_details.cached_tokens` |
+| `cache_creation_input_tokens` | `cache_creation_input_tokens` | —（Responses 无对应字段） |
+| `prompt_tokens` | **减去**上面两项后作为 `input_tokens` | 原样作为 `input_tokens` |
+
+两者对 `input_tokens` 的口径不同：Anthropic 的 `input_tokens` **不含**缓存读/写（总量 = `input_tokens` + `cache_read` + `cache_creation`），OpenAI/Responses 的 `input_tokens` **含**缓存读（`cached_tokens` 是它的子集）。不按各自口径报会让计费方重复计算缓存前缀 —— 例如 new-api 用 `总量 - input_tokens - cached_tokens` 反推缓存写入量，混用口径会算出负数。
+
+`/v1/chat/completions` 是逐字节透传，缓存字段本来就带着，无需转换。
 
 ---
 

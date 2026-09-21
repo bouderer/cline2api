@@ -21,6 +21,7 @@ import { RequestLog } from "./services/requestLog.js";
 import { TokenManager } from "./cline/tokenManager.js";
 import { ModelCatalog } from "./cline/models.js";
 import { LoginService } from "./services/loginService.js";
+import { createImporter } from "./services/importer.js";
 import { registerOpenAIRoutes } from "./api/openai.js";
 import { registerResponsesRoutes } from "./api/responses.js";
 import { registerAnthropicRoutes } from "./api/anthropic.js";
@@ -34,12 +35,13 @@ export function createApp(config: AppConfig = loadConfig()) {
   const tokens = new TokenManager(store, config, logger);
   const catalog = new ModelCatalog(config, logger);
   const login = new LoginService(config, store, logger);
+  const importer = createImporter(store, config, logger);
   const requests = new RequestLog();
 
   const deps = { config, logger, store, pool, tokens, catalog, requests };
   const app = new Hono();
 
-  registerAdminRoutes(app, { ...deps, login });
+  registerAdminRoutes(app, { ...deps, login, importer });
   registerOpenAIRoutes(app, deps);
   registerResponsesRoutes(app, deps);
   registerAnthropicRoutes(app, deps);

@@ -2,6 +2,7 @@
 import type { Context, Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import type { LoginService } from "../services/loginService.js";
+import type { Importer } from "../services/importer.js";
 import { extractBearer, safeEqual } from "./http.js";
 import { ADMIN_PAGE } from "../webui/page.js";
 import { chatCompletion } from "./openai.js";
@@ -10,6 +11,7 @@ import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
 
 export interface AdminRouteDeps extends OpenAIRouteDeps {
   login: LoginService;
+  importer: Importer;
 }
 
 function remoteAddress(c: Context): string | undefined {
@@ -136,6 +138,34 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
     if (denied) return denied;
     const removed = deps.store.remove(c.req.param("id"));
     return c.json({ removed });
+  });
+
+  /**
+   * Import accounts from a gateway account file.
+   *
+   * Each entry is refreshed against WorkOS before it is stored, so the request
+   * can take a few seconds per account and may be large; the body limit is
+   * raised for this route only.
+   */
+  app.post("/admin/api/accounts/import", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    let payload: unknown;
+    try {
+      payload = await c.req.json();
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    try {
+      const report = await deps.importer.import(payload);
+      deps.logger.info("account import finished", {
+        imported: report.imported.length,
+        failed: report.failed.length,
+      });
+      return c.json(report);
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 400);
+    }
   });
 
   app.post("/admin/api/login/start", async (c) => {

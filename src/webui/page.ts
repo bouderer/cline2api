@@ -447,6 +447,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
           <p>账号池按轮询调度，401 静默续期，失效自动切换。每个账号需本人在官方页面确认。</p>
         </div>
         <div class="actions">
+          <button class="btn" id="importBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            导入 JSON
+          </button>
           <button class="btn primary" id="loginBtn">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
             登录新账号
@@ -456,6 +460,16 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
       <div class="card">
         <div class="card-body">
+          <div class="login-box" id="importBox">
+            <div class="muted sm">选择本网关的账号文件（<code>{ version, accounts: [...] }</code>）。每个账号会先向上游验证并轮换令牌，通过后才写入。</div>
+            <div style="margin:12px 0"><input type="file" id="importFile" accept=".json,application/json"></div>
+            <div class="muted xs" id="importHint">验证需要几秒到几十秒，取决于账号数量。</div>
+            <div style="margin-top:12px">
+              <button class="btn small primary" id="importRunBtn">开始导入</button>
+              <button class="btn small" id="importCancelBtn">取消</button>
+            </div>
+            <div id="importReport" style="margin-top:14px"></div>
+          </div>
           <div class="login-box" id="loginBox">
             <div class="row" style="align-items:flex-start; gap:18px">
               <div class="qr" id="qrHolder"></div>
@@ -1264,6 +1278,66 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     api("/admin/api/login/" + encodeURIComponent(currentSession.id) + "/cancel", { method: "POST" })
       .catch(function () { /* 取消失败无关紧要 */ })
       .finally(function () { stopPolling(); setLoginState("已取消"); });
+  };
+
+  /* ---------- import ---------- */
+  // Verification refreshes every account upstream, so a large file can take a
+  // while; the button stays disabled until the request settles.
+  $("importBtn").onclick = function () {
+    $("importBox").style.display = "block";
+    $("importReport").innerHTML = "";
+    $("importFile").value = "";
+  };
+  $("importCancelBtn").onclick = function () {
+    $("importBox").style.display = "none";
+  };
+  $("importRunBtn").onclick = function () {
+    var btn = this;
+    var input = $("importFile");
+    if (!input.files || !input.files.length) { toast("先选择一个 JSON 文件", "err"); return; }
+    var report = $("importReport");
+    clear(report);
+    report.appendChild(el("div", "muted sm", "读取并验证中…"));
+    btn.disabled = true;
+    input.files[0].text().then(function (text) {
+      var payload;
+      try {
+        payload = JSON.parse(text);
+      } catch (e) {
+        clear(report);
+        report.appendChild(el("div", "sm err", "文件不是合法 JSON：" + e.message));
+        btn.disabled = false;
+        return;
+      }
+      return jsonApi("/admin/api/accounts/import", payload).then(function (r) {
+        clear(report);
+        report.appendChild(el("div", "sm ok", "导入 " + r.imported.length + " 个，失败 " + r.failed.length + " 个"));
+        if (r.imported.length) {
+          var list = el("ul", "sm");
+          r.imported.forEach(function (a) {
+            list.appendChild(el("li", null,
+              (a.action === "updated" ? "更新 " : "新增 ") + (a.email || a.accountId || a.id)));
+          });
+          report.appendChild(list);
+        }
+        if (r.failed.length) {
+          var fl = el("ul", "sm err");
+          r.failed.forEach(function (f) {
+            fl.appendChild(el("li", null,
+              "#" + f.index + " " + (f.email || "(无邮箱)") + "：" + f.reason));
+          });
+          report.appendChild(fl);
+        }
+        loadAccounts(); loadStatus(); loadUsage();
+      }).catch(function (e) {
+        clear(report);
+        report.appendChild(el("div", "sm err", "导入失败：" + e.message));
+      }).finally(function () { btn.disabled = false; });
+    }).catch(function () {
+      clear(report);
+      report.appendChild(el("div", "sm err", "读取文件失败"));
+      btn.disabled = false;
+    });
   };
 
   /* ---------- logs ---------- */
