@@ -22,13 +22,19 @@ const PORT = Number(process.env.REGISTER_WEB_PORT || 8788);
 // ---- 当前任务状态（同一时刻只允许跑一轮）-------------------------------
 let current = null;
 const history = [];
+// SSE 订阅者与事件缓冲放在全局，不挂在 current 上 —— 否则页面先连上 SSE、
+// 之后才点「开始」时，新连接不属于新建的 current，日志就永远收不到。
+const subscribers = new Set();
+const eventBuffer = [];
+let eventSeq = 0;
 
 function broadcast(evt) {
-  if (!current) return;
-  current.events.push(evt);
-  if (current.events.length > 3000) current.events.splice(0, current.events.length - 3000);
-  for (const res of current.subscribers) {
-    try { res.write("data: " + JSON.stringify(evt) + "\n\n"); } catch {}
+  const stamped = { ...evt, seq: ++eventSeq, at: Date.now() };
+  eventBuffer.push(stamped);
+  if (eventBuffer.length > 3000) eventBuffer.splice(0, eventBuffer.length - 3000);
+  const payload = "data: " + JSON.stringify(stamped) + "\n\n";
+  for (const res of subscribers) {
+    try { res.write(payload); } catch {}
   }
 }
 
@@ -101,9 +107,9 @@ const server = http.createServer(async (req, res) => {
       const email = typeof body.email === "string" ? body.email.trim() : "";
 
       const controller = new AbortController();
+      eventBuffer.length = 0;
       current = {
-        controller, subscribers: new Set(), events: [],
-        total: 0, done: 0, ok: 0, fail: 0, pushed: 0,
+        controller,
         concurrency, startedAt: Date.now(),
         options: { count, concurrency, mode, device, push, email },
       };
@@ -153,17 +159,18 @@ const server = http.createServer(async (req, res) => {
         "X-Accel-Buffering": "no",
       });
       res.write(": connected\n\n");
-      const subscribers = current ? current.subscribers : null;
-      if (subscribers) {
-        subscribers.add(res);
-        for (const evt of current.events) {
+      // 订阅者直接登记到全局集合，并在连接建立时回放当前这一轮已有的事件。
+      // 这样「先打开页面、后点开始」也能实时收到日志。
+      subscribers.add(res);
+      if (eventBuffer.length) {
+        for (const evt of eventBuffer) {
           try { res.write("data: " + JSON.stringify(evt) + "\n\n"); } catch {}
         }
-      } else {
+      } else if (!current) {
         res.write("data: " + JSON.stringify({ type: "idle" }) + "\n\n");
       }
       const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 15000);
-      req.on("close", () => { clearInterval(ping); if (subscribers) subscribers.delete(res); });
+      req.on("close", () => { clearInterval(ping); subscribers.delete(res); });
       return;
     }
 
@@ -186,3 +193,5 @@ server.listen(PORT, HOST, () => {
   console.log("  按 Ctrl+C 退出");
   console.log("");
 });
+
+

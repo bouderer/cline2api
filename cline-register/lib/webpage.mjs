@@ -151,6 +151,7 @@ export const PAGE = String.raw`<!doctype html>
 <script>
 var $ = function(id){ return document.getElementById(id); };
 var state = { running: false, total: 0, done: 0, startedAt: 0 };
+var lastSeq = 0;
 
 function fmtDuration(ms){
   var s = Math.max(0, Math.round(ms/1000));
@@ -237,6 +238,7 @@ async function refreshAccounts(){
 $('concurrency').addEventListener('input', function(e){ $('concVal').textContent = e.target.value; });
 
 $('startBtn').addEventListener('click', async function(){
+  lastSeq = 0;
   logLine('info', '--- 新一轮开始 ---');
   $('progCard').style.display = '';
   state.running = true; state.done = 0; state.total = 0; state.startedAt = Date.now();
@@ -278,6 +280,11 @@ $('clearLog').addEventListener('click', function(){ $('logs').innerHTML = ''; })
 var es = new EventSource('/api/events');
 es.onmessage = function(m){
   var evt; try { evt = JSON.parse(m.data); } catch (e) { return; }
+  // SSE 断线重连时服务端会回放整个缓冲，按 seq 去重避免日志重复
+  if (typeof evt.seq === 'number') {
+    if (evt.seq <= lastSeq) return;
+    lastSeq = evt.seq;
+  }
   switch (evt.type){
     case 'idle':
       state.running = false;
@@ -319,3 +326,4 @@ setInterval(refreshState, 3000);
 </script>
 </body>
 </html>`;
+
