@@ -1,0 +1,13 @@
+# 辅助接码邮箱库存（模板）
+#
+# 这些邮箱用来接收微软在「异地登录保护」时下发的一次性安全代码。
+# 需要带有 Microsoft Graph API 的 refresh token 才能静默收信。
+#
+# 每行一个账号，格式：
+#   邮箱----邮箱密码----GraphClientId----GraphRefreshToken----辅助邮箱----辅助邮箱密码
+#
+# 复制本文件为 new_mail.txt 后填入真实账号。
+# 该文件已被 .gitignore 忽略，不会提交到仓库。
+#
+# 示例：
+# helper@outlook.com----MailboxPassword----00000000-0000-0000-0000-000000000000----M.Cxxx_refresh_token_here$$----alias@example.com----AliasPassword

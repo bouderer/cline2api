@@ -1,0 +1,10 @@
+# 待登录的目标账号库存（模板）
+#
+# 每行一个账号，格式：
+#   邮箱----密码
+#
+# 复制本文件为 all_web_mail.txt（或 web_mail.txt）后填入真实账号。
+# 这两个名字下的 .txt 已被 .gitignore 忽略，不会提交到仓库。
+#
+# 示例：
+# someone@outlook.com----TheirPassword123

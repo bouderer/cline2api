@@ -1,14 +1,38 @@
+# 依赖与构建产物
 node_modules/
 dist/
-data/
+*.tsbuildinfo
+
+# 运行时数据与密钥
 .env
-.env.*
-!.env.example
-*.log
-*.tmp
+.env.local
+data/
+data-verify/
 .cache/
-tokens.json
-accounts.json
+*.log
 
-output/
+# ---------------------------------------------------------------------------
+# 注册机本地产出 —— 含真实凭据，绝对不要提交
+# ---------------------------------------------------------------------------
+cline-register/.env
+cline-register/data/logs/
+cline-register/data/output/
+cline-register/data/accounts_cline.json
+cline-register/data/last-token.json
 
+# 邮箱库存（真实账号密码 / Graph refresh token）
+cline-register/config/mail/*.txt
+cline-register/config/mail/pending_skip.json
+!cline-register/config/mail/*.example.txt
+!cline-register/config/mail/.gitkeep
+
+# 代理池（含账号密码）
+cline-register/config/proxy/*.txt
+!cline-register/config/proxy/*.example.txt
+!cline-register/config/proxy/.gitkeep
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
