@@ -11,9 +11,11 @@ import fs from "fs";
 import path from "path";
 import { mailPath, dataPath } from "../paths.mjs";
 import { loginOne, loginOneDevice } from "./cline_engine.mjs";
+import { createBrowserPool } from "./browserPool.mjs";
 import { pushAccounts, readPushConfig } from "./push.mjs";
 
-export const MAX_CONCURRENCY = 8;
+// 并发上限可通过 REGISTER_MAX_CONCURRENCY 调整；内存充足就往上开。
+export const MAX_CONCURRENCY = Math.max(1, Number(process.env.REGISTER_MAX_CONCURRENCY) || 64);
 export const ACCOUNTS_FILE = dataPath("accounts_cline.json");
 const CACHE_TOKEN_FILE = dataPath("last-token.json");
 
@@ -133,6 +135,12 @@ export async function runBatch({
   }
 
   const runner = device ? loginOneDevice : loginOne;
+
+  // 默认「一个 Chrome + N 个独立 context」。
+  // 指纹/IP 本来就和独立 Chrome 一样（同机器同 IP），但内存占用只要 1/N，
+  // 所以并发能开得更高。想退回每账号独立 Chrome 就设 REGISTER_SHARED_BROWSER=false。
+  const sharedBrowser = String(process.env.REGISTER_SHARED_BROWSER ?? "true").toLowerCase() !== "false";
+  const pool = sharedBrowser ? createBrowserPool() : null;
   const helperLines = readList(mailPath("new_mail.txt"));
   if (!helperLines.length) throw new Error("没有辅助接码邮箱，请检查 config/mail/new_mail.txt");
 
@@ -153,6 +161,14 @@ export async function runBatch({
   let cursor = 0;
   let aborted = false;
   let running = 0;
+
+  // 高并发会同时开很多浏览器标签，提前提醒一句
+  if (conc > 8) {
+    onEvent({
+      type: "log", level: "warn",
+      text: `并发 ${conc} 会同时开 ${conc} 个浏览器标签，内存约 ${(conc * 0.25).toFixed(1)} GB，机器可能变卡`,
+    });
+  }
 
   onEvent({
     type: "start",
@@ -182,6 +198,7 @@ export async function runBatch({
         webEmail, webPass, helperEmail, helperRt,
         log: (msg) => emit("info", String(msg).replace(/^\s+/, "")),
         signal,
+        pool,
       });
       const record = { email: webEmail, password: webPass, helperEmail, ok: true, ...rec };
       await commit((list) => [
@@ -243,11 +260,21 @@ export async function runBatch({
     }
   }
 
-  await Promise.all(Array.from({ length: conc }, () => worker()));
-  await writeChain;
+  try {
+    await Promise.all(Array.from({ length: conc }, () => worker()));
+  } finally {
+    await writeChain;
+    if (pool) await pool.close();
+  }
 
   const ms = Date.now() - started;
   const result = { ...stats, total: queue.length, ms, aborted };
   onEvent({ type: "done", ...result });
   return result;
 }
+
+
+
+
+
+

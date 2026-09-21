@@ -13,6 +13,7 @@ import readline from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { REGISTER_DIR, mailPath, dataPath } from "./paths.mjs";
 import { readPushConfig } from "./lib/push.mjs";
+import { MAX_CONCURRENCY as REGISTER_MAX_CONCURRENCY } from "./lib/batch.mjs";
 
 const C = {
   reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
@@ -21,7 +22,7 @@ const C = {
 const paint = (c, s) => `${c}${s}${C.reset}`;
 
 const ACCOUNTS_FILE = dataPath("accounts_cline.json");
-const MAX_CONCURRENCY = 8;
+const MAX_CONCURRENCY = REGISTER_MAX_CONCURRENCY;
 
 function readList(file) {
   if (!fs.existsSync(file)) return [];
@@ -156,3 +157,4 @@ main().catch((e) => {
   console.error(paint(C.red, `启动失败: ${e.message}`));
   process.exit(1);
 });
+

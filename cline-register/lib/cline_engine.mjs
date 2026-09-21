@@ -24,7 +24,8 @@ const WORKOS_CLIENT_ID = process.env.WORKOS_CLIENT_ID || "client_01K3A541FN8TA3E
 const GRAPH_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753";
 const CHROME = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const HEADLESS = String(process.env.REGISTER_HEADLESS || "true") !== "false";
-const CALLBACK_PORTS = Array.from({ length: 40 }, (_, i) => 48801 + i);
+// 回调端口池：从 48801 起 200 个，够高并发用（每个在跑的账号占一个）。
+const CALLBACK_PORTS = Array.from({ length: 200 }, (_, i) => 48801 + i);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================= 辅助邮箱 Graph 接码 ================= */
@@ -71,12 +72,29 @@ export async function pollGraphCode(graphToken, afterMs, maxWaitMs = 40000) {
 
 /* ================= 本地回调接收 ================= */
 
+// 端口池：只增不减会让跑满 200 个账号后全线失败。
+// 这里记一个「在用端口」集合，close() 时归还，端口会被复用。
+const inUsePorts = new Set();
+
 export function listenCallback() {
   return new Promise((resolve, reject) => {
+    // 优先挑当前没在用的端口；启动失败的端口跳过（可能被别的进程占着）
+    const candidates = CALLBACK_PORTS.filter((p) => !inUsePorts.has(p));
+    if (candidates.length === 0) {
+      return reject(new Error(
+        `本地回调端口全部被占用（共 ${CALLBACK_PORTS.length} 个：${CALLBACK_PORTS[0]}–${CALLBACK_PORTS[CALLBACK_PORTS.length - 1]}），` +
+        `请降低并发或释放端口`
+      ));
+    }
+
     let idx = 0;
     const next = () => {
-      if (idx >= CALLBACK_PORTS.length) return reject(new Error(`本地回调端口全部被占用（已试 ${CALLBACK_PORTS[0]}–${CALLBACK_PORTS[CALLBACK_PORTS.length - 1]}），请降低并发或释放端口`));
-      const port = CALLBACK_PORTS[idx++];
+      if (idx >= candidates.length) {
+        return reject(new Error(
+          `本地回调端口全部被占用（已试 ${candidates.length} 个空闲端口），请降低并发或释放端口`
+        ));
+      }
+      const port = candidates[idx++];
       let resolveCode;
       const codePromise = new Promise((r) => { resolveCode = r; });
       const server = http.createServer((req, res) => {
@@ -86,10 +104,19 @@ export function listenCallback() {
         res.end(code ? "<h2>授权成功，可以关闭此页面。</h2>" : "<h2>等待授权…</h2>");
         if (code) resolveCode(code);
       });
-      server.once("error", next);
+      server.once("error", () => { inUsePorts.delete(port); next(); });
       server.listen(port, "127.0.0.1", () => {
-        resolve({ port, callbackUrl: `http://127.0.0.1:${port}/auth`, code: codePromise,
-          close: () => new Promise((d) => server.close(() => d())) });
+        inUsePorts.add(port);
+        resolve({
+          port,
+          callbackUrl: `http://127.0.0.1:${port}/auth`,
+          code: codePromise,
+          close: () => new Promise((d) => {
+            // 先归还端口，再关服务，保证下一轮能立刻复用
+            inUsePorts.delete(port);
+            server.close(() => d());
+          }),
+        });
       });
     };
     next();
@@ -410,7 +437,7 @@ async function launch() {
 }
 
 /** 主链路：扩展回调流程。 */
-export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal }) {
+export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal, pool }) {
   log(`[目标账号] ${webEmail}`);
   log(`[辅助接码] ${helperEmail}`);
 
@@ -425,9 +452,9 @@ export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log =
   const loc = new URL(ares.headers.get("location"));
   loc.searchParams.set("provider", "MicrosoftOAuth");
 
-  const { browser, page } = await launch();
+  const lease = pool ? await pool.acquire() : await launch();
+  const page = lease.page;
   try {
-    log("2. 打开微软授权页并自动登录");
     await page.goto(loc.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
     await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: waiter.callbackUrl, log, signal });
 
@@ -444,16 +471,18 @@ export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log =
     log(`>>> 成功: ${webEmail} <<<`);
     return { email: webEmail, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt, boundAt: new Date().toISOString() };
   } finally {
-    await browser.close().catch(() => {});
+    if (pool) await lease.release().catch(() => {});
+    else await lease.browser.close().catch(() => {});
     await waiter.close().catch(() => {});
   }
 }
 
 /** 备用链路：WorkOS 设备码（备用邮箱接码仍可用）。 */
-export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal }) {
+export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal, pool }) {
   const device = await startDeviceAuthorization();
   log(`1. 设备码: ${device.user_code}`);
-  const { browser, page } = await launch();
+  const lease = pool ? await pool.acquire() : await launch();
+  const page = lease.page;
   try {
     await page.goto(device.verification_uri_complete || device.verification_uri, { waitUntil: "domcontentloaded" });
     await sleep(2500);
@@ -461,19 +490,13 @@ export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt,
     if (c) { await safeClick(page, c); await sleep(2500); }
     const ms = await safeQuery(page, "a:has-text('Microsoft'), button:has-text('Microsoft')");
     if (await safeVisible(ms)) { await safeClick(page, ms); await sleep(3000); }
-    await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: "", log });
+    await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: "", log, signal });
     const tokens = await pollDeviceTokens(device, { timeoutMs: 120000 });
     const cline = await registerClineSession(tokens);
     return { email: webEmail, ...cline, boundAt: new Date().toISOString() };
   } finally {
-    await browser.close().catch(() => {});
+    if (pool) await lease.release().catch(() => {});
+    else await lease.browser.close().catch(() => {});
   }
 }
-
-
-
-
-
-
-
 
