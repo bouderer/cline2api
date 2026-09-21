@@ -8,6 +8,7 @@ import { ADMIN_PAGE } from "../webui/page.js";
 import { chatCompletion } from "./openai.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
+import { fetchAccountCredits, type AccountCredits } from "../cline/credits.js";
 
 export interface AdminRouteDeps extends OpenAIRouteDeps {
   login: LoginService;
@@ -110,6 +111,92 @@ async function collectUsage(deps: AdminRouteDeps): Promise<{ accounts: AccountUs
       return row;
     }),
   );
+  return { accounts: rows };
+}
+
+/**
+ * Credit balances and today's token totals, one row per account.
+ *
+ * Each row costs three upstream calls (uid, balance, usages), so a 70-account
+ * pool is 210 requests; they are capped at CREDITS_CONCURRENCY at a time and
+ * the whole result is cached for CREDITS_CACHE_TTL_MS. The cache is what makes
+ * this affordable to call on every overview refresh.
+ */
+interface AccountCreditsRow extends AccountCredits {
+  id: string;
+  email: string | null;
+  disabled: boolean;
+  lastError: string | null;
+}
+
+const CREDITS_CACHE_TTL_MS = 60_000;
+const CREDITS_CONCURRENCY = 6;
+const creditsCache = new Map<string, { at: number; row: AccountCreditsRow }>();
+
+/** Run `worker` over `items` with at most `limit` in flight, order preserved. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index] as T);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function collectCredits(
+  deps: AdminRouteDeps,
+  options: { force?: boolean } = {},
+): Promise<{ accounts: AccountCreditsRow[] }> {
+  const accounts = deps.store.list();
+  const rows = await mapWithConcurrency(accounts, CREDITS_CONCURRENCY, async (account) => {
+    const cached = creditsCache.get(account.id);
+    if (!options.force && cached && Date.now() - cached.at < CREDITS_CACHE_TTL_MS) {
+      return cached.row;
+    }
+
+    const base = {
+      id: account.id,
+      email: account.email,
+      disabled: account.disabled,
+      lastError: account.lastError,
+    };
+    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
+    if (!authorization) {
+      return {
+        ...base,
+        uid: null,
+        balanceMicroUsd: null,
+        balanceUsd: null,
+        balanceCredits: null,
+        today: {
+          requests: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          costMicroUsd: 0,
+          creditsUsed: 0,
+        },
+        lastUsage: null,
+        error: "re-login required",
+      } satisfies AccountCreditsRow;
+    }
+
+    const credits = await fetchAccountCredits(deps.config, authorization, deps.logger);
+    const row: AccountCreditsRow = { ...base, ...credits };
+    creditsCache.set(account.id, { at: Date.now(), row });
+    return row;
+  });
   return { accounts: rows };
 }
 
@@ -393,6 +480,21 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  ap
     const denied = guard(c);
     if (denied) return denied;
     return c.json(await collectUsage(deps));
+  });
+
+  /**
+   * Per-account credit balance plus today's token totals.
+   *
+   * Separate from /admin/api/usage because the two answer different questions
+   * and fail differently: usage windows 404 on an account with no plan (most
+   * of a bulk-registered pool), while the balance is readable for every
+   * account that can still authenticate.
+   */
+  app.get("/admin/api/credits", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const force = c.req.query("refresh") === "1";
+    return c.json(await collectCredits(deps, { force }));
   });
 
   /** Recent requests, newest first. */

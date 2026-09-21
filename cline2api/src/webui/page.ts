@@ -318,6 +318,11 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
           <div class="s" id="sCreditsHint">—</div>
         </div>
         <div class="stat">
+          <div class="k">今日 Token</div>
+          <div class="v num" id="sToday">—</div>
+          <div class="s" id="sTodayHint">—</div>
+        </div>
+        <div class="stat">
           <div class="k">配额占用最高</div>
           <div class="v num" id="sQuota">—</div>
           <div class="s" id="sQuotaHint">—</div>
@@ -328,7 +333,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <div class="card-head">
           <h2>账号配额</h2>
           <div class="row">
-            <span class="hint" id="usageHint">套餐与 5 小时 / 周 / 月 三个窗口的用量</span>
+            <span class="hint" id="usageHint">余额、今日 token 与 5 小时 / 周 / 月 三个窗口的用量</span>
             <button class="btn small" id="usageReload">重新读取</button>
           </div>
         </div>
@@ -645,6 +650,36 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   }
   function bucketLabel(b) { return b === "pass" ? "订阅" : (b === "free" ? "免费" : "Credits"); }
 
+  /* ---------- credit / token formatting ---------- */
+  // Balances and costs arrive as micro-USD, so $0.50 is 500000. Cline's own UI
+  // divides by 1e4 and labels the result "credits" — 1 credit = $0.01. Both
+  // numbers are shown because the dashboard quotes the credit figure.
+  function fmtTok(n) {
+    if (n === null || n === undefined) return "—";
+    var v = Number(n) || 0;
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + "K";
+    return String(v);
+  }
+  function fmtUsd(micro) {
+    if (micro === null || micro === undefined) return "—";
+    var v = Number(micro) / 1e6;
+    return (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(4);
+  }
+  function fmtCredits(micro) {
+    if (micro === null || micro === undefined) return "—";
+    return (Number(micro) / 1e4).toFixed(2);
+  }
+  function fmtAgo(ts) {
+    if (!ts) return "—";
+    var secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (secs < 60) return secs + " 秒前";
+    if (secs < 3600) return Math.round(secs / 60) + " 分钟前";
+    if (secs < 86400) return Math.round(secs / 3600) + " 小时前";
+    return Math.round(secs / 86400) + " 天前";
+  }
+
   function api(path, options) {
     var opts = options || {};
     var h = opts.headers || {};
@@ -765,6 +800,32 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     return soonest;
   }
 
+  /**
+   * Credit rows keyed by account id.
+   *
+   * Loaded separately from the quota table because the two come from different
+   * upstream endpoints and fail independently: the usage-window call 404s on an
+   * account that has no plan, while the balance and today's token totals are
+   * still readable. A credits failure therefore leaves the quota table intact.
+   */
+  var creditsById = {};
+  var creditsLoaded = false;
+  var creditsError = null;
+
+  function loadCredits(force) {
+    return api("/admin/api/credits" + (force ? "?refresh=1" : ""))
+      .then(function (data) {
+        var next = {};
+        (data.accounts || []).forEach(function (row) { next[row.id] = row; });
+        creditsById = next;
+        creditsLoaded = true;
+        creditsError = null;
+      })
+      .catch(function (e) {
+        creditsError = e.message;
+      });
+  }
+
   function renderUsage(data) {
     var body = $("usageBody");
     clear(body);
@@ -779,16 +840,21 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     var table = el("table");
     var thead = el("thead");
     var htr = el("tr");
-    ["账号", "套餐", "用量（5 小时 / 周 / 月）", "下次重置"].forEach(function (t) { htr.appendChild(el("th", "nowrap", t)); });
+    ["账号", "余额", "套餐", "用量（5 小时 / 周 / 月）", "下次重置"].forEach(function (t) { htr.appendChild(el("th", "nowrap", t)); });
     thead.appendChild(htr);
     table.appendChild(thead);
 
     var tbody = el("tbody");
     var worst = 0;
     var worstLabel = "";
+    var totalToday = 0;
+    var totalTodayCost = 0;
+    var balanceSum = 0;
+    var balanceKnown = 0;
 
     accounts.forEach(function (a) {
       var tr = el("tr");
+      var credit = creditsById[a.id] || null;
 
       var td1 = el("td");
       var acct = el("div", "acct");
@@ -798,19 +864,61 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       if (a.disabled) tags.appendChild(el("span", "badge err", "需重新登录"));
       if (a.error) tags.appendChild(el("span", "badge warn", summarize(a.error, 28)));
       if (tags.childNodes.length) acct.appendChild(tags);
+
+      // Today's token totals, per the overview's purpose: this is the line that
+      // answers "is this account actually doing work today".
+      var todayLine = el("div", "xs faint");
+      if (credit && credit.error) {
+        todayLine.className = "xs warn";
+        todayLine.textContent = "余额读取失败：" + summarize(credit.error, 40);
+      } else if (credit) {
+        totalToday += credit.today.totalTokens || 0;
+        totalTodayCost += credit.today.costMicroUsd || 0;
+        var bits = ["今日 " + fmtTok(credit.today.totalTokens) + " tok"];
+        bits.push((credit.today.requests || 0) + " 次");
+        if (credit.today.cachedTokens) bits.push("缓存 " + fmtTok(credit.today.cachedTokens));
+        if (credit.today.costMicroUsd) bits.push(fmtUsd(credit.today.costMicroUsd));
+        todayLine.textContent = bits.join(" · ");
+        acct.appendChild(todayLine);
+
+        var lastLine = el("div", "xs faint");
+        if (credit.lastUsage) {
+          lastLine.textContent = "最后 " + fmtAgo(credit.lastUsage.at) +
+            (credit.lastUsage.model ? " · " + credit.lastUsage.model : "");
+        } else {
+          lastLine.textContent = "今天暂无请求";
+        }
+        acct.appendChild(lastLine);
+      } else if (creditsLoaded && !creditsError) {
+        todayLine.textContent = "今日 —";
+        acct.appendChild(todayLine);
+      }
       td1.appendChild(acct);
       tr.appendChild(td1);
+
+      var tdBal = el("td", "nowrap num");
+      if (credit && credit.balanceMicroUsd !== null && credit.balanceMicroUsd !== undefined) {
+        balanceSum += credit.balanceMicroUsd;
+        balanceKnown += 1;
+        var bal = el("div", "sm", fmtUsd(credit.balanceMicroUsd));
+        if (credit.balanceMicroUsd < 0) bal.className = "sm err";
+        tdBal.appendChild(bal);
+        tdBal.appendChild(el("div", "xs faint", fmtCredits(credit.balanceMicroUsd) + " credits"));
+      } else {
+        tdBal.appendChild(el("span", "sm faint", "—"));
+      }
+      tr.appendChild(tdBal);
 
       var td2 = el("td", "nowrap");
       var plan = a.plan;
       if (plan && !plan.error) {
         td2.appendChild(el("div", "sm", plan.displayName || "未知套餐"));
         var sub = el("div", "xs faint");
-        var bits = [];
-        if (plan.interval) bits.push(plan.interval);
-        bits.push(plan.isActive ? "生效中" : "未生效");
-        if (plan.currentPeriodEnd) bits.push("至 " + fmtDay(plan.currentPeriodEnd));
-        sub.textContent = bits.join(" · ");
+        var planBits = [];
+        if (plan.interval) planBits.push(plan.interval);
+        planBits.push(plan.isActive ? "生效中" : "未生效");
+        if (plan.currentPeriodEnd) planBits.push("至 " + fmtDay(plan.currentPeriodEnd));
+        sub.textContent = planBits.join(" · ");
         td2.appendChild(sub);
       } else {
         var badge = plan && plan.error ? ("读取失败：" + summarize(plan.error, 24)) : "—";
@@ -849,14 +957,25 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
     table.appendChild(tbody);
     body.appendChild(table);
-    body.appendChild(el("div", "xs muted", "用量来自上游 /api/v1/users/me/plan/usage-limits（每账号 60 秒缓存一次）。比例是上游按套餐额度算好的，不做本地估算。"));
+    var note = "用量来自上游 /api/v1/users/me/plan/usage-limits，余额与今日 token 来自 /api/v1/users/{uid}/balance 与 /usages；每账号 60 秒缓存一次。";
+    if (creditsError) note += " 本次余额读取失败：" + summarize(creditsError, 60);
+    body.appendChild(el("div", "xs muted", note));
 
     $("sQuota").textContent = worst ? worst + "%" : "—";
     $("sQuotaHint").textContent = worstLabel || "三个窗口均未上报用量";
+
+    // Today's pool-wide token burn, shown where the balance total already lives.
+    $("sToday").textContent = fmtTok(totalToday);
+    var todayBits = ["跨 " + accounts.length + " 个账号"];
+    if (totalTodayCost) todayBits.push(fmtUsd(totalTodayCost));
+    if (balanceKnown) todayBits.push("合计余额 " + fmtUsd(balanceSum));
+    $("sTodayHint").textContent = todayBits.join(" · ");
   }
 
-  function loadUsage() {
-    api("/admin/api/usage").then(renderUsage).catch(function (e) {
+  function loadUsage(force) {
+    Promise.all([api("/admin/api/usage"), loadCredits(force)]).then(function (res) {
+      renderUsage(res[0]);
+    }).catch(function (e) {
       var body = $("usageBody");
       clear(body);
       body.className = "err sm";
@@ -1541,8 +1660,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     }
   }
   $("logAuto").onchange = syncLogTimer;
-  $("refreshAll").onclick = function () { loadStatus(); loadUsage(); loadAccounts(); loadMiniLogs(); loadModels(true); toast("已刷新"); };
-  $("usageReload").onclick = loadUsage;
+  $("refreshAll").onclick = function () { loadStatus(); loadUsage(true); loadAccounts(); loadMiniLogs(); loadModels(true); toast("已刷新"); };
+  // Forced, not cached: the button exists precisely to re-read upstream now.
+  $("usageReload").onclick = function () { loadUsage(true); };
 
   /* ---------- boot ---------- */
   fillSnippets();
