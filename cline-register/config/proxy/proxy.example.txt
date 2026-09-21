@@ -1,0 +1,10 @@
+# 代理池（模板）
+#
+# 每行一个代理，格式：host:port:username:password
+# 或带协议：http://username:password@host:port
+#
+# 复制本文件为 proxy.txt 后填入真实代理。
+# config/proxy/ 下的 .txt 已被 .gitignore 忽略，不会提交到仓库。
+#
+# 示例：
+# 203.0.113.10:8080:user:pass

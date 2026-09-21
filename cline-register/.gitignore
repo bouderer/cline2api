@@ -1,0 +1,6 @@
+node_modules/
+data/logs/
+data/output/
+.env
+*.log
+!config/mail/.gitkeep
