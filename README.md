@@ -347,6 +347,37 @@ stealth/union-alpha                   poolside/laguna-s-2.1:free
 `AccountPool.candidates()` 轮询，401/403 静默续期并重放，仍失败则切换下一个账号。
 每个账号都必须由账号本人在官方页面确认一次，仓库不含批量开户。
 
+### 导入账号（`POST /admin/api/accounts/import`）
+
+管理台「账号」页的「导入 JSON」按钮，或直接 POST 本网关自己的账号文件：
+
+```json
+{"version": 1, "accounts": [{"access": "…", "refresh": "…", "expires": 1789…, "email": "…", "accountId": "…"}]}
+```
+
+也接受裸数组、以及单个凭证对象。字段别名兼容常见 OAuth 写法（`access_token` /
+`refresh_token` / `expires_at`）；`expires` 写成秒会被自动放大到毫秒。缺失的 `expires`
+不算错误——下面的验证会刷新出真实值。
+
+**每个账号先验证再写入**：导入时对该条做一次 `forceRefresh` 的 WorkOS 刷新，成功才存。
+所以
+
+- 文件里的 `access` 是过期的也无所谓，**存进去的是刷新后轮换的新令牌**；
+- 坏号（refresh token 已失效）在导入阶段就被挡下，不会进池子让后续每个请求白撞一次；
+- 验证成功会**顺带把之前因 `invalid_grant` 被禁用的账号重新启用**——验证过的刷新比当初的失败记录更有力。
+
+条目之间互不影响：某条失败会在响应的 `failed[]` 里带上它在文件中的下标和原因，其余照常导入。
+
+```json
+{"imported": [{"email": "…", "action": "updated", "id": "…"}],
+ "failed":   [{"index": 0, "email": "…", "reason": "refresh token rejected"}]}
+```
+
+`action` 为 `added`（新号）或 `updated`（命中已有）。匹配顺序是 `accountId` → `email`，
+所以**重复导入同一份文件是幂等的**，不会产生重复账号。
+
+> 验证要逐个打上游，N 个账号约 N 次请求，导入会同步等待；大批量文件请留意耗时。
+
 **账号能力并不一致**：一个号有 Cline Credits、另一个只有 Cline Pass 时，
 `anthropic/claude-*` 这类计费模型在前者成功、在后者返回 `insufficient_credits`。网关对此做了两件事：
 
