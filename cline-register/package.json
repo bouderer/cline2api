@@ -3,24 +3,30 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Cline account registrar: drives the official WorkOS OAuth login and can push credentials to a self-hosted cline2api gateway",
+  "description": "Cline account registrar: drives the official WorkOS OAuth login and pushes credentials to a self-hosted cline2api gateway",
   "engines": {
     "node": ">=20.11"
   },
   "scripts": {
+    "start": "node start.mjs",
+    "web": "node web.mjs",
     "status": "node register.mjs --status",
     "login": "node register.mjs --one",
     "login:device": "node register.mjs --one --device",
     "batch": "node register.mjs --count 5",
+    "batch:parallel": "node register.mjs --count 20 --concurrency 3",
     "all": "node register.mjs --all",
+    "all:parallel": "node register.mjs --all --concurrency 2",
     "retry": "node register.mjs --retry",
     "push": "node register.mjs --push",
     "push:dry": "node register.mjs --push --dry-run",
+    "push:all": "node register.mjs --push --all-ok",
     "probe": "node register.mjs --probe",
     "install:browser": "playwright install chromium"
   },
   "dependencies": {
     "dotenv": "^17.2.1",
-    "playwright": "^1.62.1"
+    "playwright": "^1.62.1",
+    "undici": "^8.10.2"
   }
 }

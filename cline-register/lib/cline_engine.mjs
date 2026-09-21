@@ -24,7 +24,7 @@ const WORKOS_CLIENT_ID = process.env.WORKOS_CLIENT_ID || "client_01K3A541FN8TA3E
 const GRAPH_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753";
 const CHROME = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const HEADLESS = String(process.env.REGISTER_HEADLESS || "true") !== "false";
-const CALLBACK_PORTS = [48801, 48802, 48803, 48804, 48805, 48806];
+const CALLBACK_PORTS = Array.from({ length: 40 }, (_, i) => 48801 + i);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================= 辅助邮箱 Graph 接码 ================= */
@@ -75,7 +75,7 @@ export function listenCallback() {
   return new Promise((resolve, reject) => {
     let idx = 0;
     const next = () => {
-      if (idx >= CALLBACK_PORTS.length) return reject(new Error("本地回调端口全部被占用"));
+      if (idx >= CALLBACK_PORTS.length) return reject(new Error(`本地回调端口全部被占用（已试 ${CALLBACK_PORTS[0]}–${CALLBACK_PORTS[CALLBACK_PORTS.length - 1]}），请降低并发或释放端口`));
       const port = CALLBACK_PORTS[idx++];
       let resolveCode;
       const codePromise = new Promise((r) => { resolveCode = r; });
@@ -176,20 +176,129 @@ export async function exchangeAuthorizationCode(code, callbackUrl) {
 /* ================= 浏览器安全流转 ================= */
 
 async function titleOf(page) { try { return await page.title(); } catch { return ""; } }
+
+/**
+ * 容错查询：页面正在导航时，page.$ 会抛
+ * "Execution context was destroyed, most likely because of a navigation"。
+ * 这种错误是暂时的，退避一下重试即可，不该把整轮带崩。
+ */
+async function safeQuery(page, selector, { retries = 3, delay = 700 } = {}) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await page.$(selector);
+    } catch (e) {
+      if (!/Execution context was destroyed|Target closed|navigating/i.test(String(e.message))) throw e;
+      if (i === retries) return null;
+      await sleep(delay);
+    }
+  }
+  return null;
+}
+
+async function safeQueryAll(page, selector, { retries = 3, delay = 700 } = {}) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await page.$$(selector);
+    } catch (e) {
+      if (!/Execution context was destroyed|Target closed|navigating/i.test(String(e.message))) throw e;
+      if (i === retries) return [];
+      await sleep(delay);
+    }
+  }
+  return [];
+}
+
+/** 等元素出现，同样挡住导航竞态。超时返回 null，不抛错。 */
+async function safeWait(page, selector, { timeout = 20000 } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      return await page.waitForSelector(selector, { timeout: Math.min(5000, deadline - Date.now()) });
+    } catch (e) {
+      const msg = String(e.message);
+      if (/Execution context was destroyed|Target closed|navigating/i.test(msg)) { await sleep(600); continue; }
+      if (/Timeout/i.test(msg)) return null;
+      throw e;
+    }
+  }
+  return null;
+}
+
+/** 判断元素是否可见，同样要挡住导航竞态。 */
+async function safeVisible(handle) {
+  try { return Boolean(handle) && await handle.isVisible(); } catch { return false; }
+}
+
+/**
+ * 容错点击：页面跳转时元素常被替换（detached / not stable），
+ * Playwright 的 click() 会直接抛错把整轮带崩。这里退化成
+ * 「在 DOM 里再查一次 → 不行就用 JS 触发 click → 再不行就忽略」。
+ *
+ * @returns {Promise<boolean>} 是否至少尝试过点击
+ */
+async function safeClick(page, selectorOrHandle, { log = () => {} } = {}) {
+  const isSelector = typeof selectorOrHandle === "string";
+  const selector = isSelector ? selectorOrHandle : null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      let handle = null;
+      if (isSelector) {
+        handle = await safeQuery(page, selector);
+      } else {
+        // 传入的 handle 可能已 detached，重新按 id 找一次
+        const id = await selectorOrHandle.evaluate((el) => el.id).catch(() => "");
+        handle = id ? await safeQuery(page, `#${id}`) : selectorOrHandle;
+      }
+      if (!handle) { await sleep(600); continue; }
+      try {
+        await handle.click({ timeout: 5000 });
+        return true;
+      } catch {
+        // 退一步：直接在页面里用 JS 点，绕过可见性/稳定性检查
+        const ok = await handle.evaluate((el) => {
+          if (typeof el.click === "function") { el.click(); return true; }
+          return false;
+        }).catch(() => false);
+        if (ok) return true;
+      }
+    } catch {}
+    await sleep(600);
+  }
+  log(`     （元素未能点击，已跳过）`);
+  return false;
+}
 async function textOf(page) { try { return (await page.innerText("body")).replace(/\s+/g, " "); } catch { return ""; } }
 
 /**
  * 自动完成微软登录 + 各类安全页（备用邮箱接码 / FIDO 跳过 / 同意 / Cline 授权）。
  * 返回 true 表示成功抵达本地回调。
  */
-export async function driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl, log = () => {} }) {
+export async function driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl, log = () => {}, signal }) {
   let graphToken = null;
   const graph = async () => (graphToken ??= await fetchGraphAccessToken(GRAPH_CLIENT_ID, helperRt));
 
-  // 邮箱
-  await page.waitForSelector("input[name=loginfmt], input[type=email]", { timeout: 25000 });
-  await page.fill("input[name=loginfmt], input[type=email]", webEmail);
-  await (await page.$("#idSIButton9, input[type=submit], button[type=submit]")).click();
+  // 邮箱：微软登录页有时要等好几秒才渲染，而且不同模板字段名不同，
+  // 这里轮询「任意一个可见的邮箱/账号输入框」，而不是死等某个选择器。
+  let emailBox = null;
+  for (let i = 0; i < 20 && !emailBox; i++) {
+    await sleep(1200);
+    for (const sel of [
+      "input[name=loginfmt]",
+      "input[type=email]",
+      "input[name=Username]",
+      "input#i0116",
+    ]) {
+      const cand = await safeQuery(page, sel);
+      if (await safeVisible(cand)) { emailBox = cand; break; }
+    }
+  }
+  if (!emailBox) {
+    const shot = `${LOG_DIR}/nologinbox_${String(webEmail).split("@")[0]}.png`;
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    throw new Error(`等待登录邮箱输入框超时（约 24 秒）截图: ${shot}`);
+  }
+  await emailBox.fill(webEmail);
+  await safeClick(page, "#idSIButton9, input[type=submit], button[type=submit]");
   log("   已提交邮箱");
 
   // 密码
@@ -197,7 +306,7 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
   for (let i = 0; i < 14; i++) {
     await sleep(1500);
     try {
-      for (const x of await page.$$("input[type=password]")) if (await x.isVisible()) { pw = x; break; }
+      for (const x of await safeQueryAll(page, "input[type=password]")) if (await safeVisible(x)) { pw = x; break; }
       if (pw) break;
       const up = await page.getByText("使用密码", { exact: false });
       if (await up.count()) await up.first().click().catch(() => {});
@@ -205,11 +314,12 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
   }
   if (!pw) throw new Error("未找到密码输入框");
   await pw.fill(webPass);
-  await (await page.$("#idSIButton9, input[type=submit], button[type=submit]")).click();
+  await safeClick(page, "#idSIButton9, input[type=submit], button[type=submit]");
   log("   已提交密码");
 
-  for (let step = 0; step < 24; step++) {
-    await sleep(2600);
+  for (let step = 0; step < 40; step++) {
+    if (signal?.aborted) throw new Error("已中止");
+    await sleep(2000);
     const url = page.url();
     const title = await titleOf(page);
     const text = await textOf(page);
@@ -226,20 +336,21 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
         const code = await pollGraphCode(await graph(), Date.now() - 45000, 40000);
         if (!code) throw new Error("未能从辅助邮箱获取安全代码");
         log(`   -> 安全代码 ${code}`);
-        const inp = await page.waitForSelector("input", { timeout: 15000 });
-        await inp.click();
+        const inp = await safeWait(page, "input", { timeout: 15000 });
+        if (!inp) throw new Error("等待验证码输入框超时");
+        await safeClick(page, inp);
         await page.keyboard.type(String(code), { delay: 90 });
         await sleep(4000);
         continue;
       }
-      const addBtn = await page.$("button:has-text('添加电子邮件'), input[value='添加电子邮件'], #iLandingViewAction");
-      if (addBtn && (await addBtn.isVisible())) { log("   -> 点击 [添加电子邮件]"); await addBtn.click().catch(() => {}); await sleep(2500); continue; }
-      const em = await page.$("input[type=email], input[type=text], #EmailAddress");
-      if (em && (await em.isVisible())) {
+      const addBtn = await safeQuery(page, "button:has-text('添加电子邮件'), input[value='添加电子邮件'], #iLandingViewAction");
+      if (await safeVisible(addBtn)) { log("   -> 点击 [添加电子邮件]"); await safeClick(page, addBtn); await sleep(2500); continue; }
+      const em = await safeQuery(page, "input[type=email], input[type=text], #EmailAddress");
+      if (await safeVisible(em)) {
         log(`   -> 填入辅助邮箱 ${helperEmail}`);
         await em.fill(helperEmail); await sleep(400);
-        const sb = await page.$("input[type=submit], button[type=submit], #iNext, button:has-text('下一步')");
-        if (sb) { await sb.click().catch(() => {}); await sleep(3500); }
+        const sb = await safeQuery(page, "input[type=submit], button[type=submit], #iNext, button:has-text('下一步')");
+        if (sb) { await safeClick(page, sb); await sleep(3500); }
         continue;
       }
     }
@@ -247,30 +358,42 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
     // 条款更新
     if (url.includes("tou/accrue") || title.includes("更新条款")) {
       log("   -> 确认服务协议更新");
-      const n = await page.$("#iNext, input[type=submit], button[type=submit]");
-      if (n) { await n.click().catch(() => {}); continue; }
+      const n = await safeQuery(page, "#iNext, input[type=submit], button[type=submit]");
+      if (n) { await safeClick(page, n); continue; }
     }
 
     // FIDO / Passkey
     if (url.includes("fido/create")) {
       log("   -> 跳过 FIDO 通行密钥");
-      const s = await page.$("#idBtn_Back, a[id*=Cancel], button[id*=Cancel], input[id*=Cancel], button:has-text('跳过')");
-      if (s && (await s.isVisible())) { await s.click().catch(() => {}); await sleep(2500); continue; }
+      const s = await safeQuery(page, "#idBtn_Back, a[id*=Cancel], button[id*=Cancel], input[id*=Cancel], button:has-text('跳过')");
+      if (await safeVisible(s)) { await safeClick(page, s); await sleep(2500); continue; }
     }
 
     // Cline 授权确认页
     if (url.includes("app.cline.bot/auth/callback")) {
-      const b = await page.$("button:has-text('Authorize'), button:has-text('授权'), button[type=submit]");
-      if (b && (await b.isVisible())) { log("   -> 点击 [Authorize]"); await b.click().catch(() => {}); await sleep(3000); continue; }
+      const b = await safeQuery(page, "button:has-text('Authorize'), button:has-text('授权'), button[type=submit]");
+      if (await safeVisible(b)) { log("   -> 点击 [Authorize]"); await safeClick(page, b); await sleep(3000); continue; }
     }
 
     // 通用确认
-    const btn = await page.$(
+    const btn = await safeQuery(page, 
       "#idSIButton9, input[value=是], input[value=接受], input[value=Accept], button:has-text('继续'), button:has-text('接受'), button:has-text('Authorize'), button:has-text('是')",
     );
-    if (btn && (await btn.isVisible())) { await btn.click().catch(() => {}); continue; }
+    if (await safeVisible(btn)) { await safeClick(page, btn); continue; }
   }
-  throw new Error("安全流转步数用尽，未收到回调");
+  // 步数用尽时，如果页面已经停在 Cline 授权页附近，再多等一会儿碰运气
+  const lastUrl = page.url();
+  if (/app\\.cline\\.bot|authkit\\.cline\\.bot/.test(lastUrl)) {
+    log("   -> 步数用尽，但页面仍在授权流程中，额外等待 20 秒...");
+    for (let i = 0; i < 10; i++) {
+      await sleep(2000);
+      const u = page.url();
+      if (u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")) return true;
+      const b = await safeQuery(page, "button:has-text('Authorize'), button:has-text('授权'), #idSIButton9, input[type=submit]");
+      if (await safeVisible(b)) await safeClick(page, b);
+    }
+  }
+  throw new Error(`安全流转步数用尽，未收到回调（最后停留：${lastUrl.slice(0, 90)}）`);
 }
 
 /* ================= 对外主入口 ================= */
@@ -287,7 +410,7 @@ async function launch() {
 }
 
 /** 主链路：扩展回调流程。 */
-export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log = () => {} }) {
+export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal }) {
   log(`[目标账号] ${webEmail}`);
   log(`[辅助接码] ${helperEmail}`);
 
@@ -306,7 +429,7 @@ export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log =
   try {
     log("2. 打开微软授权页并自动登录");
     await page.goto(loc.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
-    await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: waiter.callbackUrl, log });
+    await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: waiter.callbackUrl, log, signal });
 
     log("3. 等待回调授权码");
     const code = await Promise.race([waiter.code, sleep(20000).then(() => null)]);
@@ -327,17 +450,17 @@ export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log =
 }
 
 /** 备用链路：WorkOS 设备码（备用邮箱接码仍可用）。 */
-export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt, log = () => {} }) {
+export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt, log = () => {}, signal }) {
   const device = await startDeviceAuthorization();
   log(`1. 设备码: ${device.user_code}`);
   const { browser, page } = await launch();
   try {
     await page.goto(device.verification_uri_complete || device.verification_uri, { waitUntil: "domcontentloaded" });
     await sleep(2500);
-    const c = await page.$("button[type=submit]");
-    if (c) { await c.click().catch(() => {}); await sleep(2500); }
-    const ms = await page.$("a:has-text('Microsoft'), button:has-text('Microsoft')");
-    if (ms && (await ms.isVisible())) { await ms.click(); await sleep(3000); }
+    const c = await safeQuery(page, "button[type=submit]");
+    if (c) { await safeClick(page, c); await sleep(2500); }
+    const ms = await safeQuery(page, "a:has-text('Microsoft'), button:has-text('Microsoft')");
+    if (await safeVisible(ms)) { await safeClick(page, ms); await sleep(3000); }
     await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: "", log });
     const tokens = await pollDeviceTokens(device, { timeoutMs: 120000 });
     const cline = await registerClineSession(tokens);
@@ -346,3 +469,11 @@ export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt,
     await browser.close().catch(() => {});
   }
 }
+
+
+
+
+
+
+
+

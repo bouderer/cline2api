@@ -14,10 +14,16 @@ Cline 账号注册机。驱动 **Cline 官方**的 WorkOS OAuth 登录链路，�
 
 ```text
 cline-register/
-├── register.mjs              命令行入口
+├── web.mjs                   本地 Web 控制台（并发滑块 + 实时日志 + 一键停止）
+├── web.cmd                   双击启动 Web 控制台
+├── start.mjs                 交互式命令行启动器
+├── start.cmd                 双击启动命令行版
+├── register.mjs              命令行入口（参数式）
 ├── paths.mjs                 路径与环境变量解析
 ├── lib/
+│   ├── batch.mjs             可复用批处理引擎（并发 / 落盘 / 推送 / 事件回调）
 │   ├── cline_engine.mjs      登录核心引擎（两条 OAuth 链路 + Graph 接码）
+│   ├── webpage.mjs           Web 控制台的页面（HTML/CSS/JS）
 │   └── push.mjs              推送到远程 cline2api
 ├── config/
 │   ├── mail/                 邮箱库存（见下）
@@ -102,44 +108,106 @@ cp .env.example .env
 
 ---
 
-## 命令
+## 启动方式
+
+### 方式 1：Web 控制台（推荐，能调并发、看实时日志）
+
+Windows 上**双击 `web.cmd`**，或者：
+
+```bash
+npm run web
+```
+
+浏览器会自动打开 <http://127.0.0.1:8788/>。控制台里可以：
+
+- 看到库存 / 已成功 / 失败 / 剩余 / 已推送 / 远端配置
+- 用滑块选**并发数**（1–8），填**跑多少个**（0 = 全部剩余）
+- 选范围（未处理 / 仅失败的 / 全部库存）和链路（回调 / 设备码）
+- 勾选「成功即推送远端」
+- 点开始后实时看每个账号的进度和日志，随时点停止
+- 底部展开已成功账号列表（含是否已推送）
+
+只监听 `127.0.0.1`，不对局域网/公网开放。
+
+### 方式 2：交互式命令行
+
+Windows 上双击 `start.cmd`，或者：
+
+```bash
+npm start          # 等价于 node start.mjs
+```
+
+它会先打印状态，然后问两个问题：
+
+```
+这次要跑多少个账号 [1]: 20
+并发数（同时开几个浏览器） [1]: 3
+```
+
+### 方式 3：命令行直接给参数
+
+```bash
+# 跑 20 个，并发 3
+node register.mjs --count 20 --concurrency 3
+
+# 跑完全部未完成账号，并发 2
+node register.mjs --all --concurrency 2
+
+# 并发也可以走环境变量
+REGISTER_CONCURRENCY=3 node register.mjs --count 50
+```
+
+## 并发控制
+
+`--concurrency N`（或环境变量 `REGISTER_CONCURRENCY`）决定**同时处理几个账号**。
+
+**每个并发 = 一个 Chrome 进程 + 一个本地回调端口**（回调模式从 `48801` 起顺序占用）。
+
+| 并发 | 适用场景 | 说明 |
+|---|---|---|
+| `1` | 默认，最稳 | 跑一个完再跑下一个 |
+| `2–3` | 推荐区间 | 速度约翻倍，内存压力可控 |
+| `4–8` | 机器好、急着灌号 | 会同时开 N 个 Chrome，内存占用明显；上限保护在 8 |
+
+几点注意：
+
+- **设备码链路建议并发 1–2**。设备码更容易触发风控，并发高反而失败率上升。
+- **回调链路可以并发 2–4**，每个账号各占一个端口，互不干扰。
+- 日志会带 `[3/20]` 这样的序号前缀，并发时也能分清哪个账号在干什么。
+- 账号池写入做了串行互斥，多 worker 同时落盘不会互相覆盖。
+- 中途 Ctrl+C：已成功的账号已经写盘，不会丢；下次跑会跳过它们。
+
+---
+
+## 常用命令
 
 全部在 `cline-register/` 目录下执行：
 
+| 命令 | 作用 |
+|---|---|
+| `npm run web` | 启动 Web 控制台（推荐，带并发滑块与实时日志） |
+| `npm start` | 交互式命令行启动（问数量 + 并发） |
+| `npm run status` | 查看账号池（成功 / 失败 / 已推送） |
+| `npm run login` | 登录下一个待处理账号 |
+| `npm run login:device` | 强制走设备码流程 |
+| `npm run batch` | 连续登录 5 个 |
+| `npm run batch:parallel` | 并发 3 跑 20 个 |
+| `npm run all` | 跑完全部未完成账号 |
+| `npm run all:parallel` | 并发 2 跑完全部 |
+| `npm run retry` | 重试之前失败的账号 |
+| `npm run push` | 手动把凭据推到远程网关 |
+| `npm run push:dry` | 只预览，不发请求 |
+| `npm run push:all` | 连已推送过的也重推一遍 |
+| `npm run probe` | 探测远程网关是否可达 |
+
+指定单个邮箱：
+
 ```bash
-# 查看账号池状态（成功/失败/已推送）
-npm run status
-
-# 登录下一个待处理账号
-npm run login
-
-# 强制走设备码流程登录一个
-npm run login:device
-
-# 连续登录 5 个
-npm run batch
-
-# 登录全部未完成账号
-npm run all
-
-# 重试之前失败的账号
-npm run retry
-
-# 指定单个邮箱
 node register.mjs --email someone@outlook.com
-
-# 把已成功的凭据推到远程网关
-npm run push
-npm run push:dry            # 只预览，不发请求
-node register.mjs --push --all-ok   # 连已推送过的也重推一遍
-
-# 探测远程网关是否可达、管理令牌是否有效
-npm run probe
 ```
 
-每成功登录一个账号，会自动尝试推送到远程网关（前提是配了 `CLINE2API_REMOTE_URL` + `CLINE2API_ADMIN_TOKEN`）。
-想关掉自动推送，加 `--no-push`。
-
+**自动推送**：每成功登录一个账号，会**立刻**推送到远程网关（前提是 `.env` 里配了 `CLINE2API_REMOTE_URL` + `CLINE2API_ADMIN_TOKEN`）。
+不想推就加 `--no-push`，只写本地。
 ---
 
 ## 推送到远程 cline2api
@@ -181,6 +249,10 @@ CLINE2API_ADMIN_TOKEN=<网关的 ADMIN_TOKEN>
 | `CLINE2API_ADMIN_TOKEN` | 推送时必填 | 空 | 远程网关管理令牌 |
 | `CLINE2API_IMPORT_PATH` | 否 | `/admin/api/accounts/import` | 导入接口路径 |
 | `CLINE2API_PUSH_TIMEOUT_MS` | 否 | `30000` | 推送超时 |
+| `CLINE2API_PROXY` | 否 | 空 | 推送/探测走的 HTTP 代理；留空则直连，缺省会依次回落到 `HTTPS_PROXY`、`HTTP_PROXY` |
+| `REGISTER_CONCURRENCY` | 否 | `1` | 并发数，等价于 `--concurrency N`，上限 8 |
+| `REGISTER_WEB_PORT` | 否 | `8788` | Web 控制台端口 |
+| `REGISTER_WEB_HOST` | 否 | `127.0.0.1` | Web 控制台监听地址（默认只本机） |
 
 环境变量按 `cline-register/.env` → 仓库根 `.env` → `cline2api/cline2api/.env` 的顺序加载，后者只补前者没设的键。
 
@@ -205,4 +277,6 @@ CLINE2API_ADMIN_TOKEN=<网关的 ADMIN_TOKEN>
 
 **推送报 413**
 单批记录太多（网关默认上限 2 MB / 5000 条）。注册机已自动按 500 条分批，正常不会触发。
+
+
 

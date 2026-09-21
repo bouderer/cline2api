@@ -31,11 +31,11 @@
 import fs from "fs";
 import path from "path";
 import { REGISTER_DIR, mailPath, dataPath, LOG_DIR } from "./paths.mjs";
-import { loginOne, loginOneDevice } from "./lib/cline_engine.mjs";
+import { runBatch, ACCOUNTS_FILE, loadAccounts, saveAccounts, readList } from "./lib/batch.mjs";
 import { pushAccounts, probeRemote, readPushConfig } from "./lib/push.mjs";
 
 const args = process.argv.slice(2);
-const ACCOUNTS_FILE = dataPath("accounts_cline.json");
+
 const CACHE_TOKEN_FILE = dataPath("last-token.json");
 const LOG_FILE = path.join(LOG_DIR, "cline_register.log");
 
@@ -45,40 +45,6 @@ function log(...parts) {
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.appendFileSync(LOG_FILE, line + "\n"); } catch {}
 }
 
-function readList(file) {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, "utf-8")
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.includes("@") && l.includes("----"));
-}
-
-function loadAccounts() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf-8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch { return []; }
-}
-
-function saveAccounts(list) {
-  fs.mkdirSync(path.dirname(ACCOUNTS_FILE), { recursive: true });
-  const tmp = `${ACCOUNTS_FILE}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
-  fs.renameSync(tmp, ACCOUNTS_FILE);
-}
-
-function updateCacheToken(rec) {
-  try {
-    fs.mkdirSync(path.dirname(CACHE_TOKEN_FILE), { recursive: true });
-    fs.writeFileSync(CACHE_TOKEN_FILE, JSON.stringify({
-      accessToken: rec.accessToken,
-      refreshToken: rec.refreshToken,
-      expiresAt: rec.expiresAt,
-      source: "device",
-      updatedAt: new Date().toISOString(),
-    }, null, 2));
-  } catch {}
-}
 
 function printStatus() {
   const accounts = loadAccounts();
@@ -177,11 +143,34 @@ async function main() {
   if (args.length === 0) {
     printStatus();
     console.log("用法：");
-    console.log("  --one | --count N | --all | --retry | --email <邮箱>   登录账号");
-    console.log("  --push [--dry-run] [--all-ok]                          推送凭据到远程网关");
-    console.log("  --probe                                                探测远程网关");
-    console.log("  --status                                               查看账号池");
-    return;
+    console.log("");
+    console.log("  登录");
+    console.log("    --one                          登录下一个未完成账号");
+    console.log("    --count N                      连续登录 N 个");
+    console.log("    --all                          跑完全部未完成账号");
+    console.log("    --retry                        重试之前失败的账号");
+    console.log("    --email <邮箱>                 只处理指定的一个邮箱");
+    console.log("");
+    console.log("  并发（每个并发 = 一个 Chrome 窗口）");
+    console.log("    --concurrency N                同时跑 N 个，默认 1，上限 8");
+    console.log("    环境变量 REGISTER_CONCURRENCY  等价写法");
+    console.log("");
+    console.log("  链路");
+    console.log("    默认                           扩展回调流程，需 48801-48840 可用");
+    console.log("    --device                       强制用 WorkOS 设备码流程");
+    console.log("");
+    console.log("  推送（在 .env 配好 CLINE2API_REMOTE_URL / CLINE2API_ADMIN_TOKEN 后自动推送）");
+    console.log("    --push [--dry-run] [--all-ok]  手动推送到远程网关");
+    console.log("    --no-push                      本轮只写本地，不推送");
+    console.log("");
+    console.log("  其他");
+    console.log("    --probe                        探测远程网关是否可达");
+    console.log("    --status                       查看账号池");
+    console.log("");
+    console.log("示例：");
+    console.log("    node register.mjs --count 20 --concurrency 3");
+    console.log("    node register.mjs --all --concurrency 2");
+    console.log("    node register.mjs --all --concurrency 2 --no-push");
   }
 
   const webLines = readList(mailPath("all_web_mail.txt")).concat(readList(mailPath("web_mail.txt")));
@@ -215,65 +204,36 @@ async function main() {
 
   if (!queue.length) { log("没有需要处理的账号"); printStatus(); return; }
 
-  const runner = args.includes("--device") ? loginOneDevice : loginOne;
-  log(`本轮处理 ${queue.length} 个账号（链路：${args.includes("--device") ? "设备码" : "回调"}，库存共 ${webLines.length}）`);
-
-  const newlySucceeded = [];
-
-  for (let i = 0; i < queue.length; i++) {
-    const [webEmail, webPass] = queue[i].split("----").map((s) => s.trim());
-    const idx = Math.max(0, webLines.indexOf(queue[i]));
-    const hs = helperLines[idx % helperLines.length].split("----").map((s) => s.trim());
-    const helperEmail = hs[0];
-    const helperRt = hs[3];
-
-    log(`\n>>> [${i + 1}/${queue.length}] ${webEmail} <<<`);
-    try {
-      const rec = await runner({ webEmail, webPass, helperEmail, helperRt, log });
-      accounts = accounts.filter((a) => a.email.toLowerCase() !== webEmail.toLowerCase());
-      const record = { email: webEmail, password: webPass, helperEmail, ok: true, ...rec };
-      accounts.push(record);
-      saveAccounts(accounts);
-      updateCacheToken(rec);
-      newlySucceeded.push(record);
-      log(`[${i + 1}/${queue.length}] 成功: ${webEmail}`);
-    } catch (e) {
-      log(`[${i + 1}/${queue.length}] 失败: ${webEmail} -> ${e.message}`);
-      accounts = accounts.filter((a) => a.email.toLowerCase() !== webEmail.toLowerCase());
-      accounts.push({
-        email: webEmail, password: webPass, helperEmail, ok: false,
-        error: e.message, attemptedAt: new Date().toISOString(),
-      });
-      saveAccounts(accounts);
-    }
-    if (i + 1 < queue.length) await new Promise((r) => setTimeout(r, 2000));
-  }
-
-  log("\n本轮结束");
-
-  // 若配置了远程网关且本轮有成功，自动推送一次
-  if (newlySucceeded.length && !args.includes("--no-push")) {
-    const cfg = readPushConfig();
-    if (cfg.base && cfg.token) {
-      try {
-        log(`自动推送到远程网关 ${cfg.base} ...`);
-        const result = await pushAccounts(newlySucceeded, { log });
-        log(`推送结果：新增 ${result.imported} / 覆盖 ${result.updated} / 跳过 ${result.skipped}`);
-        const stamp = new Date().toISOString();
-        const okEmails = new Set(newlySucceeded.map((c) => c.email.toLowerCase()));
-        saveAccounts(accounts.map((a) =>
-          a.ok && okEmails.has(a.email.toLowerCase()) ? { ...a, pushedAt: stamp } : a,
-        ));
-      } catch (e) {
-        log(`自动推送失败（本地凭据已保存，可稍后 --push 重试）: ${e.message}`);
+  // 走和 Web 控制台完全相同的批处理引擎
+  const result = await runBatch({
+    count: args.includes("--all") ? 0 : pickNumber("count", 1),
+    concurrency: pickNumber("concurrency", Number(process.env.REGISTER_CONCURRENCY) || 1),
+    device: args.includes("--device"),
+    push: !args.includes("--no-push"),
+    mode: args.includes("--retry") ? "retry" : (specific ? "pending" : "pending"),
+    email: specific,
+    onEvent: (evt) => {
+      if (evt.type === "log") {
+        log(evt.text);
+      } else if (evt.type === "start") {
+        log(`本轮处理 ${evt.total} 个账号｜链路 ${evt.mode === "device" ? "设备码" : "回调"}｜并发 ${evt.concurrency}`);
+        if (evt.push) log(`已启用边跑边推 → ${evt.remote}`);
+        else log("未推送（--no-push）：本轮只写本地");
+      } else if (evt.type === "done") {
+        log("");
+        log("================ 本轮结果 ================");
+        log(`成功 ${evt.ok} ｜ 失败 ${evt.fail} ｜ 已推送 ${evt.pushed} ｜ 耗时 ${(evt.ms / 60000).toFixed(1)} 分钟${evt.aborted ? "（已中止）" : ""}`);
+        log("==========================================");
       }
-    } else {
-      log("未配置远程网关，跳过自动推送（本地凭据已保存）");
-    }
-  }
+    },
+  });
 
+  if (result.total === 0) log("没有需要处理的账号");
   printStatus();
 }
 
 main().catch((e) => { log(`[FATAL] ${e.message}`); process.exit(1); });
+
+
+
 

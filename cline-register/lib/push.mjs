@@ -12,6 +12,8 @@
  *   HTTPS_PROXY / HTTP_PROXY 可选，走代理时设置
  */
 
+import { ProxyAgent, fetch as undiciFetch } from "undici";
+
 const DEFAULT_IMPORT_PATH = "/admin/api/accounts/import";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BATCH = 500; // 单次请求最多推送多少条，避免请求体过大
@@ -25,7 +27,9 @@ export function readPushConfig() {
   const token = env("CLINE2API_ADMIN_TOKEN");
   const path = env("CLINE2API_IMPORT_PATH", DEFAULT_IMPORT_PATH);
   const timeoutMs = Number(env("CLINE2API_PUSH_TIMEOUT_MS", String(DEFAULT_TIMEOUT_MS))) || DEFAULT_TIMEOUT_MS;
-  return { base, token, path, timeoutMs };
+  // 本机直连不通时走代理。优先级：CLINE2API_PROXY > HTTPS_PROXY > HTTP_PROXY
+  const proxy = env("CLINE2API_PROXY") || env("HTTPS_PROXY") || env("HTTP_PROXY");
+  return { base, token, path, timeoutMs, proxy };
 }
 
 export function assertPushConfig(cfg = readPushConfig()) {
@@ -81,13 +85,25 @@ export function toImportRecord(rec) {
   };
 }
 
+/**
+ * 选一个能用的 fetch：配了代理就用 undici 的 ProxyAgent，
+ * 否则回落到全局 fetch。这样本机需要科学上网时也能推送。
+ */
+function makeFetch(proxy) {
+  if (!proxy) return { fetchImpl: fetch, dispatcher: undefined };
+  return {
+    fetchImpl: undiciFetch,
+    dispatcher: new ProxyAgent({ uri: proxy, connectTimeout: 20_000 }),
+  };
+}
+
 function chunk(list, size) {
   const out = [];
   for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
   return out;
 }
 
-async function postBatch(cfg, accounts, { fetchImpl = fetch } = {}) {
+async function postBatch(cfg, accounts, { fetchImpl = fetch, dispatcher } = {}) {
   const url = `${cfg.base}${cfg.path}`;
   const res = await fetchImpl(url, {
     method: "POST",
@@ -98,6 +114,7 @@ async function postBatch(cfg, accounts, { fetchImpl = fetch } = {}) {
     },
     body: JSON.stringify({ accounts }),
     signal: AbortSignal.timeout(cfg.timeoutMs),
+    ...(dispatcher ? { dispatcher } : {}),
   });
 
   const text = await res.text().catch(() => "");
@@ -123,8 +140,11 @@ async function postBatch(cfg, accounts, { fetchImpl = fetch } = {}) {
  * @param {Array<object>} records 注册机记录（含 accessToken / refreshToken / expiresAt / email）
  * @param {{ log?: Function, fetchImpl?: typeof fetch, dryRun?: boolean }} [options]
  */
-export async function pushAccounts(records, { log = console.log, fetchImpl = fetch, dryRun = false } = {}) {
+export async function pushAccounts(records, { log = console.log, fetchImpl, dryRun = false } = {}) {
   const cfg = readPushConfig();
+  const agent = makeFetch(cfg.proxy);
+  const doFetch = fetchImpl ?? agent.fetchImpl;
+  const dispatcher = fetchImpl ? undefined : agent.dispatcher;
   const mapped = [];
   const localSkipped = [];
 
@@ -150,9 +170,10 @@ export async function pushAccounts(records, { log = console.log, fetchImpl = fet
 
   assertPushConfig(cfg);
   log(`推送到 ${cfg.base}${cfg.path}，共 ${mapped.length} 条（分 ${chunk(mapped, MAX_BATCH).length} 批）`);
+  if (cfg.proxy) log(`（经代理 ${cfg.proxy}）`);
 
   for (const batch of chunk(mapped, MAX_BATCH)) {
-    const res = await postBatch(cfg, batch, { fetchImpl });
+    const res = await postBatch(cfg, batch, { fetchImpl: doFetch, dispatcher });
     summary.imported += res.imported;
     summary.updated += res.updated;
     summary.skipped += res.skipped;
@@ -168,13 +189,17 @@ export async function pushAccounts(records, { log = console.log, fetchImpl = fet
 /**
  * 探测远程网关是否可达、令牌是否有效。
  */
-export async function probeRemote({ fetchImpl = fetch } = {}) {
+export async function probeRemote({ fetchImpl } = {}) {
   const cfg = readPushConfig();
   assertPushConfig(cfg);
+  const agent = makeFetch(cfg.proxy);
+  const doFetch = fetchImpl ?? agent.fetchImpl;
+  const dispatcher = fetchImpl ? undefined : agent.dispatcher;
   const url = `${cfg.base}/admin/api/status`;
-  const res = await fetchImpl(url, {
+  const res = await doFetch(url, {
     headers: { Authorization: `Bearer ${cfg.token}`, Accept: "application/json" },
     signal: AbortSignal.timeout(cfg.timeoutMs),
+    ...(dispatcher ? { dispatcher } : {}),
   });
   const text = await res.text().catch(() => "");
   let payload = null;
@@ -185,3 +210,5 @@ export async function probeRemote({ fetchImpl = fetch } = {}) {
   }
   return { url: cfg.base, status: res.status, payload };
 }
+
+
