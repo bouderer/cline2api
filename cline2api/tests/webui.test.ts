@@ -36,9 +36,11 @@ test("the admin page script parses", () => {
   assert.doesNotThrow(() => new Function(script));
 });
 
-/** Strip string/template literals so code embedded in text is not scanned. */
+/** Strip string/template literals and comments so prose is not scanned. */
 function stripStrings(source: string): string {
   return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
     .replace(/`(?:\\.|[^`\\])*`/gs, '""')
     .replace(/'(?:\\.|[^'\\\n])*'/g, '""')
     .replace(/"(?:\\.|[^"\\\n])*"/g, '""');

@@ -377,9 +377,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
               </select>
             </label>
             <input type="number" id="winHours" min="0.1" max="720" step="0.5" value="24" style="width:88px; display:none" title="窗口长度（小时）" />
-            <label class="row xs muted" style="gap:5px; margin:0; cursor:pointer" title="按本地零点切分，而不是滚动窗口">
+            <label class="row xs muted" id="winAnchorWrap" style="gap:5px; margin:0; cursor:pointer" title="从本地今天零点算起，而不是从现在往回滚 24 小时">
               <input type="checkbox" id="winAnchorDay" style="width:auto; margin:0" />
-              按自然日
+              从今天零点起
             </label>
             <button class="btn small" id="usageReload">重新读取</button>
           </div>
@@ -706,11 +706,12 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
             <div class="sm err" id="keyError" style="display:none; white-space:pre-wrap"></div>
             <button class="btn primary" id="keySubmit" style="margin-left:auto">生成</button>
           </div>
-          <div id="keyResult" style="display:none; margin-top:12px">
-            <div class="sm ok">密钥已生成，只显示这一次，复制后妥善保存：</div>
-            <div class="row" style="margin-top:8px">
-              <code class="mono pre" id="keyPlaintext" style="flex:1">-</code>
-              <button class="btn small" id="keyCopy">复制</button>
+          <div id="keyResult" style="display:none; margin-top:14px; padding:14px; border:1px solid var(--ok, #065f46); border-radius:10px">
+            <div class="sm ok" style="font-weight:600">新密钥（只这一次）—— 关闭本面板前都可以复制：</div>
+            <textarea readonly id="keyPlaintext" class="mono" rows="2" style="width:100%; margin-top:8px; resize:none"></textarea>
+            <div class="row" style="margin-top:8px; gap:8px">
+              <button class="btn small primary" id="keyCopy">复制密钥</button>
+              <button class="btn small" id="keySelect">全选</button>
             </div>
           </div>
         </div>
@@ -787,13 +788,29 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     t._timer = setTimeout(function () { t.classList.remove("show"); }, 2600);
   }
   function copy(text, okMsg) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
+    // execCommand is the fallback for contexts where the async clipboard is
+    // denied (HTTP, a permission prompt dismissed, an iframe). It needs a
+    // focused, selectable element, so a hidden textarea is created on demand.
+    function fallback() {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(area);
+      toast(ok ? (okMsg || "已复制") : "复制失败，请手动选中文本", ok ? "ok" : "err");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
       navigator.clipboard.writeText(text).then(
         function () { toast(okMsg || "已复制", "ok"); },
-        function () { toast("复制失败", "err"); }
+        fallback
       );
     } else {
-      toast("浏览器不支持剪贴板", "err");
+      fallback();
     }
   }
   function fmtAbsolute(ts) {
@@ -1060,9 +1077,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
   function windowLabel() {
     var h = usageWindow.hours;
+    if (usageWindow.anchorDay) return "今天零点至今";
     var span = h < 1 ? (Math.round(h * 60) + " 分钟")
       : (h < 48 ? (h + " 小时") : (Math.round(h / 24) + " 天"));
-    return usageWindow.anchorDay ? ("本自然日（" + span + "）") : ("最近 " + span);
+    return "最近 " + span;
   }
 
   function loadCredits(force, page) {
@@ -1074,6 +1092,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         creditsById = next;
         creditsLoaded = true;
         creditsError = null;
+        lastCreditsMeta = data;
         return data;
       })
       .catch(function (e) {
@@ -1104,11 +1123,6 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     var tbody = el("tbody");
     var worst = 0;
     var worstLabel = "";
-    var totalTokens = 0;
-    var totalCost = 0;
-    var totalRequests = 0;
-    var balanceSum = 0;
-    var balanceKnown = 0;
 
     accounts.forEach(function (a) {
       var tr = el("tr");
@@ -1131,9 +1145,6 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         windowLine.className = "xs warn";
         windowLine.textContent = "余额读取失败：" + summarize(credit.error, 40);
       } else if (creditWindow) {
-        totalTokens += creditWindow.totalTokens || 0;
-        totalCost += creditWindow.costUsd || 0;
-        totalRequests += creditWindow.requests || 0;
         var bits = [windowLabel() + " " + fmtTok(creditWindow.totalTokens) + " tok"];
         bits.push((creditWindow.requests || 0) + " 次");
         if (creditWindow.cachedTokens) bits.push("缓存 " + fmtTok(creditWindow.cachedTokens));
@@ -1158,8 +1169,6 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
       var tdBal = el("td", "nowrap num");
       if (credit && credit.balanceMicroUsd !== null && credit.balanceMicroUsd !== undefined) {
-        balanceSum += credit.balanceMicroUsd;
-        balanceKnown += 1;
         var bal = el("div", "sm", fmtUsd(credit.balanceMicroUsd));
         if (credit.balanceMicroUsd < 0) bal.className = "sm err";
         tdBal.appendChild(bal);
@@ -1217,21 +1226,14 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
     table.appendChild(tbody);
     body.appendChild(table);
-    // Totals cover the rows on screen, not the whole pool — every other row
-    // would cost three more upstream calls for a number nobody reads.
-    var note = "用量来自 /api/v1/users/me/plan/usage-limits；余额与 token 来自 /v1/users/{uid}/balance 与 /usages（每账号 60 秒缓存）。本页合计仅统计当前页 " + accounts.length + " 个账号。";
+    // The row totals only cover the visible rows; the headline counters
+    // above come from the pool-wide summary endpoint instead.
+    var note = "用量来自 /api/v1/users/me/plan/usage-limits；余额与 token 来自 /v1/users/{uid}/balance 与 /usages（每账号 60 秒缓存）。";
     if (creditsError) note += " 本次余额读取失败：" + summarize(creditsError, 60);
     body.appendChild(el("div", "xs muted", note));
 
     $("sQuota").textContent = worst ? worst + "%" : "—";
     $("sQuotaHint").textContent = worstLabel || "三个窗口均未上报用量";
-
-    $("sToday").textContent = fmtTok(totalTokens);
-    var todayBits = ["本页 " + accounts.length + " 个账号 · " + windowLabel()];
-    if (totalRequests) todayBits.push(totalRequests + " 次");
-    if (totalCost) todayBits.push(fmtCost(totalCost));
-    if (balanceKnown) todayBits.push("合计余额 " + fmtUsd(balanceSum));
-    $("sTodayHint").textContent = todayBits.join(" · ");
 
     var meta = creditsMeta || { page: 1, pageSize: usagePageSize, total: accounts.length, totalPages: 1 };
     renderPager($("usagePager"), meta.page, meta.totalPages, meta.total, meta.pageSize, function (p) {
@@ -1240,19 +1242,79 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     });
   }
 
+  /**
+   * Pool-wide headline counters for the overview stat cards.
+   *
+   * Separate from the per-row loop above on purpose: the rows only cover the
+   * page in view (each extra row costs three upstream calls), while these
+   * counters roll up the in-memory cache across the whole pool. The hint names
+   * the coverage — "based on 281/287" — because a cold cache means fewer rows
+   * contribute, and printing a partial sum as a total would be a quiet lie.
+   */
+  function renderPoolSummary() {
+    renderPoolSummaryAsync().catch(function () { /* hint already set */ });
+  }
+
+  function renderPoolSummaryData(data) {
+    var t = data.totals || {};
+    var label = windowLabel() + " · 全池 " + data.total + " 个账号";
+    var cov = data.covered >= data.total
+      ? "（全池已统计）"
+      : "（已统计 " + data.covered + "/" + data.total + (data.refreshing ? "，其余统计中" : "") + "）";
+    $("sToday").textContent = fmtTok(t.totalTokens || 0);
+    var bits = [label];
+    if (t.requests) bits.push(t.requests + " 次");
+    if (t.cachedTokens) bits.push("缓存 " + fmtTok(t.cachedTokens));
+    if (t.costUsd) bits.push(fmtCost(t.costUsd));
+    if (t.balanceKnown) bits.push("合计余额 " + fmtUsd(t.balanceMicroUsd));
+    bits.push(cov);
+    $("sTodayHint").textContent = bits.join(" · ");
+  }
+
+  /** Re-read the pool summary until the background sweep has covered everyone. */
+  var summaryPoll = null;
+  function scheduleSummaryPoll(data) {
+    if (summaryPoll) { clearTimeout(summaryPoll); summaryPoll = null; }
+    if (!data || !data.refreshing || data.covered >= data.total) return;
+    summaryPoll = setTimeout(function () { renderPoolSummary(); }, 4000);
+  }
+
   function loadUsage(force, page) {
     var target = page || usagePage;
     usagePage = target;
     var usageUrl = "/admin/api/usage?page=" + target + "&pageSize=" + usagePageSize;
-    Promise.all([api(usageUrl), loadCredits(force, target)]).then(function (res) {
-      renderUsage(res[0], res[1]);
+    // The headline counters read the pool-wide summary; the table rows read
+    // this page. All three are independent, so one slow leg must not blank the
+    // other two — hence allSettled instead of all.
+    Promise.allSettled([api(usageUrl), loadCredits(force, target), renderPoolSummaryAsync()]).then(function (res) {
+      if (res[0].status === "fulfilled") {
+        renderUsage(res[0].value, loadCreditsLastMeta());
+      } else {
+        var body = $("usageBody");
+        clear(body);
+        body.className = "err sm";
+        body.textContent = "配额读取失败：" + (res[0].reason && res[0].reason.message ? res[0].reason.message : res[0].reason);
+        $("sQuota").textContent = "—";
+        $("sQuotaHint").textContent = "读取失败";
+      }
+    });
+  }
+
+  /** Last credits page metadata, so renderUsage can build its pager. */
+  var lastCreditsMeta = null;
+  function loadCreditsLastMeta() { return lastCreditsMeta; }
+
+  /** Pool summary as a promise, so loadUsage can race it with the rows. */
+  function renderPoolSummaryAsync() {
+    var q = windowQuery("");
+    return api("/admin/api/credits/summary" + (q ? "?" + q : "")).then(function (data) {
+      renderPoolSummaryData(data);
+      scheduleSummaryPoll(data);
+      return data;
     }).catch(function (e) {
-      var body = $("usageBody");
-      clear(body);
-      body.className = "err sm";
-      body.textContent = "配额读取失败：" + e.message;
-      $("sQuota").textContent = "—";
-      $("sQuotaHint").textContent = "读取失败";
+      $("sToday").textContent = "—";
+      $("sTodayHint").textContent = "全池合计读取失败：" + e.message;
+      throw e;
     });
   }
 
@@ -1745,7 +1807,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   var selectedIds = {};
   /** accountId -> last known liveness. Missing means never tested. */
   var probeCache = {};
-  /** accountId -> account row, so batch actions do not need the row on screen. */
+  /** accountId -> account row, so batch actions do not need a visible row. */
   var knownAccounts = {};
 
   function selectedList() { return Object.keys(selectedIds); }
@@ -2236,11 +2298,15 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     });
   }
 
-  function loadKeys() {
+  function loadKeys(options) {
+    var keepSecret = options && options.keepSecret;
     api("/admin/api/keys").then(function (data) {
       renderKeys(data.keys || []);
-      // Hide a stale one-time secret: navigating back must not re-show it.
-      $("keyResult").style.display = "none";
+      // The plaintext lives only in this panel — the server never sends it
+      // again — so the refresh that follows a create or rotate must not wipe
+      // it. Every other refresh (entering the view, the reload button) still
+      // clears a secret that was already on screen.
+      if (!keepSecret) $("keyResult").style.display = "none";
     }).catch(function (e) {
       var body = $("keysBody");
       clear(body);
@@ -2255,8 +2321,16 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   function showPlaintextOnce(plaintext) {
     var box = $("keyResult");
     box.style.display = "block";
-    $("keyPlaintext").textContent = plaintext;
-    $("keyCopy").onclick = function () { copy(plaintext, "密钥已复制，妥善保存"); };
+    var field = $("keyPlaintext");
+    field.value = plaintext;
+    // Copy from the field itself rather than a closed-over string, and do it
+    // synchronously inside the click: an async clipboard call made after an
+    // await loses the user-gesture and is rejected.
+    $("keyCopy").onclick = function () { copy(field.value, "密钥已复制，妥善保存"); };
+    $("keySelect").onclick = function () { field.focus(); field.select(); };
+    box.scrollIntoView({ block: "center" });
+    field.focus();
+    field.select();
   }
 
   function submitKey() {
@@ -2267,7 +2341,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         toast("已生成", "ok");
         $("keyLabel").value = "";
         showPlaintextOnce(data.plaintext);
-        loadKeys();
+        loadKeys({ keepSecret: true });
       })
       .catch(function (e) {
         err.textContent = e.message;
@@ -2288,7 +2362,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       .then(function (data) {
         toast("已轮换，旧密钥已失效", "ok");
         showPlaintextOnce(data.plaintext);
-        loadKeys();
+        loadKeys({ keepSecret: true });
       })
       .catch(function (e) { toast("轮换失败：" + e.message, "err"); });
   }
@@ -2576,6 +2650,15 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     else {
       var v = Number($("winHours").value);
       usageWindow.hours = (isFinite(v) && v > 0) ? Math.min(v, 720) : 24;
+    }
+    // Anchoring only changes the answer for a day-long window: shorter ones
+    // ignore it server-side, and a multi-day window has no single midnight to
+    // snap to. Hide it everywhere else so it cannot look like a no-op.
+    var dayScale = usageWindow.hours >= 23 && usageWindow.hours <= 25;
+    $("winAnchorWrap").style.display = dayScale ? "" : "none";
+    if (!dayScale && usageWindow.anchorDay) {
+      usageWindow.anchorDay = false;
+      $("winAnchorDay").checked = false;
     }
   }
   $("winPreset").onchange = function () {

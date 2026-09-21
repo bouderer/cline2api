@@ -94,6 +94,10 @@ export class TokenManager {
     if (rotated) {
       // Update in place by id. `saveCredentials` matches on accountId/email and
       // would insert a duplicate for accounts that carry neither.
+      //
+      // `disabled` is an operator choice, not a token-health flag, so a
+      // successful rotation must not re-enable an account the operator turned
+      // off. Only a prior refresh failure (`lastError`) is cleared here.
       this.store.update(accountId, {
         access: resolved.access,
         refresh: resolved.refresh,
@@ -101,7 +105,6 @@ export class TokenManager {
         tokenType: resolved.metadata?.tokenType ?? record.tokenType,
         ...(resolved.accountId ? { accountId: resolved.accountId } : {}),
         ...(resolved.email ? { email: resolved.email } : {}),
-        disabled: false,
         lastError: null,
       });
       this.logger.debug("persisted rotated credentials", {

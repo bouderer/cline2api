@@ -4,6 +4,7 @@ import type { OpenAIRouteDeps } from "./openai.js";
 import type { LoginMode, LoginService } from "../services/loginService.js";
 import { extractBearer, safeEqual } from "./http.js";
 import type { CredentialSaveInput } from "../store.js";
+import type { StoredAccount } from "../cline/types.js";
 import { ADMIN_PAGE } from "../webui/page.js";
 import { chatCompletion, unwrapEnvelope } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
@@ -139,7 +140,12 @@ async function collectUsage(
       error: null,
     };
 
-    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
+    const authorization = await deps.tokens
+      // A disabled account is an operator choice, not a dead token. Forcing the
+      // refresh keeps its refresh token rotating even while it is out of the
+      // pool, so it can be turned back on later instead of needing a re-login.
+      .getAuthorization(account.id, account.disabled ? { forceRefresh: true } : {})
+      .catch(() => null);
     if (!authorization) {
       row.error = "re-login required";
       return row;
@@ -173,9 +179,21 @@ interface AccountCreditsRow extends AccountCredits {
   lastError: string | null;
 }
 
-const CREDITS_CACHE_TTL_MS = 60_000;
+const CREDITS_CACHE_TTL_MS = 5 * 60_000;
 const CREDITS_CONCURRENCY = 6;
 const creditsCache = new Map<string, { at: number; row: AccountCreditsRow }>();
+
+/**
+ * One background sweep of the whole pool per window, so the overview's
+ * headline counters fill in without anyone paging through every account.
+ * Keyed by the window; a newer request for the same window joins the one
+ * already running instead of starting a second sweep.
+ */
+const poolSweeps = new Map<string, Promise<void>>();
+
+function sweepKey(window: ResolvedWindow): string {
+  return `${window.windowMs}:${window.snappedToDay}`;
+}
 
 /** Run `worker` over `items` with at most `limit` in flight, order preserved. */
 async function mapWithConcurrency<T, R>(
@@ -235,7 +253,22 @@ async function collectCredits(
 ): Promise<{ accounts: AccountCreditsRow[] } & Omit<PageMeta, "offset">> {
   const resolved = resolveWindow(options.window ?? {});
   const accounts = deps.store.list().slice(page.offset, page.offset + page.pageSize);
-  const rows = await mapWithConcurrency(accounts, CREDITS_CONCURRENCY, async (account) => {
+  const rows = await creditRows(deps, accounts, resolved, options);
+  return { accounts: rows, page: page.page, pageSize: page.pageSize, total: page.total, totalPages: page.totalPages };
+}
+
+/**
+ * Fetch one credits row per account, serving fresh cache hits and only going
+ * upstream for the rest. Shared by the paginated endpoint and the pool sweep,
+ * so a page the UI already loaded is never fetched twice.
+ */
+async function creditRows(
+  deps: AdminRouteDeps,
+  accounts: readonly StoredAccount[],
+  resolved: ResolvedWindow,
+  options: { force?: boolean; window?: UsageWindowRequest } = {},
+): Promise<AccountCreditsRow[]> {
+  return mapWithConcurrency(accounts, CREDITS_CONCURRENCY, async (account) => {
     const base = {
       id: account.id,
       email: account.email,
@@ -243,8 +276,10 @@ async function collectCredits(
       lastError: account.lastError,
     };
     const cached = creditsCache.get(account.id);
-    // The cache key includes the window: a cached 1-hour total must not be
-    // served for a 7-day request under the same account id.
+    // Keyed on the window *length*, not its absolute edges: a rolling window's
+    // `since` moves every call, and matching on it would make a row fetched a
+    // second ago look stale. Rows stay for the TTL, which bounds how far the
+    // summed window can drift from "right now".
     if (
       !options.force &&
       cached &&
@@ -255,7 +290,9 @@ async function collectCredits(
       return cached.row;
     }
 
-    const authorization = await deps.tokens.getAuthorization(account.id).catch(() => null);
+    const authorization = await deps.tokens
+      .getAuthorization(account.id, account.disabled ? { forceRefresh: true } : {})
+      .catch(() => null);
     if (!authorization) {
       return emptyCreditsRow(base, resolved, "re-login required");
     }
@@ -268,9 +305,116 @@ async function collectCredits(
     creditsCache.set(account.id, { at: Date.now(), row });
     return row;
   });
-  return { accounts: rows, page: page.page, pageSize: page.pageSize, total: page.total, totalPages: page.totalPages };
 }
 
+/**
+ * Fill the credits cache for every account, in the background.
+ *
+ * The overview headline is a pool-wide sum, but the row endpoint only fetches
+ * the page on screen. Without this, the sum only ever covers accounts someone
+ * happened to page to. One sweep runs per window at a time; repeat requests
+ * join it rather than stacking more upstream load on top.
+ */
+function sweepCreditsPool(
+  deps: AdminRouteDeps,
+  options: { window?: UsageWindowRequest } = {},
+): { started: boolean; accounts: number } {
+  const resolved = resolveWindow(options.window ?? {});
+  const key = sweepKey(resolved);
+  if (poolSweeps.has(key)) return { started: false, accounts: deps.store.count() };
+  // A rolling window's edges move between the pages of a long sweep, so pin
+  // them once here. Every row of this sweep then covers the same range, and
+  // the cache compares windows by length rather than by those edges.
+  const pinned: UsageWindowRequest = {
+    now: resolved.until,
+    windowMs: resolved.windowMs,
+    snapToDay: resolved.snappedToDay,
+  };
+  const accounts = deps.store.list();
+  const run = creditRows(deps, accounts, resolved, { window: pinned })
+    .catch((error) => {
+      deps.logger.warn("credit pool sweep failed", { error: (error as Error).message });
+    })
+    .finally(() => {
+      poolSweeps.delete(key);
+    });
+  poolSweeps.set(key, run.then(() => undefined));
+  return { started: true, accounts: accounts.length };
+}
+
+
+/**
+ * Pool-wide credit summary over the same cache the rows come from.
+ *
+ * The overview's headline counters must cover the whole pool, not the page on
+ * screen: reading every account upstream just to render "287 accounts used
+ * 221M tokens" would cost ~861 requests per refresh. Instead this walks the
+ * in-memory row cache, summing every row that matches the requested window and
+ * reporting how many accounts it actually stands on. A stale or missing cache
+ * means fewer rows contribute — which is why `covered` and `total` travel with
+ * the sums, so the UI can say "based on 41/287" rather than print a quiet
+ * undercount as fact.
+ */
+interface PoolCreditSummary {
+  window: UsageWindowRequest & { windowMs: number; snappedToDay: boolean };
+  totals: {
+    requests: number;
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+    costUsd: number;
+    balanceMicroUsd: number;
+    balanceKnown: number;
+  };
+  /** Accounts whose cached rows contributed to this summary. */
+  covered: number;
+  /** Accounts in the pool right now. */
+  total: number;
+}
+
+function summarizeCreditsPool(deps: AdminRouteDeps, options: { window?: UsageWindowRequest } = {}): PoolCreditSummary {
+  const resolved = resolveWindow(options.window ?? {});
+  const now = Date.now();
+  const totals = {
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    balanceMicroUsd: 0,
+    balanceKnown: 0,
+  };
+  let covered = 0;
+  const ids = new Set(deps.store.list().map((account) => account.id));
+  for (const entry of creditsCache.values()) {
+    if (now - entry.at >= CREDITS_CACHE_TTL_MS) continue;
+    if (!ids.has(entry.row.id)) continue;
+    if (entry.row.windowMs !== resolved.windowMs || entry.row.snappedToDay !== resolved.snappedToDay) continue;
+    covered += 1;
+    const window = entry.row.window;
+    totals.requests += window.requests;
+    totals.promptTokens += window.promptTokens;
+    totals.completionTokens += window.completionTokens;
+    totals.cachedTokens += window.cachedTokens;
+    totals.totalTokens += window.totalTokens;
+    totals.costUsd += window.costUsd;
+    if (entry.row.balanceMicroUsd !== null && entry.row.balanceMicroUsd !== undefined) {
+      totals.balanceMicroUsd += entry.row.balanceMicroUsd;
+      totals.balanceKnown += 1;
+    }
+  }
+  return {
+    window: {
+      windowMs: resolved.windowMs,
+      snappedToDay: resolved.snappedToDay,
+    },
+    totals,
+    covered,
+    total: ids.size,
+  };
+}
 
 const MAX_IMPORT_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_IMPORT_ACCOUNTS = 5_000;
@@ -669,6 +813,26 @@ app.get("/admin/api/accounts", (c) => {
     const page = resolvePage((name) => c.req.query(name), deps.store.count());
     const force = c.req.query("refresh") === "1";
     return c.json(await collectCredits(deps, page, { force, window: windowQuery(c) }));
+  });
+
+  /**
+   * Pool-wide credit summary for the overview headline counters.
+   *
+   * Reads only the in-memory row cache: the full-pool walk belongs to the
+   * paginated row endpoint, where the UI explicitly asks for a page. Every
+   * field this returns can also be derived from the per-account rows, so a
+   * client can treat it as a rollup rather than a separate source of truth.
+   */
+  app.get("/admin/api/credits/summary", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const window = windowQuery(c);
+    // Kick off a background sweep so the headline covers the whole pool, not
+    // just the pages someone opened. It joins one already running for this
+    // window, and the response below is whatever the cache holds right now.
+    const sweep = sweepCreditsPool(deps, { window });
+    const summary = summarizeCreditsPool(deps, { window });
+    return c.json({ ...summary, refreshing: sweep.started || poolSweeps.has(sweepKey(resolveWindow(window))) });
   });
 
   /**

@@ -521,3 +521,81 @@ test("credits paging and window reach upstream per page, not per pool", async ()
     assert.equal(meCalls, 5);
   });
 });
+
+test("reading credits refreshes a disabled account without re-enabling it", async () => {
+  await withGateway(1, async ({ app, dataDir, upstream }) => {
+    const stored = readStore(dataDir)[0];
+    assert.ok(stored);
+    stored.disabled = true;
+    stored.expires = Date.now() + 60_000;
+    const file = path.join(dataDir, "accounts.json");
+    fs.writeFileSync(file, JSON.stringify({ version: 1, accounts: [stored] }), "utf8");
+    // mtime is the reload signal and it has 1ms resolution; a write in the
+    // same millisecond as the store's own persist would be invisible to it.
+    const bumped = new Date(fs.statSync(file).mtimeMs + 5000);
+    fs.utimesSync(file, bumped, bumped);
+    upstream.requests.length = 0;
+
+    const response = await app.request("/admin/api/credits?page=1&pageSize=5&hours=6&refresh=1", {
+      headers: adminHeaders,
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { accounts: Array<{ error: string | null }> };
+    assert.equal(body.accounts[0]?.error, null);
+
+    // The refresh happened...
+    assert.ok(upstream.requests.some((r) => r.url === "/api/v1/auth/refresh"));
+    // ...and the account stays disabled, because disabling is an operator
+    // choice rather than a token-health flag.
+    const after = readStore(dataDir)[0];
+    assert.equal(after?.disabled, true);
+    assert.equal(after?.refresh, "rotated-refresh");
+  });
+});
+
+test("credits summary rolls up the row cache without new upstream calls", async () => {
+  // Note: creditsCache is module-level, so earlier tests in this file may have
+  // already cached acct-N rows for the same window. The assertions below only
+  // rely on totals being a multiple of the mock's per-row values, never on an
+  // exact row count from a cold cache.
+  await withGateway(30, async ({ app, upstream }) => {
+    const before = (await (
+      await app.request("/admin/api/credits/summary?hours=6", { headers: adminHeaders })
+    ).json()) as {
+      covered: number;
+      total: number;
+      totals: { requests: number; totalTokens: number; balanceKnown: number };
+    };
+    assert.equal(before.total, 30);
+
+    await app.request("/admin/api/credits?page=1&pageSize=5&hours=6", { headers: adminHeaders });
+    upstream.requests.length = 0;
+
+    const summary = (await (
+      await app.request("/admin/api/credits/summary?hours=6", { headers: adminHeaders })
+    ).json()) as {
+      covered: number;
+      total: number;
+      window: { windowMs: number };
+      totals: { requests: number; totalTokens: number; balanceKnown: number };
+    };
+    assert.equal(summary.total, 30);
+    // The mock answers one usage record of 9 tokens per account, so every
+    // covered row contributes the same shape: requests == rows, 9 tokens each.
+    assert.equal(summary.totals.requests, summary.covered);
+    assert.equal(summary.totals.totalTokens, summary.covered * 9);
+    assert.equal(summary.totals.balanceKnown, summary.covered);
+    assert.equal(summary.window.windowMs, 6 * 60 * 60 * 1000);
+    assert.ok(summary.covered >= 5, `expected at least the 5 just-read rows, got ${summary.covered}`);
+    // Zero upstream traffic: this is a pure cache rollup.
+    assert.equal(upstream.requests.length, 0);
+
+    // A different window must not reuse these rows: hours=168 shares nothing
+    // with hours=6 in the cache key, so coverage comes only from rows read
+    // under that window (none here).
+    const other = (await (
+      await app.request("/admin/api/credits/summary?hours=168", { headers: adminHeaders })
+    ).json()) as { covered: number };
+    assert.equal(other.covered, 0);
+  });
+});
