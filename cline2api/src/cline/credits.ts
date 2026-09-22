@@ -484,6 +484,23 @@ export interface UsageBucket {
 }
 
 /**
+ * The bucket step for a window, snapped to a human-sized interval.
+ *
+ * Split out so the by-time and by-model passes share one definition of the
+ * bucket boundaries; if the two disagreed the series could not be read together.
+ */
+export function bucketStepFor(window: ResolvedWindow, target = 48): number {
+  const span = Math.max(1, window.until - window.since);
+  const rough = span / target;
+  const STEPS = [
+    60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000,
+    60 * 60_000, 3 * 60 * 60_000, 6 * 60 * 60_000, 12 * 60 * 60_000,
+    24 * 60 * 60_000, 7 * 24 * 60 * 60_000,
+  ];
+  return STEPS.find((s) => s >= rough) ?? STEPS[STEPS.length - 1]!;
+}
+
+/**
  * Bucket a window's records into a timeline.
  *
  * The bucket size is chosen from the window so the series lands in a readable
@@ -493,16 +510,7 @@ export interface UsageBucket {
  * across an hour of no traffic and read as sustained usage.
  */
 export function bucketUsage(records: readonly UsageRecord[], window: ResolvedWindow): UsageBucket[] {
-  const span = Math.max(1, window.until - window.since);
-  const target = 48;
-  const rough = span / target;
-  // Snap to a human-sized step so bucket boundaries land on round times.
-  const STEPS = [
-    60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000,
-    60 * 60_000, 3 * 60 * 60_000, 6 * 60 * 60_000, 12 * 60 * 60_000,
-    24 * 60 * 60_000, 7 * 24 * 60 * 60_000,
-  ];
-  const step = STEPS.find((s) => s >= rough) ?? STEPS[STEPS.length - 1]!;
+  const step = bucketStepFor(window);
   const start = Math.floor(window.since / step) * step;
   const count = Math.max(1, Math.ceil((window.until - start) / step));
 
@@ -533,6 +541,72 @@ export function bucketUsage(records: readonly UsageRecord[], window: ResolvedWin
     bucket.cacheHitRate = bucket.promptTokens > 0 ? bucket.cachedTokens / bucket.promptTokens : 0;
   }
   return buckets;
+}
+
+/** One model's series across a timeline: a bucket-aligned array of totals. */
+export interface ModelTimeline {
+  id: string;
+  bucket: string | null;
+  /** Parallel to the timeline's buckets, same length and order. */
+  tokens: number[];
+  requests: number[];
+  total: number;
+}
+
+export interface UsageTimeline {
+  buckets: UsageBucket[];
+  models: ModelTimeline[];
+}
+
+/**
+ * Bucket a window's records by time *and* by model.
+ *
+ * Two series shapes are produced from one pass: the pool total per bucket, and
+ * each model's tokens per bucket aligned to the same bucket boundaries. The
+ * alignment is the point — a model chart whose x-axis drifted from the total
+ * chart's would make the two impossible to read together.
+ *
+ * Only the models that carry the window are returned, most tokens first, since
+ * a legend past a handful of entries stops being readable. `maxModels` caps it
+ * and the caller is told what was dropped through the returned totals.
+ */
+export function bucketUsageByModel(
+  records: readonly UsageRecord[],
+  window: ResolvedWindow,
+  options: { maxModels?: number } = {},
+): UsageTimeline {
+  const buckets = bucketUsage(records, window);
+  const step = bucketStepFor(window);
+  const start = Math.floor(window.since / step) * step;
+
+  const indexFor = (at: number): number => {
+    const i = Math.floor((at - start) / step);
+    return Math.min(buckets.length - 1, Math.max(0, i));
+  };
+
+  const byModel = new Map<string, ModelTimeline>();
+  for (const record of records) {
+    if (record.model === null) continue;
+    let series = byModel.get(record.model);
+    if (series === undefined) {
+      series = {
+        id: record.model,
+        bucket: bucketOf(record.model),
+        tokens: new Array<number>(buckets.length).fill(0),
+        requests: new Array<number>(buckets.length).fill(0),
+        total: 0,
+      };
+      byModel.set(record.model, series);
+    }
+    const i = indexFor(record.at);
+    series.tokens[i] = (series.tokens[i] ?? 0) + record.totalTokens;
+    series.requests[i] = (series.requests[i] ?? 0) + 1;
+    series.total += record.totalTokens;
+  }
+
+  const all = [...byModel.values()].sort((a, b) => b.total - a.total || a.id.localeCompare(b.id));
+  const maxModels = options.maxModels ?? 8;
+  return { buckets, models: all.slice(0, maxModels) };
 }
 
 /** The window an admin read covers, resolved from request options. */

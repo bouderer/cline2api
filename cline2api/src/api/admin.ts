@@ -15,7 +15,7 @@ import type { RateLimiter } from "../services/rateLimit.js";
 import type { SweepRunner } from "../services/sweep.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
-import { fetchAccountCredits, bucketUsage, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageRecord, type UsageWindowRequest } from "../cline/credits.js";
+import { fetchAccountCredits, bucketUsage, bucketUsageByModel, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageRecord, type UsageWindowRequest } from "../cline/credits.js";
 import { ProxyStore, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
 import type { ProxyResolver } from "../cline/proxy.js";
 
@@ -938,8 +938,12 @@ app.get("/admin/api/accounts", (c) => {
       records.push(...entry.records);
     }
     const buckets = bucketUsage(records, resolved);
+    // The same records, bucketed per model too: the two charts then share one
+    // set of bucket boundaries and can be read against each other.
+    const byModel = bucketUsageByModel(records, resolved);
     return c.json({
       buckets,
+      models: byModel.models,
       covered,
       total: ids.size,
       window: {

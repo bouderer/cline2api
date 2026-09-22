@@ -783,3 +783,36 @@ test("free quota reports each account's per-model fill against the ceiling", asy
     assert.equal(first.models[0]?.totalTokens, 9);
   });
 });
+
+test("the timeline carries a per-model series aligned to its buckets", async () => {
+  await withGateway(30, async ({ app, upstream }) => {
+    await app.request("/admin/api/credits?page=1&pageSize=5&hours=6", { headers: adminHeaders });
+    upstream.requests.length = 0;
+
+    const body = (await (
+      await app.request("/admin/api/usage/timeline?hours=6", { headers: adminHeaders })
+    ).json()) as {
+      buckets: Array<{ totalTokens: number }>;
+      models: Array<{ id: string; tokens: number[]; requests: number[]; total: number }>;
+    };
+
+    assert.equal(body.models.length, 1);
+    const series = body.models[0];
+    assert.ok(series);
+    assert.equal(series.id, "cline-free/Deepseek-v4.1-Flash");
+    // Parallel to the buckets: that alignment is what lets the two charts be
+    // read against each other.
+    assert.equal(series.tokens.length, body.buckets.length);
+    assert.equal(series.requests.length, body.buckets.length);
+    // The stack sums to the same total as the by-time series, with no
+    // double counting between the two views.
+    const stacked = body.buckets.map((_, i) =>
+      body.models.reduce((sum, m) => sum + (m.tokens[i] ?? 0), 0),
+    );
+    assert.equal(
+      stacked.reduce((a, b) => a + b, 0),
+      body.buckets.reduce((s, b) => s + b.totalTokens, 0),
+    );
+    assert.equal(upstream.requests.length, 0);
+  });
+});

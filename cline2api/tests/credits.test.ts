@@ -20,6 +20,7 @@ import {
   COST_UNITS_PER_USD,
   MICRO_USD,
   bucketUsage,
+  bucketUsageByModel,
   fetchAccountCredits,
   fetchUsagesSince,
   normalizeModelId,
@@ -439,4 +440,74 @@ test("bucketUsage picks a coarser step for a wider window", () => {
   // Neither window should explode into an unreadable number of points.
   const hourBuckets = bucketUsage([], { ...hour, windowMs: 3600_000, snappedToDay: false } as never);
   assert.ok(hourBuckets.length <= 64, `too many buckets for an hour: ${hourBuckets.length}`);
+});
+
+test("bucketUsageByModel aligns every model to the same bucket boundaries", () => {
+  const now = Date.UTC(2026, 8, 22, 12, 0, 0);
+  const since = now - 6 * 60 * 60 * 1000;
+  const window = { since, until: now, windowMs: now - since, snappedToDay: false };
+  const rec = (at: number, model: string, tokens: number) => ({
+    id: `u${at}${model}`,
+    at,
+    model,
+    operation: "chat_completion",
+    provider: "vercel",
+    promptTokens: tokens,
+    completionTokens: 0,
+    totalTokens: tokens,
+    cachedTokens: 0,
+    costMicroUsd: 0,
+    creditsUsed: 0,
+  });
+
+  const timeline = bucketUsageByModel([
+    rec(since + 3600_000, "cline-free/kimi-k3", 100),
+    rec(since + 3600_000, "cline-free/Deepseek-v4.1-Flash", 300),
+    rec(since + 7200_000, "cline-free/kimi-k3", 50),
+  ], window);
+
+  // A model series is parallel to the bucket array, so the two charts share an
+  // x-axis and can be read against each other.
+  for (const m of timeline.models) {
+    assert.equal(m.tokens.length, timeline.buckets.length);
+    assert.equal(m.requests.length, timeline.buckets.length);
+  }
+  // Ranked by tokens, so deepseek leads despite kimi having more requests.
+  assert.equal(timeline.models[0]?.id, "cline-free/Deepseek-v4.1-Flash");
+  assert.equal(timeline.models[0]?.total, 300);
+  assert.equal(timeline.models[1]?.id, "cline-free/kimi-k3");
+  assert.equal(timeline.models[1]?.total, 150);
+  assert.equal(timeline.models[1]?.requests.reduce((a, b) => a + b, 0), 2);
+  // Every series sums to its own total — no double counting across the stack.
+  const stacked = timeline.buckets.map((_, i) =>
+    timeline.models.reduce((sum, m) => sum + (m.tokens[i] ?? 0), 0),
+  );
+  assert.equal(stacked.reduce((a, b) => a + b, 0), 450);
+  assert.equal(stacked.reduce((a, b) => a + b, 0), timeline.buckets.reduce((s, b) => s + b.totalTokens, 0));
+});
+
+test("bucketUsageByModel caps the series and keeps the largest", () => {
+  const now = Date.UTC(2026, 8, 22, 12, 0, 0);
+  const since = now - 3600_000;
+  const window = { since, until: now, windowMs: 3600_000, snappedToDay: false };
+  // Twelve models, sizes 1..12 tokens: a legend past a handful is unreadable,
+  // so the cap must drop the tail rather than the leaders.
+  const records = Array.from({ length: 12 }, (_, i) => ({
+    id: `u${i}`,
+    at: since + 60_000,
+    model: `bucket/model-${String(i).padStart(2, "0")}`,
+    operation: "chat_completion",
+    provider: "vercel",
+    promptTokens: i + 1,
+    completionTokens: 0,
+    totalTokens: i + 1,
+    cachedTokens: 0,
+    costMicroUsd: 0,
+    creditsUsed: 0,
+  }));
+  const capped = bucketUsageByModel(records, window, { maxModels: 5 });
+  assert.equal(capped.models.length, 5);
+  assert.equal(capped.models[0]?.id, "bucket/model-11");
+  assert.equal(capped.models[0]?.total, 12);
+  assert.equal(capped.models[4]?.total, 8);
 });

@@ -28,8 +28,12 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
     /* Chart series slots. Validated as a set against this surface: adjacent
-       CVD ΔE 24.7, normal-vision ΔE 33.6, all ≥3:1 contrast (see dataviz). */
-    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a;
+       CVD ΔE 24.7, normal-vision ΔE 33.6, all ≥3:1 contrast (see dataviz).
+       Slots 4-8 extend the same validated order for the per-model chart, where
+       each model needs its own identity. The light slots 3, 4 and 5 sit below
+       3:1 by design, which obligates the relief the per-model table provides. */
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+    --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
     --grid:#e5e7eb; --axis:#c3c2b7;
   }
   @media (prefers-color-scheme: dark) {
@@ -42,8 +46,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       --err:#f87171; --err-soft:#2c1516;
       --sky:#7dd3fc; --sky-soft:#0f2430;
       --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
-      /* The same three hues re-stepped for the dark surface, not an auto-flip. */
-      --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+      /* The same hues re-stepped for the dark surface, not an auto-flip. */
+      --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+      --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
       --grid:#252a33; --axis:#383835;
     }
   }
@@ -206,8 +211,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     box-shadow:var(--shadow); padding:8px 10px; font-size:12px; min-width:150px;
   }
   .chart-tip .tip-row { display:flex; justify-content:space-between; gap:14px; }
-  .chart-tip .tip-k { color:var(--muted); }
+  .chart-tip .tip-k { color:var(--muted); display:inline-flex; align-items:center; gap:6px; }
   .chart-tip .tip-v { font-variant-numeric:tabular-nums; }
+  .chart-tip .tip-sw { width:9px; height:9px; border-radius:2px; display:inline-block; flex:none; }
 
   /* Pager under a paginated table, and under the overview's usage card. */
   .card-foot {
@@ -532,6 +538,24 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         </div>
         <div class="card-body">
           <div id="chartWrap"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>按模型走势</h2>
+            <div class="hint" id="modelChartHint">—</div>
+          </div>
+          <div class="row" style="gap:8px">
+            <select id="modelChartMetric" style="width:auto; min-width:110px">
+              <option value="tokens">Token</option>
+              <option value="requests">请求数</option>
+            </select>
+          </div>
+        </div>
+        <div class="card-body">
+          <div id="modelChartWrap"><div class="muted sm">读取中…</div></div>
         </div>
       </div>
 
@@ -1598,6 +1622,121 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     return { svg: svg, legend: legend, step: step };
   }
 
+  /**
+   * A model id short enough for a legend but still unique.
+   *
+   * The last path segment alone is not enough: cline-free/kimi-k3,
+   * moonshotai/kimi-k3 and cline-pass/kimi-k3 would all render as "kimi-k3",
+   * so a legend of three swatches would name three different models
+   * identically. The bucket is therefore kept whenever the bare name alone
+   * would collide within the series being drawn.
+   */
+  function shortModelLabels(ids) {
+    var bare = ids.map(function (id) {
+      var parts = String(id).split("/");
+      return parts[parts.length - 1] || id;
+    });
+    var counts = {};
+    bare.forEach(function (b) { counts[b] = (counts[b] || 0) + 1; });
+    return ids.map(function (id, i) {
+      if (counts[bare[i]] === 1) return bare[i];
+      // Only strip the cline- noise; the distinguishing part is the bucket.
+      var parts = String(id).split("/");
+      var bucket = parts.length > 1 ? parts[0].replace(/^cline-/, "") : "";
+      return bucket ? bucket + "/" + bare[i] : bare[i];
+    });
+  }
+
+  /**
+   * Build the SVG for a per-model timeline.
+   *
+   * A stacked band per model, most-used at the bottom, so the reading is "who
+   * is carrying the pool" rather than "where did these tokens come from". Each
+   * model takes a categorical slot by its rank in the ranked series list, and
+   * that list does not change when the metric or the window does — so a color
+   * always means the same model within a session rather than being reassigned
+   * by rank.
+   */
+  function chartSvgByModel(data, metric) {
+    var models = data.models || [];
+    var buckets = data.buckets || [];
+    if (!models.length || !buckets.length) return null;
+    var step = bucketStepMs(buckets);
+    var W = CHART.w, H = CHART.h;
+    var plotW = W - CHART.padL - CHART.padR;
+    var plotH = H - CHART.padT - CHART.padB;
+    var key = metric === "requests" ? "requests" : "tokens";
+    var axisKind = key === "requests" ? "requests" : "totalTokens";
+
+    var totals = buckets.map(function (_, i) {
+      var sum = 0;
+      models.forEach(function (m) { sum += Number(m[key][i]) || 0; });
+      return sum;
+    });
+    var maxV = Math.max.apply(null, totals);
+    if (!(maxV > 0)) maxV = 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(maxV)));
+    maxV = Math.ceil(maxV / (mag / 2)) * (mag / 2);
+
+    function x(i) { return CHART.padL + (buckets.length === 1 ? plotW / 2 : (plotW * i) / (buckets.length - 1)); }
+    function y(v) { return CHART.padT + plotH - (plotH * v) / maxV; }
+
+    var parts = [];
+    var lower = buckets.map(function () { return 0; });
+    // Names are computed once for the whole set: uniqueness can only be judged
+    // against the siblings being drawn.
+    var labels = shortModelLabels(models.map(function (m) { return m.id; }));
+    models.forEach(function (m, mi) {
+      var upper = buckets.map(function (_, i) {
+        return (lower[i] || 0) + (Number(m[key][i]) || 0);
+      });
+      var top = upper.map(function (v, i) { return x(i) + "," + y(v); });
+      var bottom = lower.map(function (v, i) { return x(i) + "," + y(v); }).reverse();
+      // Eight validated slots; a ninth model folds into the same rotation, and
+      // the table below carries identity for it regardless.
+      var slot = (mi % 8) + 1;
+      parts.push('<polygon class="c-area" points="' + top.concat(bottom).join(" ") +
+        '" fill="var(--s' + slot + ')" />');
+      lower = upper;
+    });
+
+    var ticks = 4;
+    var grid = [];
+    for (var t = 0; t <= ticks; t++) {
+      var gv = (maxV * t) / ticks;
+      var gy = y(gv);
+      grid.push('<line class="c-grid" x1="' + CHART.padL + '" y1="' + gy + '" x2="' + (W - CHART.padR) + '" y2="' + gy + '" />');
+      grid.push('<text class="c-tick" x="' + (CHART.padL - 8) + '" y="' + (gy + 3.5) + '" text-anchor="end">' +
+        axisNum(gv, axisKind) + "</text>");
+    }
+
+    var xLabels = [];
+    [0, Math.floor((buckets.length - 1) / 2), buckets.length - 1].forEach(function (i, k) {
+      if (i < 0 || i >= buckets.length) return;
+      if (k === 1 && buckets.length < 5) return;
+      var anchor = k === 0 ? "start" : (k === 2 ? "end" : "middle");
+      xLabels.push('<text class="c-tick" x="' + x(i) + '" y="' + (H - 8) + '" text-anchor="' + anchor + '">' +
+        bucketLabel(buckets[i].at, step) + "</text>");
+    });
+
+    var hits = buckets.map(function (b, i) {
+      var bw = plotW / Math.max(1, buckets.length - 1);
+      return '<rect class="c-hit" x="' + (x(i) - bw / 2) + '" y="' + CHART.padT + '" width="' + bw +
+        '" height="' + plotH + '" data-i="' + i + '" />';
+    });
+
+    var svg = '<svg class="chart" viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img">' +
+      grid.join("") + parts.join("") + hits.join("") + xLabels.join("") + "</svg>";
+
+    var legend = '<div class="legend">' + labels.map(function (name, mi) {
+      var slot = (mi % 8) + 1;
+      return '<span class="lg"><i style="background:var(--s' + slot + ')"></i>' +
+        name + "</span>";
+    }).join("") + "</div>";
+
+    return { svg: svg, legend: legend, models: models, labels: labels, step: step };
+  }
+
   /** Render the chart plus its hover tooltip layer into the given wrap. */
   function renderChartInto(wrap, hintEl, data, metric) {
     clear(wrap);
@@ -1663,14 +1802,94 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       timelineCache = data;
       renderChartInto($("chartWrap"), $("chartHint"), data, $("chartMetric").value);
       if ($("ovChartWrap")) renderChartInto($("ovChartWrap"), $("ovChartHint"), data, "totalTokens");
+      renderModelChart(data);
       return data;
     }).catch(function (e) {
-      [$("chartWrap"), $("ovChartWrap")].forEach(function (wrap) {
+      [$("chartWrap"), $("ovChartWrap"), $("modelChartWrap")].forEach(function (wrap) {
         if (!wrap) return;
         clear(wrap);
         wrap.appendChild(el("div", "err sm", "走势读取失败：" + e.message));
       });
       if ($("chartHint")) $("chartHint").textContent = "读取失败";
+    });
+  }
+
+  /**
+   * The per-model chart: one stacked band per model, each its own color.
+   *
+   * The tooltip is where the per-model split is actually readable — a stacked
+   * band tells you a model is large, not by how much — so it lists every series
+   * with its value for the hovered bucket, largest first.
+   */
+  function renderModelChart(data) {
+    var wrap = $("modelChartWrap");
+    if (!wrap) return;
+    var metric = $("modelChartMetric") ? $("modelChartMetric").value : "tokens";
+    clear(wrap);
+    var built = chartSvgByModel(data, metric);
+    if (!built) {
+      wrap.appendChild(el("div", "muted sm", "窗口内没有带模型信息的用量记录。"));
+      if ($("modelChartHint")) $("modelChartHint").textContent = windowLabel() + " · 暂无数据";
+      return;
+    }
+    if ($("modelChartHint")) {
+      $("modelChartHint").textContent = windowLabel() + " · " + built.models.length + " 个模型 · " +
+        (data.models && data.models.length < (data.modelsTotal || data.models.length)
+          ? "已显示前 " + built.models.length + " 个" : "已统计 " + data.covered + "/" + data.total + " 个账号");
+    }
+
+    var host = el("div", "chart-host");
+    host.innerHTML = built.svg; // numbers only; no user text
+    var legendRow = el("div");
+    legendRow.innerHTML = built.legend;
+    wrap.appendChild(host);
+    wrap.appendChild(legendRow);
+
+    var tip = el("div", "chart-tip");
+    tip.style.display = "none";
+    host.appendChild(tip);
+
+    var key = metric === "requests" ? "requests" : "tokens";
+    var models = built.models;
+    host.querySelectorAll(".c-hit").forEach(function (rect) {
+      rect.addEventListener("mousemove", function (ev) {
+        var i = Number(this.getAttribute("data-i"));
+        var b = (data.buckets || [])[i];
+        if (!b) return;
+        var box = host.getBoundingClientRect();
+        // Largest contributor first, and drop the zeros: a bucket where a model
+        // did nothing is not worth a line.
+        var rows = models.map(function (m, mi) {
+          return { label: built.labels[mi], slot: (mi % 8) + 1, value: Number(m[key][i]) || 0 };
+        }).filter(function (r) { return r.value > 0; })
+          .sort(function (a, b) { return b.value - a.value; });
+
+        tip.innerHTML = "";
+        var head = el("div", "tip-row");
+        head.appendChild(el("span", "tip-k", new Date(b.at).toLocaleString()));
+        tip.appendChild(head);
+        var total = el("div", "tip-row");
+        total.appendChild(el("span", "tip-k", "合计"));
+        total.appendChild(el("span", "tip-v", key === "requests" ? (b.requests + " 次") : fmtTok(b.totalTokens)));
+        tip.appendChild(total);
+        rows.forEach(function (r) {
+          var line = el("div", "tip-row");
+          var k = el("span", "tip-k");
+          var swatch = el("i", "tip-sw");
+          swatch.style.background = "var(--s" + r.slot + ")";
+          k.appendChild(swatch);
+          k.appendChild(el("span", null, r.label));
+          line.appendChild(k);
+          line.appendChild(el("span", "tip-v", key === "requests" ? (r.value + " 次") : fmtTok(r.value)));
+          tip.appendChild(line);
+        });
+        tip.style.display = "block";
+        var left = ev.clientX - box.left + 14;
+        if (left + tip.offsetWidth > box.width) left = box.width - tip.offsetWidth - 4;
+        tip.style.left = Math.max(0, left) + "px";
+        tip.style.top = Math.max(0, ev.clientY - box.top - 12) + "px";
+      });
+      rect.addEventListener("mouseleave", function () { tip.style.display = "none"; });
     });
   }
 
@@ -3478,6 +3697,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     // Re-render from the cached timeline: switching the metric is a redraw, not
     // a new upstream read.
     if (timelineCache) renderChartInto($("chartWrap"), $("chartHint"), timelineCache, this.value);
+    else loadTimeline();
+  };
+  $("modelChartMetric").onchange = function () {
+    if (timelineCache) renderModelChart(timelineCache);
     else loadTimeline();
   };
   $("freeQuotaReload").onclick = function () { loadFreeQuota(); toast("已刷新免费额度"); };
