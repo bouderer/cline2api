@@ -27,6 +27,15 @@ export interface AppConfig {
    */
   readonly rateLimitGlobalPerMinute: number;
   readonly rateLimitKeyPerMinute: number;
+  /**
+   * Free-tier ceiling per account per model, in tokens per day.
+   *
+   * Upstream does not document this and exposes no endpoint for it; the value
+   * observed in practice sits between 15M and 20M tokens. It is only used to
+   * draw the fullness bar in the console, so being approximate is fine — the
+   * authoritative signal is still an actual `Daily free limit` failure.
+   */
+  readonly freeLimitTokensPerModel: number;
   /** Upstream Cline API origin, e.g. https://api.cline.bot */
   readonly clineApiBaseUrl: string;
   /** WorkOS API origin, e.g. https://api.workos.com */
@@ -98,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     adminToken: readString(env, "ADMIN_TOKEN") ?? null,
     rateLimitGlobalPerMinute: readInt(env, "RATE_LIMIT_GLOBAL_PER_MINUTE", 400),
     rateLimitKeyPerMinute: readInt(env, "RATE_LIMIT_KEY_PER_MINUTE", 200),
+    freeLimitTokensPerModel: readInt(env, "FREE_LIMIT_TOKENS_PER_MODEL", 15_000_000),
     clineApiBaseUrl: stripTrailingSlash(
       readString(env, "CLINE_API_BASE_URL") ?? "https://api.cline.bot",
     ),

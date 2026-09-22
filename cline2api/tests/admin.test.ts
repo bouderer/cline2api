@@ -728,3 +728,58 @@ test("a free-limit error becomes an exhausted signal, a provider 429 does not", 
     assert.equal(listed.accounts[0]?.signal, null);
   });
 });
+
+/* ---------------- timeline + free-quota fullness ---------------- */
+
+test("the timeline buckets the cached records and reports its coverage", async () => {
+  await withGateway(30, async ({ app, upstream }) => {
+    // The mock records every usage one second apart at "now", which lands in
+    // the newest bucket of any window.
+    await app.request("/admin/api/credits?page=1&pageSize=5&hours=6", { headers: adminHeaders });
+    upstream.requests.length = 0;
+
+    const body = (await (
+      await app.request("/admin/api/usage/timeline?hours=6", { headers: adminHeaders })
+    ).json()) as {
+      buckets: Array<{ requests: number; totalTokens: number; cacheHitRate: number }>;
+      covered: number;
+      total: number;
+      window: { windowMs: number };
+    };
+
+    assert.equal(body.total, 30);
+    assert.ok(body.covered >= 5, `expected the 5 rows just read, got ${body.covered}`);
+    assert.equal(body.window.windowMs, 6 * 60 * 60 * 1000);
+    // Six hours is bucketed at a readable resolution, not one point per second.
+    assert.ok(body.buckets.length >= 6 && body.buckets.length <= 64, `got ${body.buckets.length} buckets`);
+    // Every record lands in exactly one bucket, so the sums must survive.
+    const totalTokens = body.buckets.reduce((s, b) => s + b.totalTokens, 0);
+    assert.equal(totalTokens, body.covered * 9);
+    const requests = body.buckets.reduce((s, b) => s + b.requests, 0);
+    assert.equal(requests, body.covered);
+    // Zero-traffic buckets are kept so the axis stays linear in time.
+    assert.ok(body.buckets.some((b) => b.requests === 0), "expected idle buckets to be present");
+    // Pure cache rollup: no new upstream calls just to draw the chart.
+    assert.equal(upstream.requests.length, 0);
+  });
+});
+
+test("free quota reports each account's per-model fill against the ceiling", async () => {
+  await withGateway(3, async ({ app }) => {
+    await app.request("/admin/api/credits?page=1&pageSize=3&hours=6", { headers: adminHeaders });
+    const body = (await (
+      await app.request("/admin/api/free-quota", { headers: adminHeaders })
+    ).json()) as {
+      accounts: Array<{ id: string; models: Array<{ id: string; totalTokens: number }> }>;
+      freeLimitPerModel: number;
+    };
+    assert.equal(body.freeLimitPerModel, 15_000_000);
+    assert.equal(body.accounts.length, 3);
+    // The row carries the per-model split so the client can draw the meter
+    // without a second request.
+    const first = body.accounts.find((a) => a.models.length > 0);
+    assert.ok(first, "expected at least one account with model data");
+    assert.equal(first.models[0]?.id, "cline-free/Deepseek-v4.1-Flash");
+    assert.equal(first.models[0]?.totalTokens, 9);
+  });
+});

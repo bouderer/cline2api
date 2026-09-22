@@ -157,6 +157,13 @@ export interface AccountCredits {
   window: UsageTotals;
   /** The same window split by model, biggest by tokens first. */
   models: ModelUsage[];
+  /**
+   * The window's raw records, newest first.
+   *
+   * Kept on the result so a caller can bucket them by time (the timeline) or
+   * re-aggregate a different way without paying for a second upstream read.
+   */
+  records: readonly UsageRecord[];
   /** Window bounds, epoch millis, echoed so the UI can label the column. */
   since: number;
   until: number;
@@ -461,6 +468,73 @@ export function sumUsageByModel(records: readonly UsageRecord[]): ModelUsage[] {
   return rows;
 }
 
+/** One time bucket in a usage timeline. */
+export interface UsageBucket {
+  /** Bucket start, epoch millis. */
+  at: number;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  costUnits: number;
+  costUsd: number;
+  /** Tokens that hit the prompt cache, as a fraction of prompt tokens (0-1). */
+  cacheHitRate: number;
+}
+
+/**
+ * Bucket a window's records into a timeline.
+ *
+ * The bucket size is chosen from the window so the series lands in a readable
+ * range rather than 1440 points: too many buckets and every point is noise,
+ * too few and the shape disappears. Empty buckets are emitted as zeros so the
+ * x-axis stays linear in time — a gap-free series would draw a straight line
+ * across an hour of no traffic and read as sustained usage.
+ */
+export function bucketUsage(records: readonly UsageRecord[], window: ResolvedWindow): UsageBucket[] {
+  const span = Math.max(1, window.until - window.since);
+  const target = 48;
+  const rough = span / target;
+  // Snap to a human-sized step so bucket boundaries land on round times.
+  const STEPS = [
+    60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000,
+    60 * 60_000, 3 * 60 * 60_000, 6 * 60 * 60_000, 12 * 60 * 60_000,
+    24 * 60 * 60_000, 7 * 24 * 60 * 60_000,
+  ];
+  const step = STEPS.find((s) => s >= rough) ?? STEPS[STEPS.length - 1]!;
+  const start = Math.floor(window.since / step) * step;
+  const count = Math.max(1, Math.ceil((window.until - start) / step));
+
+  const buckets: UsageBucket[] = Array.from({ length: count }, (_, i) => ({
+    at: start + i * step,
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    costUnits: 0,
+    costUsd: 0,
+    cacheHitRate: 0,
+  }));
+
+  for (const record of records) {
+    const index = Math.min(count - 1, Math.max(0, Math.floor((record.at - start) / step)));
+    const bucket = buckets[index]!;
+    bucket.requests += 1;
+    bucket.promptTokens += record.promptTokens;
+    bucket.completionTokens += record.completionTokens;
+    bucket.cachedTokens += record.cachedTokens;
+    bucket.totalTokens += record.totalTokens;
+    bucket.costUnits += record.costMicroUsd;
+  }
+  for (const bucket of buckets) {
+    bucket.costUsd = bucket.costUnits / COST_UNITS_PER_USD;
+    bucket.cacheHitRate = bucket.promptTokens > 0 ? bucket.cachedTokens / bucket.promptTokens : 0;
+  }
+  return buckets;
+}
+
 /** The window an admin read covers, resolved from request options. */
 export interface UsageWindowRequest {
   /** Window length in millis. Clamped to [1 minute, MAX_WINDOW_MS]. */
@@ -524,6 +598,7 @@ export async function fetchAccountCredits(
       balanceCredits: null,
       window: emptyTotals(),
       models: [],
+      records: [],
       since: window.since,
       until: window.until,
       windowMs: window.windowMs,
@@ -554,6 +629,7 @@ export async function fetchAccountCredits(
       balanceMicroUsd === null ? null : balanceMicroUsd / MICRO_USD_PER_CREDIT,
     window: sumUsage(usages),
     models: sumUsageByModel(usages),
+    records: usages,
     since: window.since,
     until: window.until,
     windowMs: window.windowMs,

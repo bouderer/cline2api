@@ -85,7 +85,7 @@ test("every element id the admin script reaches for exists in the markup", () =>
     ...[...script.matchAll(/\$\("([\w-]+)"\)/g)].map((m) => m[1]),
     ...[...script.matchAll(/getElementById\("([\w-]+)"\)/g)].map((m) => m[1]),
     // ids the script builds by concatenation, e.g. "view-" + name
-    ...["overview", "models", "play", "accounts", "logs"].map((v) => `view-${v}`),
+    ...["overview", "models", "play", "accounts", "quota", "proxies", "keys", "logs"].map((v) => `view-${v}`),
   ]);
   // Created at runtime by the script itself when the token is missing.
   referenced.delete("tokenPrompt");
@@ -97,7 +97,7 @@ test("every element id the admin script reaches for exists in the markup", () =>
 test("boot calls are all defined and routed through the view switcher", () => {
   // The boot sequence runs at the end of the IIFE; anything it touches must
   // exist, and every hash route must map to a real section.
-  for (const view of ["overview", "models", "play", "accounts", "logs"]) {
+  for (const view of ["overview", "models", "play", "accounts", "quota", "logs"]) {
     assert.ok(markup.includes(`id="view-${view}"`), `missing section for hash route #${view}`);
     assert.ok(markup.includes(`data-view="${view}"`), `missing nav button for #${view}`);
   }

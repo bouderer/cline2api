@@ -15,7 +15,7 @@ import type { RateLimiter } from "../services/rateLimit.js";
 import type { SweepRunner } from "../services/sweep.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
-import { fetchAccountCredits, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageWindowRequest } from "../cline/credits.js";
+import { fetchAccountCredits, bucketUsage, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageRecord, type UsageWindowRequest } from "../cline/credits.js";
 import { ProxyStore, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
 import type { ProxyResolver } from "../cline/proxy.js";
 
@@ -191,7 +191,18 @@ interface AccountCreditsRow extends AccountCredits {
 
 const CREDITS_CACHE_TTL_MS = 5 * 60_000;
 const CREDITS_CONCURRENCY = 6;
-const creditsCache = new Map<string, { at: number; row: AccountCreditsRow }>();
+/**
+ * Cached per-account credits rows.
+ *
+ * The raw usage records are kept alongside the summed row: the timeline needs
+ * them to bucket by time, and re-fetching every account's ledger just to draw a
+ * chart would multiply the upstream cost of opening the overview. They are
+ * dropped for rows whose token could not be resolved, where there are none.
+ */
+const creditsCache = new Map<
+  string,
+  { at: number; row: AccountCreditsRow; records: readonly UsageRecord[] }
+>();
 
 /**
  * One background sweep of the whole pool per window, so the overview's
@@ -248,6 +259,7 @@ function emptyCreditsRow(
       creditsMicroUsd: 0,
     },
     models: [],
+    records: [],
     since: window.since,
     until: window.until,
     windowMs: window.windowMs,
@@ -313,7 +325,7 @@ async function creditRows(
       dispatcher: deps.resolver.forAccount(account.id),
     });
     const row: AccountCreditsRow = { ...base, ...credits };
-    creditsCache.set(account.id, { at: Date.now(), row });
+    creditsCache.set(account.id, { at: Date.now(), row, records: credits.records });
     return row;
   });
 }
@@ -496,11 +508,19 @@ function validateImportAccount(
     },
   };
 }
-export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {  app.get("/", (c) => {
+export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {
+  app.get("/", (c) => {
     if (!isAdminAuthorized(c, deps)) {
       return c.text("Admin UI is not exposed here. Set ADMIN_TOKEN or use localhost.", 403);
     }
-    return c.html(ADMIN_PAGE);
+    // The whole UI is one inlined HTML document with no asset URL to version,
+    // so without this the browser applies heuristic caching and keeps serving
+    // the previous build's markup and script after a redeploy — which reads as
+    // "the new panel is missing" even though the server is serving it.
+    return c.html(ADMIN_PAGE, 200, {
+      "cache-control": "no-store, must-revalidate",
+      pragma: "no-cache",
+    });
   });
 
   const guard = (c: Context): Response | null =>
@@ -894,6 +914,44 @@ app.get("/admin/api/accounts", (c) => {
   });
 
   /**
+   * Usage over time, for the overview charts.
+   *
+   * Bucketed from the same per-account records the credits rows are built from,
+   * so the chart and the table can never disagree. Empty buckets are kept as
+   * zeros: a gap-free series would draw a straight line across an idle hour and
+   * read as steady traffic.
+   */
+  app.get("/admin/api/usage/timeline", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const resolved = resolveWindow(windowQuery(c));
+    const now = Date.now();
+    const ids = new Set(deps.store.list().map((account) => account.id));
+    const records: UsageRecord[] = [];
+    let covered = 0;
+    for (const entry of creditsCache.values()) {
+      if (now - entry.at >= CREDITS_CACHE_TTL_MS) continue;
+      if (!ids.has(entry.row.id)) continue;
+      if (entry.row.windowMs !== resolved.windowMs) continue;
+      if (entry.row.snappedToDay !== resolved.snappedToDay) continue;
+      covered += 1;
+      records.push(...entry.records);
+    }
+    const buckets = bucketUsage(records, resolved);
+    return c.json({
+      buckets,
+      covered,
+      total: ids.size,
+      window: {
+        windowMs: resolved.windowMs,
+        snappedToDay: resolved.snappedToDay,
+        since: resolved.since,
+        until: resolved.until,
+      },
+    });
+  });
+
+  /**
    * Per-account credit balance plus the window's token totals.
    *
    * Separate from /admin/api/usage because the two answer different questions
@@ -976,8 +1034,15 @@ app.get("/admin/api/accounts", (c) => {
         email: account.email,
         disabled: account.disabled,
         signal: signals[account.id] ?? null,
+        // Per-model consumption for this account, from the same cache the
+        // usage table reads. The account row uses it to show how full each
+        // free bucket is against the per-model daily ceiling.
+        models: creditsCache.get(account.id)?.row.models ?? [],
+        windowMs: creditsCache.get(account.id)?.row.windowMs ?? null,
       })),
       probeModel: DEFAULT_FREE_PROBE_MODEL,
+      /** Free-tier ceiling per account per model, for the fullness bars. */
+      freeLimitPerModel: deps.config.freeLimitTokensPerModel,
       checkedAt: Date.now(),
     });
   });

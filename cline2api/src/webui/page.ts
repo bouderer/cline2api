@@ -27,6 +27,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 24px -16px rgba(16,24,40,.18);
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    /* Chart series slots. Validated as a set against this surface: adjacent
+       CVD ΔE 24.7, normal-vision ΔE 33.6, all ≥3:1 contrast (see dataviz). */
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a;
+    --grid:#e5e7eb; --axis:#c3c2b7;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -38,6 +42,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       --err:#f87171; --err-soft:#2c1516;
       --sky:#7dd3fc; --sky-soft:#0f2430;
       --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -20px rgba(0,0,0,.8);
+      /* The same three hues re-stepped for the dark surface, not an auto-flip. */
+      --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+      --grid:#252a33; --axis:#383835;
     }
   }
   * { box-sizing:border-box; }
@@ -177,6 +184,31 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   .acct { display:flex; flex-direction:column; gap:2px; }
   .acct .mail { overflow-wrap:anywhere; }
 
+  /* ---------- charts ---------- */
+  .chart-host { position:relative; width:100%; }
+  .chart { display:block; width:100%; height:220px; overflow:visible; }
+  /* Band edges separated by a 2px surface gap rather than a stroke: the gap is
+     what makes touching marks read apart, and a stroke would add ink that is
+     not data. */
+  .c-area { stroke:var(--surface); stroke-width:2; }
+  .c-line { fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+  .c-dot { stroke:var(--surface); stroke-width:2; }
+  .c-grid { stroke:var(--grid); stroke-width:1; }
+  .c-tick { fill:var(--muted); font-size:11px; font-family:var(--sans); }
+  .c-hit { fill:transparent; }
+  .c-hit:hover { fill:var(--text); opacity:.04; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; margin-top:10px; font-size:12px; color:var(--muted); }
+  .legend .lg { display:inline-flex; align-items:center; gap:6px; }
+  .legend .lg i { width:10px; height:10px; border-radius:3px; display:inline-block; }
+  .chart-tip {
+    position:absolute; pointer-events:none; z-index:5;
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:9px;
+    box-shadow:var(--shadow); padding:8px 10px; font-size:12px; min-width:150px;
+  }
+  .chart-tip .tip-row { display:flex; justify-content:space-between; gap:14px; }
+  .chart-tip .tip-k { color:var(--muted); }
+  .chart-tip .tip-v { font-variant-numeric:tabular-nums; }
+
   /* Pager under a paginated table, and under the overview's usage card. */
   .card-foot {
     padding:11px 18px; border-top:1px solid var(--border);
@@ -292,6 +324,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 20v-1.5a4 4 0 00-4-4H7a4 4 0 00-4 4V20M9.5 10.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM21 20v-1.5a4 4 0 00-3-3.87M16.5 3.6a4 4 0 010 7.75"/></svg>
         账号
       </button>
+      <button data-view="quota">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21a9 9 0 100-18 9 9 0 000 18zM12 12l4.5-4.5M12 3v2M21 12h-2M12 21v-2M3 12h2"/></svg>
+        配额
+      </button>
       <button data-view="proxies">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 100 18 9 9 0 000-18zM3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/></svg>
         代理
@@ -363,6 +399,21 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
       <div class="card" style="margin-top:14px">
         <div class="card-head">
+          <div>
+            <h2>用量走势</h2>
+            <div class="hint" id="ovChartHint">—</div>
+          </div>
+          <div class="actions">
+            <button class="btn small" data-goto="quota">配额详情</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div id="ovChartWrap"><div class="muted sm">读取中…</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
           <h2>账号用量</h2>
           <div class="row">
             <label class="field" style="margin:0">
@@ -388,46 +439,6 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
           <div class="muted sm">读取中…</div>
         </div>
         <div class="card-foot" id="usagePager"></div>
-      </div>
-
-      <div class="card" style="margin-top:14px">
-        <div class="card-head">
-          <div>
-            <h2>按模型用量</h2>
-            <div class="hint" id="modelUsageHint">—</div>
-          </div>
-          <button class="btn small" id="modelUsageReload">重新读取</button>
-        </div>
-        <div class="card-body tight" id="modelUsageBody">
-          <div class="muted sm">读取中…</div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:14px">
-        <div class="card-head">
-          <div>
-            <h2>免费额度</h2>
-            <div class="hint">上游没有查剩余额度的接口，这里只记录两种可观测信号：真实请求撞到 <span class="mono">Daily free limit</span> 的时刻，以及手动探测的结果。均为本地自然日。</div>
-          </div>
-          <div class="row" style="gap:8px">
-            <button class="btn small" id="freeQuotaReload">刷新</button>
-          </div>
-        </div>
-        <div class="card-body tight">
-          <div class="row" style="gap:8px; margin-bottom:10px; flex-wrap:wrap">
-            <input type="text" id="freeProbeModel" class="mono" style="min-width:260px"
-              title="探测用的免费模型，必须是免费桶里的模型，否则探测不到免费额度" />
-            <button class="btn small primary" id="freeProbeSelected">探测选中账号</button>
-            <button class="btn small" id="freeProbeExhausted">只探「已耗尽」</button>
-            <span class="xs muted" id="freeProbeStatus">—</span>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>账号</th><th class="nowrap">免费额度</th><th class="nowrap">依据</th><th>说明</th></tr></thead>
-              <tbody id="freeQuotaBody"><tr><td colspan="4" class="empty sm">加载中…</td></tr></tbody>
-            </table>
-          </div>
-        </div>
       </div>
 
       <div class="grid two" style="margin-top:14px">
@@ -492,6 +503,80 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         </div>
       </div>
       <p class="muted sm" id="modelsNote" style="margin:12px 0 0"></p>
+    </section>
+
+    <!-- ============ 配额 ============ -->
+    <section class="view" id="view-quota">
+      <div class="page-head">
+        <div>
+          <h1>配额</h1>
+          <p>用量随时间的走势、按模型拆分，以及每个账号的免费额度状态。免费额度按「账号 × 模型」每天重置。</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>用量走势</h2>
+            <div class="hint" id="chartHint">—</div>
+          </div>
+          <div class="row" style="gap:8px">
+            <select id="chartMetric" style="width:auto; min-width:130px">
+              <option value="totalTokens">Token</option>
+              <option value="requests">请求数</option>
+              <option value="costUsd">费用</option>
+              <option value="cacheHitRate">缓存命中率</option>
+            </select>
+            <button class="btn small" id="chartReload">重新读取</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div id="chartWrap"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>按模型用量</h2>
+            <div class="hint" id="modelUsageHint">—</div>
+          </div>
+          <button class="btn small" id="modelUsageReload">重新读取</button>
+        </div>
+        <div class="card-body tight" id="modelUsageBody">
+          <div class="muted sm">读取中…</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>免费额度</h2>
+            <div class="hint">上游没有查剩余额度的接口，所以这里给出的是可观测信号（真实请求撞到 <span class="mono">Daily free limit</span> 的时刻，或手动探测结果）加上按已用 token 推算的占用度。均为本地自然日。</div>
+          </div>
+          <div class="row" style="gap:8px">
+            <button class="btn small" id="freeQuotaReload">刷新</button>
+          </div>
+        </div>
+        <div class="card-body tight">
+          <div class="row" style="gap:8px; margin-bottom:10px; flex-wrap:wrap">
+            <input type="text" id="freeProbeModel" class="mono" style="min-width:260px"
+              title="探测用的免费模型，必须是免费桶里的模型，否则探测不到免费额度" />
+            <button class="btn small primary" id="freeProbeSelected">探测选中账号</button>
+            <button class="btn small" id="freeProbeExhausted">只探「已耗尽」</button>
+            <span class="xs muted" id="freeProbeStatus">—</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th class="nowrap" style="width:34px"><input type="checkbox" id="freeProbeAll" title="全选 / 全不选" style="width:auto; margin:0" /></th>
+                <th>账号</th><th class="nowrap">状态</th><th style="min-width:240px">免费额度占用</th><th class="nowrap">依据</th><th>说明</th>
+              </tr></thead>
+              <tbody id="freeQuotaBody"><tr><td colspan="6" class="empty sm">加载中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ============ 试聊 ============ -->
@@ -1049,7 +1134,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   }
 
   /* ---------- routing ---------- */
-  var views = ["overview", "models", "play", "accounts", "proxies", "keys", "logs"];
+  var views = ["overview", "models", "play", "accounts", "quota", "proxies", "keys", "logs"];
   function show(name) {
     if (views.indexOf(name) < 0) name = "overview";
     views.forEach(function (v) {
@@ -1065,7 +1150,8 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (name === "accounts") { loadAccounts(); loadModels(); pollSweep(); }
     if (name === "proxies") loadProxyView();
     if (name === "keys") { loadKeys(); loadRateLimit(); }
-    if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); loadModelUsage(); loadFreeQuota(); }
+    if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); loadTimeline(); }
+    if (name === "quota") { loadTimeline(); loadModelUsage(); loadFreeQuota(); loadModels(); }
   }
   var navButtons = document.querySelectorAll("#nav button");
   for (var i = 0; i < navButtons.length; i++) {
@@ -1350,6 +1436,244 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     });
   }
 
+  /* ---------- charts ---------- */
+  /**
+   * Inline-SVG usage charts.
+   *
+   * Hand-rolled rather than pulled from a library: the page is a single file
+   * with no external assets, and the forms needed here (a stacked area for
+   * token composition, a line for a rate) are a few dozen lines of path
+   * arithmetic.
+   *
+   * Design rules the drawing follows, so the charts stay honest:
+   *   - one y-axis, never two; a second measure gets its own chart;
+   *   - thin marks (2px lines), a 2px surface gap between stacked bands, and a
+   *     surface ring on markers, so touching marks read apart without borders;
+   *   - a legend whenever there are two or more series, and identity never
+   *     rides on color alone;
+   *   - recessive hairline gridlines, and text in ink tokens, never series color.
+   * Colors are the validated categorical slots declared as CSS variables at the
+   * top of this file, so light and dark are two selected sets, not a flip.
+   */
+  var CHART = { w: 900, h: 220, padL: 56, padR: 16, padT: 14, padB: 26 };
+
+  /** Short human label for a bucket's start time. */
+  function bucketLabel(at, stepMs) {
+    var d = new Date(at);
+    var hh = String(d.getHours()).padStart(2, "0");
+    var mm = String(d.getMinutes()).padStart(2, "0");
+    if (stepMs >= 24 * 3600 * 1000) return (d.getMonth() + 1) + "/" + d.getDate();
+    if (stepMs >= 3600 * 1000) return hh + ":00";
+    return hh + ":" + mm;
+  }
+
+  function bucketStepMs(buckets) {
+    if (buckets.length < 2) return 3600 * 1000;
+    return buckets[1].at - buckets[0].at;
+  }
+
+  /** Compact axis numbers: 1.2K / 3.4M, and dollars for cost. */
+  function axisNum(v, kind) {
+    if (kind === "costUsd") return fmtCost(v);
+    if (kind === "cacheHitRate") return Math.round(v * 100) + "%";
+    return fmtTok(v);
+  }
+
+  /**
+   * Build the SVG for a timeline.
+   *
+   * The metric picks the form: the token view stacks prompt/completion/cache
+   * (the composition is the story), the rate view draws a single line.
+   */
+  function chartSvg(data, metric) {
+    var buckets = data.buckets || [];
+    if (!buckets.length) return null;
+    var step = bucketStepMs(buckets);
+    var W = CHART.w, H = CHART.h;
+    var plotW = W - CHART.padL - CHART.padR;
+    var plotH = H - CHART.padT - CHART.padB;
+
+    // Series definition per metric. Stacked when the parts sum to the whole.
+    var series, stacked = false, kind = metric;
+    if (metric === "totalTokens") {
+      // Cache is a subset of prompt, so it is drawn as its own band rather than
+      // a fourth stack layer; completion sits on top of the rest.
+      series = [
+        { key: "cachedTokens", label: "缓存命中", varName: "--s1" },
+        { key: "promptTokens", label: "输入（未命中）", varName: "--s2" },
+        { key: "completionTokens", label: "输出", varName: "--s3" },
+      ];
+      stacked = true;
+    } else if (metric === "costUsd") {
+      series = [{ key: "costUsd", label: "费用", varName: "--s1" }];
+    } else if (metric === "cacheHitRate") {
+      series = [{ key: "cacheHitRate", label: "缓存命中率", varName: "--s3" }];
+      kind = "cacheHitRate";
+    } else {
+      series = [{ key: "requests", label: "请求数", varName: "--s1" }];
+    }
+
+    // Stacked totals per bucket, with the cache band carved out of prompt so the
+    // three bands sum to total tokens rather than double-counting the cache.
+    var totals = buckets.map(function (b) {
+      if (!stacked) return Number(b[series[0].key]) || 0;
+      return (Number(b.promptTokens) || 0) + (Number(b.completionTokens) || 0);
+    });
+    var maxV = Math.max.apply(null, totals);
+    if (!(maxV > 0)) maxV = 1;
+    // Round the axis top to a clean step so the ticks read as round numbers.
+    var mag = Math.pow(10, Math.floor(Math.log10(maxV)));
+    maxV = Math.ceil(maxV / (mag / 2)) * (mag / 2);
+
+    function x(i) { return CHART.padL + (buckets.length === 1 ? plotW / 2 : (plotW * i) / (buckets.length - 1)); }
+    function y(v) { return CHART.padT + plotH - (plotH * v) / maxV; }
+
+    var parts = [];
+    var defs = [];
+
+    if (stacked) {
+      // y0 tracks the running baseline so each band sits on the previous one.
+      var lower = buckets.map(function () { return 0; });
+      series.forEach(function (s, si) {
+        var upper = buckets.map(function (b, i) {
+          var v = Number(b[s.key]) || 0;
+          // The cache band is part of prompt: subtract it from the input band
+          // so the stack sums to the real total instead of double-counting.
+          if (s.key === "promptTokens") v -= Number(b.cachedTokens) || 0;
+          if (v < 0) v = 0;
+          return (lower[i] || 0) + v;
+        });
+        var top = upper.map(function (v, i) { return x(i) + "," + y(v); });
+        var bottom = lower.map(function (v, i) { return x(i) + "," + y(v); }).reverse();
+        parts.push('<polygon class="c-area" points="' + top.concat(bottom).join(" ") +
+          '" fill="var(' + s.varName + ')" />');
+        lower = upper;
+      });
+    } else {
+      var pts = buckets.map(function (b, i) { return x(i) + "," + y(Number(b[series[0].key]) || 0); });
+      parts.push('<polyline class="c-line" points="' + pts.join(" ") + '" stroke="var(' + series[0].varName + ')" />');
+      // End marker, ringed in the surface color so it stays legible over the line.
+      var lastX = x(buckets.length - 1);
+      var lastY = y(Number(buckets[buckets.length - 1][series[0].key]) || 0);
+      parts.push('<circle class="c-dot" cx="' + lastX + '" cy="' + lastY + '" r="4" fill="var(' + series[0].varName + ')" />');
+    }
+
+    // Gridlines + y ticks: hairline, solid, recessive.
+    var ticks = 4;
+    var grid = [];
+    for (var t = 0; t <= ticks; t++) {
+      var gv = (maxV * t) / ticks;
+      var gy = y(gv);
+      grid.push('<line class="c-grid" x1="' + CHART.padL + '" y1="' + gy + '" x2="' + (W - CHART.padR) + '" y2="' + gy + '" />');
+      grid.push('<text class="c-tick" x="' + (CHART.padL - 8) + '" y="' + (gy + 3.5) + '" text-anchor="end">' +
+        axisNum(gv, kind) + "</text>");
+    }
+
+    // X labels: first, middle, last only — a label per bucket is chaos.
+    var xLabels = [];
+    [0, Math.floor((buckets.length - 1) / 2), buckets.length - 1].forEach(function (i, k) {
+      if (i < 0 || i >= buckets.length) return;
+      if (k === 1 && buckets.length < 5) return;
+      var anchor = k === 0 ? "start" : (k === 2 ? "end" : "middle");
+      xLabels.push('<text class="c-tick" x="' + x(i) + '" y="' + (H - 8) + '" text-anchor="' + anchor + '">' +
+        bucketLabel(buckets[i].at, step) + "</text>");
+    });
+
+    // Hover hit layer: one invisible band per bucket, wider than the mark.
+    var hits = buckets.map(function (b, i) {
+      var bw = plotW / Math.max(1, buckets.length - 1);
+      return '<rect class="c-hit" x="' + (x(i) - bw / 2) + '" y="' + CHART.padT + '" width="' + bw +
+        '" height="' + plotH + '" data-i="' + i + '" />';
+    });
+
+    var svg = '<svg class="chart" viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img">' +
+      defs.join("") + grid.join("") + parts.join("") + hits.join("") + xLabels.join("") + "</svg>";
+
+    // The legend doubles as the identity channel: a colored key plus the label,
+    // never a colored label.
+    var legend = '<div class="legend">' + series.map(function (s) {
+      return '<span class="lg"><i style="background:var(' + s.varName + ')"></i>' + s.label + "</span>";
+    }).join("") + "</div>";
+
+    return { svg: svg, legend: legend, step: step };
+  }
+
+  /** Render the chart plus its hover tooltip layer into the given wrap. */
+  function renderChartInto(wrap, hintEl, data, metric) {
+    clear(wrap);
+    var built = chartSvg(data, metric);
+    if (!built) {
+      wrap.appendChild(el("div", "muted sm", "窗口内没有用量记录。"));
+      if (hintEl) hintEl.textContent = windowLabel() + " · 暂无数据";
+      return;
+    }
+    if (hintEl) {
+      hintEl.textContent = windowLabel() + " · 已统计 " + data.covered + "/" + data.total +
+        " 个账号 · " + (data.buckets || []).length + " 个时间点";
+    }
+
+    var host = el("div", "chart-host");
+    host.innerHTML = built.svg; // built above from numbers only; no user text
+    var legendRow = el("div");
+    legendRow.innerHTML = built.legend;
+    wrap.appendChild(host);
+    wrap.appendChild(legendRow);
+
+    var tip = el("div", "chart-tip");
+    tip.style.display = "none";
+    host.appendChild(tip);
+
+    var buckets = data.buckets;
+    host.querySelectorAll(".c-hit").forEach(function (rect) {
+      rect.addEventListener("mousemove", function (ev) {
+        var b = buckets[Number(this.getAttribute("data-i"))];
+        if (!b) return;
+        var box = host.getBoundingClientRect();
+        var rows = [
+          ["时间", new Date(b.at).toLocaleString()],
+          ["请求", String(b.requests)],
+          ["总 Token", fmtTok(b.totalTokens)],
+          ["输入", fmtTok(b.promptTokens)],
+          ["输出", fmtTok(b.completionTokens)],
+          ["缓存命中", fmtTok(b.cachedTokens) + (b.promptTokens ? "（" + Math.round(100 * b.cachedTokens / b.promptTokens) + "%）" : "")],
+          ["费用", b.costUsd ? fmtCost(b.costUsd) : "免费/订阅"],
+        ];
+        tip.innerHTML = "";
+        rows.forEach(function (r) {
+          var line = el("div", "tip-row");
+          line.appendChild(el("span", "tip-k", r[0]));
+          line.appendChild(el("span", "tip-v", r[1]));
+          tip.appendChild(line);
+        });
+        tip.style.display = "block";
+        // Keep the tooltip inside the host: clamp rather than let it overflow.
+        var left = ev.clientX - box.left + 14;
+        if (left + tip.offsetWidth > box.width) left = box.width - tip.offsetWidth - 4;
+        tip.style.left = Math.max(0, left) + "px";
+        tip.style.top = Math.max(0, ev.clientY - box.top - 12) + "px";
+      });
+      rect.addEventListener("mouseleave", function () { tip.style.display = "none"; });
+    });
+  }
+
+  var timelineCache = null;
+  function loadTimeline() {
+    var q = windowQuery("");
+    return api("/admin/api/usage/timeline" + (q ? "?" + q : "")).then(function (data) {
+      timelineCache = data;
+      renderChartInto($("chartWrap"), $("chartHint"), data, $("chartMetric").value);
+      if ($("ovChartWrap")) renderChartInto($("ovChartWrap"), $("ovChartHint"), data, "totalTokens");
+      return data;
+    }).catch(function (e) {
+      [$("chartWrap"), $("ovChartWrap")].forEach(function (wrap) {
+        if (!wrap) return;
+        clear(wrap);
+        wrap.appendChild(el("div", "err sm", "走势读取失败：" + e.message));
+      });
+      if ($("chartHint")) $("chartHint").textContent = "读取失败";
+    });
+  }
+
   /* ---------- pool-wide liveness sweep ---------- */
   /**
    * Drive the server-side sweep.
@@ -1579,9 +1903,14 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
    * has asked upstream about this account yet.
    */
   var freeQuotaRows = [];
+  /** accountId -> true, for the free-quota table's own selection. */
+  var freeProbeSelected = {};
+  /** Per-account, per-model daily ceiling, from the server. */
+  var freeLimitPerModel = 15000000;
   function loadFreeQuota() {
     api("/admin/api/free-quota").then(function (data) {
       freeQuotaRows = data.accounts || [];
+      if (data.freeLimitPerModel) freeLimitPerModel = data.freeLimitPerModel;
       if (!$("freeProbeModel").value) $("freeProbeModel").value = data.probeModel || "";
       renderFreeQuota();
     }).catch(function (e) {
@@ -1589,10 +1918,62 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       clear(body);
       var tr = el("tr");
       var td = el("td", "empty err sm", "免费额度读取失败：" + e.message);
-      td.colSpan = 4;
+      td.colSpan = 6;
       tr.appendChild(td);
       body.appendChild(tr);
     });
+  }
+
+  /**
+   * Fullness of one model's free bucket on one account.
+   *
+   * The ceiling is an observed value, not a documented one, so the meter is
+   * explicitly an estimate: it says "how much of the assumed daily allowance
+   * this account has used on this model", and the authoritative signal stays
+   * the real "Daily free limit" failure recorded separately.
+   */
+  function freeBucketMeter(model) {
+    var pct = Math.max(0, Math.min(100, Math.round(100 * model.totalTokens / freeLimitPerModel)));
+    var cls = pct >= 90 ? "err" : (pct >= 60 ? "warn" : "");
+    var wrap = el("div", "quota");
+    var q = el("div", "q");
+    q.style.gridTemplateColumns = "1fr 44px";
+    var bar = el("div", "bar " + cls);
+    var fill = el("i");
+    fill.style.width = pct + "%";
+    bar.appendChild(fill);
+    q.appendChild(bar);
+    q.appendChild(el("div", "pct", pct + "%"));
+    wrap.appendChild(q);
+    var line = el("div", "xs faint mono");
+    line.textContent = model.id.split("/").pop() + " · " + fmtTok(model.totalTokens);
+    wrap.appendChild(line);
+    return wrap;
+  }
+
+  /**
+   * The account's fullest free bucket, plus a rolled-up view of the rest.
+   *
+   * Sorted by fullness so the account closest to its ceiling is the one the
+   * meter describes; the remaining models are summarized rather than drawn,
+   * because a row per model would make this table unusable at 800 accounts.
+   */
+  function freeBucketCell(row) {
+    var models = (row.models || []).filter(function (m) { return m.totalTokens > 0; });
+    if (!models.length) {
+      return el("span", "xs faint", row.windowMs ? "窗口内无用量" : "尚无用量数据");
+    }
+    models.sort(function (a, b) { return b.totalTokens - a.totalTokens; });
+    var cell = el("div");
+    cell.appendChild(freeBucketMeter(models[0]));
+    if (models.length > 1) {
+      var others = models.slice(1, 4).map(function (m) {
+        return m.id.split("/").pop() + " " + Math.round(100 * m.totalTokens / freeLimitPerModel) + "%";
+      });
+      var more = models.length > 4 ? " 等 " + models.length + " 个" : "";
+      cell.appendChild(el("div", "xs faint", "另：" + others.join(" · ") + more));
+    }
+    return cell;
   }
 
   function renderFreeQuota() {
@@ -1601,13 +1982,30 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (!freeQuotaRows.length) {
       var tr0 = el("tr");
       var td0 = el("td", "empty sm", "还没有账号。");
-      td0.colSpan = 4;
+      td0.colSpan = 5;
       tr0.appendChild(td0);
       body.appendChild(tr0);
       return;
     }
     freeQuotaRows.forEach(function (row) {
       var tr = el("tr");
+
+      // Its own selection, independent of the accounts page: this table lives
+      // on the quota page, so sharing the accounts-page selection would mean
+      // the button here could never find anything to probe.
+      var td0 = el("td", "nowrap");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.style.width = "auto";
+      box.style.margin = "0";
+      box.checked = freeProbeSelected[row.id] === true;
+      box.onchange = function () {
+        if (this.checked) freeProbeSelected[row.id] = true;
+        else delete freeProbeSelected[row.id];
+      };
+      td0.appendChild(box);
+      tr.appendChild(td0);
+
       var sig = row.signal;
 
       var td1 = el("td");
@@ -1616,24 +2014,30 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       tr.appendChild(td1);
 
       var td2 = el("td", "nowrap");
-      if (sig && sig.state === "exhausted") td2.appendChild(el("span", "badge err", "今日已耗尽"));
-      else if (sig && sig.state === "ok") td2.appendChild(el("span", "badge pass", "尚有额度"));
+      if (sig && sig.state === "exhausted") td2.appendChild(el("span", "badge err", "已耗尽"));
+      else if (sig && sig.state === "ok") td2.appendChild(el("span", "badge pass", "可用"));
       else td2.appendChild(el("span", "badge warn", "未探测"));
       tr.appendChild(td2);
 
-      var td3 = el("td", "nowrap xs faint");
-      if (sig) td3.textContent = (sig.probed ? "探测" : "真实请求") + " · " + fmtAgo(sig.at);
-      else td3.textContent = "—";
+      // The fullness meter is the estimated view; the badge above is the
+      // observed one. Both are shown because they answer different questions:
+      // "how close am I" and "has it actually failed".
+      var td3 = el("td");
+      td3.appendChild(freeBucketCell(row));
       tr.appendChild(td3);
 
-      var td4 = el("td", "xs");
+      var td4 = el("td", "nowrap xs faint");
+      if (sig) td4.textContent = (sig.probed ? "探测" : "真实请求") + " · " + fmtAgo(sig.at);
+      else td4.textContent = "—";
+      tr.appendChild(td4);
+
+      var td5 = el("td", "xs");
       if (sig && sig.reason) {
-        td4.appendChild(el("div", sig.state === "exhausted" ? "xs warn" : "xs faint",
+        td5.appendChild(el("div", sig.state === "exhausted" ? "xs warn" : "xs faint",
           summarize(sig.reason, 70)));
       }
-      if (sig && sig.model) td4.appendChild(el("div", "xs faint mono", sig.model));
-      if (!sig) td4.appendChild(el("span", "faint", "尚无信号"));
-      tr.appendChild(td4);
+      if (!sig) td5.appendChild(el("span", "faint", "尚无信号，可用上方按钮探测"));
+      tr.appendChild(td5);
 
       body.appendChild(tr);
     });
@@ -3069,10 +3473,25 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   // Forced, not cached: the button exists precisely to re-read upstream now.
   $("usageReload").onclick = function () { loadUsage(true); };
   $("modelUsageReload").onclick = function () { loadModelUsage(); toast("已刷新模型用量"); };
+  $("chartReload").onclick = function () { loadTimeline(); toast("已刷新走势"); };
+  $("chartMetric").onchange = function () {
+    // Re-render from the cached timeline: switching the metric is a redraw, not
+    // a new upstream read.
+    if (timelineCache) renderChartInto($("chartWrap"), $("chartHint"), timelineCache, this.value);
+    else loadTimeline();
+  };
   $("freeQuotaReload").onclick = function () { loadFreeQuota(); toast("已刷新免费额度"); };
   $("freeProbeSelected").onclick = function () {
-    var ids = Object.keys(selectedIds).filter(function (id) { return selectedIds[id]; });
-    runFreeProbe(ids, "选中账号");
+    var ids = Object.keys(freeProbeSelected);
+    runFreeProbe(ids, "选中的 " + ids.length + " 个账号");
+  };
+  $("freeProbeAll").onclick = function () {
+    var on = this.checked;
+    freeProbeSelected = {};
+    if (on) {
+      freeQuotaRows.forEach(function (row) { freeProbeSelected[row.id] = true; });
+    }
+    renderFreeQuota();
   };
   $("freeProbeExhausted").onclick = function () {
     var ids = freeQuotaRows
@@ -3105,16 +3524,23 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     syncWindowControls();
     usagePage = 1;
     loadUsage();
+    // The charts and per-model table share this window, so they follow it too.
+    loadTimeline();
+    if ($("view-quota").classList.contains("active")) loadModelUsage();
   };
   $("winHours").onchange = function () {
     syncWindowControls();
     usagePage = 1;
     loadUsage();
+    loadTimeline();
+    if ($("view-quota").classList.contains("active")) loadModelUsage();
   };
   $("winAnchorDay").onchange = function () {
     usageWindow.anchorDay = this.checked;
     usagePage = 1;
     loadUsage();
+    loadTimeline();
+    if ($("view-quota").classList.contains("active")) loadModelUsage();
   };
 
   $("acctStatus").onchange = function () {
@@ -3194,8 +3620,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   loadStatus();
   loadUsage();
   loadMiniLogs();
-  loadModelUsage();
-  loadFreeQuota();
+  loadTimeline();
   syncLogTimer();
 })();
 </script>

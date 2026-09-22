@@ -19,6 +19,7 @@ import { createLogger } from "../src/logger.js";
 import {
   COST_UNITS_PER_USD,
   MICRO_USD,
+  bucketUsage,
   fetchAccountCredits,
   fetchUsagesSince,
   normalizeModelId,
@@ -386,4 +387,56 @@ test("a usage row whose model is a display name is attributed to its bucket", as
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+/* ---------------- timeline bucketing ---------------- */
+
+test("bucketUsage keeps every record and fills idle buckets with zeros", () => {
+  const now = Date.UTC(2026, 8, 22, 12, 0, 0);
+  const since = now - 6 * 60 * 60 * 1000;
+  const window = { since, until: now, windowMs: now - since, snappedToDay: false };
+  const rec = (at: number, prompt: number, cached: number) => ({
+    id: `u${at}`,
+    at,
+    model: "cline-free/kimi-k3",
+    operation: "chat_completion",
+    provider: "vercel",
+    promptTokens: prompt,
+    completionTokens: 10,
+    totalTokens: prompt + 10,
+    cachedTokens: cached,
+    costMicroUsd: 100,
+    creditsUsed: 0,
+  });
+
+  // Two requests one hour in, nothing for the rest of the window: the idle
+  // stretch must appear as zero buckets, not be skipped, or the x-axis would
+  // compress time and read as steady traffic.
+  const buckets = bucketUsage([rec(since + 60 * 60 * 1000, 100, 50), rec(since + 61 * 60 * 1000, 200, 0)], window);
+  assert.ok(buckets.length >= 6, `expected a bucket per step, got ${buckets.length}`);
+  const withTraffic = buckets.filter((b) => b.requests > 0);
+  assert.equal(withTraffic.length, 1);
+  assert.equal(withTraffic[0]?.requests, 2);
+  assert.equal(withTraffic[0]?.promptTokens, 300);
+  assert.equal(withTraffic[0]?.cachedTokens, 50);
+  assert.equal(withTraffic[0]?.totalTokens, 320);
+  // Cache hit rate is per bucket, against that bucket's prompt tokens only.
+  assert.equal(withTraffic[0]?.cacheHitRate, 50 / 300);
+  assert.equal(buckets.filter((b) => b.requests === 0).length, buckets.length - 1);
+  // Totals survive the bucketing exactly.
+  assert.equal(buckets.reduce((s, b) => s + b.promptTokens, 0), 300);
+});
+
+test("bucketUsage picks a coarser step for a wider window", () => {
+  const now = Date.UTC(2026, 8, 22, 12, 0, 0);
+  const hour = { since: now - 3600_000, until: now, windowMs: 3600_000, snappedToDay: false };
+  const week = { since: now - 7 * 24 * 3600_000, until: now, windowMs: 7 * 24 * 3600_000, snappedToDay: false };
+  const stepOf = (w: { since: number; until: number }) => {
+    const b = bucketUsage([], { ...w, windowMs: w.until - w.since, snappedToDay: false } as never);
+    return b.length < 2 ? 0 : b[1]!.at - b[0]!.at;
+  };
+  assert.ok(stepOf(week) > stepOf(hour), "a week must not be bucketed as finely as an hour");
+  // Neither window should explode into an unreadable number of points.
+  const hourBuckets = bucketUsage([], { ...hour, windowMs: 3600_000, snappedToDay: false } as never);
+  assert.ok(hourBuckets.length <= 64, `too many buckets for an hour: ${hourBuckets.length}`);
 });
