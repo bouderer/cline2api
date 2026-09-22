@@ -435,16 +435,18 @@ test("/v1/models serves the live upstream catalog plus the recommended buckets",
       data: Array<Record<string, unknown>>;
     };
     // Provider catalog first, then the ids only recommended-models knows about
-    // (subscription bucket before free bucket), de-duplicated by id.
+    // (subscription bucket before free bucket), then the ids we pin to the free
+    // bucket ourselves, de-duplicated by id.
     assert.deepEqual(
       json.data.map((m) => m.id),
-      ["mock/model-1", "mock/model-2", "cline-pass/mock-kimi", "mock/free-1"],
+      ["mock/model-1", "mock/model-2", "cline-pass/mock-kimi", "mock/free-1", "cline-free/kimi-k3"],
     );
     // Entries merged in from the second catalog keep a provider owner when they
     // have one, and fall back to the bucket name otherwise.
     assert.equal(json.data[0]?.owned_by, "mock");
     assert.equal(json.data[2]?.owned_by, "cline-pass");
     assert.equal(json.data[3]?.owned_by, "cline-free");
+    assert.equal(json.data[4]?.owned_by, "cline-free");
     // The billing bucket is internal — /v1/models stays pure OpenAI shape.
     for (const entry of json.data) assert.ok(!("bucket" in entry));
   });
@@ -534,7 +536,10 @@ test("/admin/api/models groups the catalog into billing buckets", async () => {
     // provider catalog *and* the free bucket, and the free bucket wins.
     assert.equal(byId.get("mock/model-1"), "free");
     assert.equal(byId.get("mock/model-2"), "credits");
-    assert.deepEqual(json.counts, { total: 4, pass: 1, free: 2, credits: 1 });
+    // Not in the mock's free bucket, but the ledger bills it as free, so it is
+    // pinned to the free bucket explicitly.
+    assert.equal(byId.get("cline-free/kimi-k3"), "free");
+    assert.deepEqual(json.counts, { total: 5, pass: 1, free: 3, credits: 1 });
   });
 });
 

@@ -27,8 +27,11 @@ interface Recorded {
 }
 
 /** Upstream that answers the endpoints the admin surface touches. */
-async function startUpstream(options: { refreshOk?: boolean } = {}) {
+async function startUpstream(options: { refreshOk?: boolean; chatHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => void } = {}) {
   const requests: Recorded[] = [];
+  // Replaceable so a test can make the chat endpoint fail the way the real
+  // upstream does when a free bucket is spent.
+  let chatHandler: ((req: http.IncomingMessage, res: http.ServerResponse) => void) | null = options.chatHandler ?? null;
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -73,6 +76,7 @@ async function startUpstream(options: { refreshOk?: boolean } = {}) {
                 costUsd: 39,
                 operation: "chat_completion",
                 aiInferenceProviderName: "vercel",
+                aiModelTypeName: "cline-free",
                 aiModelName: "Deepseek-v4.1-Flash",
                 promptTokens: 8,
                 completionTokens: 1,
@@ -92,6 +96,7 @@ async function startUpstream(options: { refreshOk?: boolean } = {}) {
         return json({ success: true, data: { limits: [] } });
       }
       if (url.pathname === "/api/v1/chat/completions") {
+        if (chatHandler !== null) return chatHandler(req, res);
         return json({
           choices: [{ message: { content: "可用" }, finish_reason: "stop" }],
           usage: { total_tokens: 9 },
@@ -105,6 +110,9 @@ async function startUpstream(options: { refreshOk?: boolean } = {}) {
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
+    setChatHandler: (handler: ((req: http.IncomingMessage, res: http.ServerResponse) => void) | null) => {
+      chatHandler = handler;
+    },
     close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
   };
 }
@@ -597,5 +605,126 @@ test("credits summary rolls up the row cache without new upstream calls", async 
       await app.request("/admin/api/credits/summary?hours=168", { headers: adminHeaders })
     ).json()) as { covered: number };
     assert.equal(other.covered, 0);
+  });
+});
+
+/* ---------------- per-model usage ---------------- */
+
+test("the by-model rollup covers the pool from the credits cache, and says when it is empty", async () => {
+  await withGateway(30, async ({ app, upstream }) => {
+    // No rows read yet under this window: an empty table with honest coverage
+    // beats inventing a total from nothing.
+    const cold = (await (
+      await app.request("/admin/api/usage/by-model?hours=13", { headers: adminHeaders })
+    ).json()) as { models: unknown[]; covered: number; total: number };
+    assert.equal(cold.covered, 0);
+    assert.equal(cold.total, 30);
+    assert.deepEqual(cold.models, []);
+
+    // Reading a page of credits is what fills the cache the rollup reads.
+    await app.request("/admin/api/credits?page=1&pageSize=5&hours=13", { headers: adminHeaders });
+    upstream.requests.length = 0;
+
+    const body = (await (
+      await app.request("/admin/api/usage/by-model?hours=13", { headers: adminHeaders })
+    ).json()) as {
+      models: Array<{ id: string; bucket: string | null; requests: number; totalTokens: number }>;
+      covered: number;
+    };
+    assert.ok(body.covered >= 5);
+    // The mock's usage rows are Deepseek with a bare display name, so the
+    // bucket has to be reconstructed from aiModelTypeName.
+    assert.equal(body.models.length, 1);
+    assert.equal(body.models[0]?.id, "cline-free/Deepseek-v4.1-Flash");
+    assert.equal(body.models[0]?.bucket, "cline-free");
+    assert.equal(body.models[0]?.requests, body.covered);
+    assert.equal(body.models[0]?.totalTokens, body.covered * 9);
+    // Pure cache rollup: no new upstream calls.
+    assert.equal(upstream.requests.length, 0);
+  });
+});
+
+/* ---------------- free quota ---------------- */
+
+test("free quota reports no signal rather than a guess, and a probe records one", async () => {
+  await withGateway(1, async ({ app, store, upstream }) => {
+    const before = (await (
+      await app.request("/admin/api/free-quota", { headers: adminHeaders })
+    ).json()) as {
+      accounts: Array<{ id: string; signal: unknown }>;
+      probeModel: string;
+    };
+    assert.equal(before.accounts.length, 1);
+    // Nothing has asked upstream yet, so there is nothing to claim.
+    assert.equal(before.accounts[0]?.signal, null);
+    assert.equal(before.probeModel, "cline-free/kimi-k3");
+
+    upstream.setChatHandler((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }));
+    });
+
+    const probe = (await (
+      await app.request("/admin/api/accounts/acct-1/free-quota", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({}),
+      })
+    ).json()) as { outcome: string; model: string; status: number | null };
+    assert.equal(probe.outcome, "ok");
+    assert.equal(probe.model, "cline-free/kimi-k3");
+    assert.equal(probe.status, 200);
+    void store;
+
+    const after = (await (
+      await app.request("/admin/api/free-quota", { headers: adminHeaders })
+    ).json()) as { accounts: Array<{ signal: { state: string; probed: boolean } | null }> };
+    assert.equal(after.accounts[0]?.signal?.state, "ok");
+    assert.equal(after.accounts[0]?.signal?.probed, true);
+  });
+});
+
+test("a free-limit error becomes an exhausted signal, a provider 429 does not", async () => {
+  await withGateway(1, async ({ app, upstream }) => {
+    upstream.setChatHandler((_req, res) => {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Daily free limit reached. Try again tomorrow." } }));
+    });
+    const probe = (await (
+      await app.request("/admin/api/accounts/acct-1/free-quota", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({}),
+      })
+    ).json()) as { outcome: string; reason: string | null };
+    assert.equal(probe.outcome, "exhausted");
+    assert.match(probe.reason ?? "", /free limit/i);
+
+    const listed = (await (
+      await app.request("/admin/api/free-quota", { headers: adminHeaders })
+    ).json()) as { accounts: Array<{ signal: { state: string } | null }> };
+    assert.equal(listed.accounts[0]?.signal?.state, "exhausted");
+  });
+
+  // A plain rate limit says nothing about the free bucket, so it must not be
+  // recorded as "this account is out of free quota".
+  await withGateway(1, async ({ app, upstream }) => {
+    upstream.setChatHandler((_req, res) => {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Rate limit exceeded, slow down." } }));
+    });
+    const probe = (await (
+      await app.request("/admin/api/accounts/acct-1/free-quota", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({}),
+      })
+    ).json()) as { outcome: string };
+    assert.equal(probe.outcome, "error");
+
+    const listed = (await (
+      await app.request("/admin/api/free-quota", { headers: adminHeaders })
+    ).json()) as { accounts: Array<{ signal: unknown }> };
+    assert.equal(listed.accounts[0]?.signal, null);
   });
 });

@@ -21,9 +21,11 @@ import {
   MICRO_USD,
   fetchAccountCredits,
   fetchUsagesSince,
+  normalizeModelId,
   resolveWindow,
   startOfLocalDay,
   sumUsage,
+  sumUsageByModel,
 } from "../src/cline/credits.js";
 
 const UID = "usr-test-1";
@@ -290,4 +292,98 @@ test("micro-USD converts to USD and credits at the documented rates", () => {
   // -19229 micro-USD is the real negative balance used to verify the unit:
   // upstream's own 402 body reports the same account as $-0.02.
   assert.equal(-19229 / MICRO_USD, -0.019229);
+});
+
+/* ---------------- per-model totals ---------------- */
+
+test("sumUsageByModel groups by model, sorted by tokens", () => {
+  const at = Date.now();
+  const record = (id: string, model: string | null, tokens: number, cached: number, cost: number) => ({
+    id,
+    at,
+    model,
+    operation: "chat_completion",
+    provider: "vercel",
+    promptTokens: tokens,
+    completionTokens: 1,
+    totalTokens: tokens + 1,
+    cachedTokens: cached,
+    costMicroUsd: cost,
+    creditsUsed: 0,
+  });
+  const rows = sumUsageByModel([
+    record("a", "cline-free/kimi-k3", 100, 90, 500),
+    record("b", "cline-free/kimi-k3", 200, 0, 300),
+    record("c", "cline-free/Deepseek-v4.1-Flash", 50, 0, 0),
+    // No model: a record we cannot attribute must not invent a bucket for it.
+    record("d", null, 999, 0, 0),
+  ]);
+
+  assert.equal(rows.length, 2);
+  // kimi has more tokens (300 + 2) than deepseek (50 + 1), so it sorts first.
+  assert.equal(rows[0]?.id, "cline-free/kimi-k3");
+  assert.equal(rows[0]?.bucket, "cline-free");
+  assert.equal(rows[0]?.requests, 2);
+  assert.equal(rows[0]?.promptTokens, 300);
+  assert.equal(rows[0]?.cachedTokens, 90);
+  assert.equal(rows[0]?.costUnits, 800);
+  assert.equal(rows[0]?.costUsd, 800 / COST_UNITS_PER_USD);
+  assert.equal(rows[1]?.id, "cline-free/Deepseek-v4.1-Flash");
+});
+
+test("normalizeModelId does not double-prefix an id that already has a bucket", () => {
+  // The ledger is inconsistent: the same model arrives as a full id on one
+  // account and as a bare display name (plus its bucket) on another.
+  assert.equal(normalizeModelId("cline-free", "cline-free/kimi-k3"), "cline-free/kimi-k3");
+  assert.equal(normalizeModelId("cline-free", "Deepseek-v4.1-Flash"), "cline-free/Deepseek-v4.1-Flash");
+  assert.equal(normalizeModelId("z-ai", "glm-5.3-flash"), "z-ai/glm-5.3-flash");
+  // A name with no bucket at all is still usable verbatim.
+  assert.equal(normalizeModelId(null, "some-model"), "some-model");
+  assert.equal(normalizeModelId("cline-free", null), "cline-free");
+});
+
+test("a usage row whose model is a display name is attributed to its bucket", async () => {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const json = (payload: unknown): void => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    if (url.pathname === "/api/v1/users/me") return json({ data: { id: UID } });
+    if (/\/balance$/.test(url.pathname)) return json({ success: true, data: { balance: 0 } });
+    if (/\/usages$/.test(url.pathname)) {
+      return json({
+        success: true,
+        data: {
+          items: [
+            {
+              id: "u1",
+              createdAt: new Date().toISOString(),
+              aiModelTypeName: "cline-free",
+              aiModelName: "Deepseek-v4.1-Flash",
+              promptTokens: 10,
+              completionTokens: 2,
+              totalTokens: 12,
+              cachedTokens: 0,
+              costUsd: 0,
+              creditsUsed: 0,
+            },
+          ],
+          nextToken: null,
+        },
+      });
+    }
+    return json({ success: true, data: {} });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const credits = await fetchAccountCredits(configFor(`http://127.0.0.1:${port}`), "Bearer workos:x", logger);
+    assert.equal(credits.models.length, 1);
+    assert.equal(credits.models[0]?.id, "cline-free/Deepseek-v4.1-Flash");
+    assert.equal(credits.models[0]?.bucket, "cline-free");
+    assert.equal(credits.models[0]?.totalTokens, 12);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

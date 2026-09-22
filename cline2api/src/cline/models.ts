@@ -60,6 +60,18 @@ function readBucket(raw: unknown, owner: string, bucket: ModelBucket): ModelEntr
 }
 
 /**
+ * Ids known to be free even though upstream's recommended-models list omits
+ * them.
+ *
+ * `cline-free/kimi-k3` is the case that motivated this: the free catalog does
+ * not advertise it, but the usage ledger bills it under `aiModelTypeName:
+ * "cline-free"` with `creditsUsed: 0`, so it is a free model in practice and
+ * callers need to see it in the free bucket rather than have it silently fall
+ * into "credits".
+ */
+const KNOWN_FREE_MODEL_IDS: readonly string[] = ["cline-free/kimi-k3"];
+
+/**
  * Provider catalog first (insertion order is what clients see), then the
  * subscription and free buckets. A duplicate id keeps its provider metadata
  * but takes the bucket from the catalog that positioned it — the free bucket
@@ -73,6 +85,14 @@ function merge(primary: ModelEntry[], pass: ModelEntry[], free: ModelEntry[]): M
       const existing = byId.get(candidate.id);
       byId.set(candidate.id, existing ? { ...existing, bucket: candidate.bucket } : candidate);
     }
+  }
+  // Applied last so the free bucket wins, which is the same precedence the
+  // merge above uses for a catalog that does declare these ids.
+  for (const id of KNOWN_FREE_MODEL_IDS) {
+    const existing = byId.get(id);
+    byId.set(id, existing
+      ? { ...existing, bucket: "free" }
+      : toEntry(id, FREE_OWNER, 0, "free"));
   }
   return [...byId.values()];
 }
@@ -114,6 +134,7 @@ export class ModelCatalog {
         ),
         ...FALLBACK_PASS_MODEL_IDS.map((id) => toEntry(id, PASS_OWNER, 0, "pass")),
         ...FALLBACK_FREE_MODEL_IDS.map((id) => toEntry(id, FREE_OWNER, 0, "free")),
+        ...KNOWN_FREE_MODEL_IDS.map((id) => toEntry(id, FREE_OWNER, 0, "free")),
       ];
     }
 

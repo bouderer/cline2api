@@ -9,9 +9,13 @@ import { ADMIN_PAGE } from "../webui/page.js";
 import { chatCompletion, unwrapEnvelope } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
 import { probeAccount } from "../services/accountCheck.js";
+import { probeFreeQuota, DEFAULT_FREE_PROBE_MODEL } from "../services/freeQuotaProbe.js";
+import type { FreeQuotaStore } from "../services/freeQuota.js";
+import type { RateLimiter } from "../services/rateLimit.js";
+import type { SweepRunner } from "../services/sweep.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
-import { fetchAccountCredits, resolveWindow, type AccountCredits, type ResolvedWindow, type UsageWindowRequest } from "../cline/credits.js";
+import { fetchAccountCredits, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageWindowRequest } from "../cline/credits.js";
 import { ProxyStore, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
 import type { ProxyResolver } from "../cline/proxy.js";
 
@@ -20,6 +24,12 @@ export interface AdminRouteDeps extends OpenAIRouteDeps {
   proxies: ProxyStore;
   /** Resolves an account's assigned proxy to a dispatcher. */
   resolver: ProxyResolver;
+  /** Free-tier quota signals: what traffic hit, plus on-demand probe results. */
+  freeQuota: FreeQuotaStore;
+  /** Live rate-limit settings and counters. */
+  rateLimit: RateLimiter;
+  /** Pool-wide liveness sweep, running server-side. */
+  sweep: SweepRunner;
 }
 
 function remoteAddress(c: Context): string | undefined {
@@ -237,6 +247,7 @@ function emptyCreditsRow(
       costUsd: 0,
       creditsMicroUsd: 0,
     },
+    models: [],
     since: window.since,
     until: window.until,
     windowMs: window.windowMs,
@@ -800,6 +811,89 @@ app.get("/admin/api/accounts", (c) => {
   });
 
   /**
+   * Pool-wide liveness sweep: status, start, cancel.
+   *
+   * Server-side so a several-hundred-account pass survives navigating away from
+   * the page. `start` with a model runs a real completion per account (pinned,
+   * so a failure is that account's); without one it only proves the credential.
+   */
+  app.get("/admin/api/sweep", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    return c.json({ sweep: deps.sweep.status() });
+  });
+
+  app.post("/admin/api/sweep", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const body = (await c.req.json().catch(() => ({}))) as {
+      model?: unknown;
+      activeOnly?: unknown;
+      failedOnly?: unknown;
+      concurrency?: unknown;
+    };
+    const result = deps.sweep.start({
+      model: typeof body.model === "string" ? body.model : null,
+      activeOnly: body.activeOnly === true,
+      failedOnly: body.failedOnly === true,
+      concurrency: typeof body.concurrency === "number" ? body.concurrency : undefined,
+    });
+    return c.json({ started: result.started, sweep: result.state });
+  });
+
+  app.post("/admin/api/sweep/cancel", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    return c.json({ cancelled: deps.sweep.cancel(), sweep: deps.sweep.status() });
+  });
+
+  /**
+   * Rate-limit settings plus live usage.
+   *
+   * `keys` counts keys that have made a request inside the current window, so
+   * the console can say "12 keys active" rather than implying the whole pool of
+   * client keys is being counted.
+   */
+  app.get("/admin/api/rate-limit", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    return c.json(deps.rateLimit.snapshot());
+  });
+
+  /**
+   * Update the ceilings. Values are clamped server-side, and the sanitized
+   * result is returned so the UI shows what was actually stored.
+   */
+  app.patch("/admin/api/rate-limit", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const patch: { enabled?: boolean; globalPerMinute?: number; keyPerMinute?: number } = {};
+    if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (typeof body.globalPerMinute === "number") patch.globalPerMinute = body.globalPerMinute;
+    if (typeof body.keyPerMinute === "number") patch.keyPerMinute = body.keyPerMinute;
+    if (Object.keys(patch).length === 0) {
+      return c.json({ error: "nothing to update: pass `enabled`, `globalPerMinute` or `keyPerMinute`" }, 400);
+    }
+    const settings = deps.rateLimit.update(patch);
+    deps.logger.info("rate limit settings updated", { ...settings });
+    return c.json({ ...deps.rateLimit.snapshot(), settings });
+  });
+
+  /**
+   * Clear the in-memory counters.
+   *
+   * Useful right after lowering a ceiling or when a runaway client has been
+   * fixed: the window is otherwise a minute of history nobody wants to wait out.
+   */
+  app.post("/admin/api/rate-limit/reset", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    deps.rateLimit.reset();
+    return c.json(deps.rateLimit.snapshot());
+  });
+
+  /**
    * Per-account credit balance plus the window's token totals.
    *
    * Separate from /admin/api/usage because the two answer different questions
@@ -813,6 +907,113 @@ app.get("/admin/api/accounts", (c) => {
     const page = resolvePage((name) => c.req.query(name), deps.store.count());
     const force = c.req.query("refresh") === "1";
     return c.json(await collectCredits(deps, page, { force, window: windowQuery(c) }));
+  });
+
+  /**
+   * Per-model usage over the selected window, across the whole pool.
+   *
+   * Built from the same per-account usage rows that feed the credits table, so
+   * the two always agree. Coverage is reported for the same reason the summary
+   * reports it: only accounts read recently contribute, and a model missing
+   * from this list may just be one nobody has loaded yet.
+   */
+  app.get("/admin/api/usage/by-model", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const resolved = resolveWindow(windowQuery(c));
+    const now = Date.now();
+    const byId = new Map<string, ModelUsage>();
+    let covered = 0;
+    const ids = new Set(deps.store.list().map((account) => account.id));
+    for (const entry of creditsCache.values()) {
+      if (now - entry.at >= CREDITS_CACHE_TTL_MS) continue;
+      if (!ids.has(entry.row.id)) continue;
+      if (entry.row.windowMs !== resolved.windowMs) continue;
+      if (entry.row.snappedToDay !== resolved.snappedToDay) continue;
+      covered += 1;
+      for (const model of entry.row.models ?? []) {
+        const current = byId.get(model.id);
+        if (current === undefined) {
+          byId.set(model.id, { ...model });
+          continue;
+        }
+        current.requests += model.requests;
+        current.promptTokens += model.promptTokens;
+        current.completionTokens += model.completionTokens;
+        current.cachedTokens += model.cachedTokens;
+        current.totalTokens += model.totalTokens;
+        current.costUnits += model.costUnits;
+        current.costUsd += model.costUsd;
+        current.creditsMicroUsd += model.creditsMicroUsd;
+      }
+    }
+    const models = [...byId.values()].sort(
+      (a, b) => b.totalTokens - a.totalTokens || a.id.localeCompare(b.id),
+    );
+    return c.json({
+      models,
+      covered,
+      total: ids.size,
+      window: { windowMs: resolved.windowMs, snappedToDay: resolved.snappedToDay },
+    });
+  });
+
+  /**
+   * Free-tier quota signals, keyed by account id.
+   *
+   * Two sources, kept distinct in the payload: `traffic` records what the pool
+   * hit in real requests (free to collect), `probe` what an explicit probe saw.
+   * Both are per day — upstream resets the free bucket on its own clock.
+   */
+  app.get("/admin/api/free-quota", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const accounts = deps.store.list();
+    const signals = deps.freeQuota.snapshot(accounts.map((account) => account.id));
+    return c.json({
+      accounts: accounts.map((account) => ({
+        id: account.id,
+        email: account.email,
+        disabled: account.disabled,
+        signal: signals[account.id] ?? null,
+      })),
+      probeModel: DEFAULT_FREE_PROBE_MODEL,
+      checkedAt: Date.now(),
+    });
+  });
+
+  /**
+   * Probe one account's free quota with a single minimal request.
+   *
+   * Costs one real (free-bucket) request, so it is on demand only — a sweep
+   * across the pool belongs behind an explicit button, not a page load.
+   */
+  app.post("/admin/api/accounts/:id/free-quota", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const body = (await c.req.json().catch(() => ({}))) as { model?: unknown };
+    const model = typeof body.model === "string" && body.model.length > 0 ? body.model : DEFAULT_FREE_PROBE_MODEL;
+    const result = await probeFreeQuota(
+      {
+        config: deps.config,
+        logger: deps.logger,
+        store: deps.store,
+        tokens: deps.tokens,
+        chat: {
+          config: deps.config,
+          logger: deps.logger,
+          pool: deps.pool,
+          tokens: deps.tokens,
+          store: deps.store,
+          proxyResolver: deps.resolver,
+          freeQuota: deps.freeQuota,
+        },
+        quota: deps.freeQuota,
+      },
+      c.req.param("id"),
+      { model },
+    );
+    return c.json(result);
   });
 
   /**

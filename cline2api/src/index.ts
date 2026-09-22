@@ -24,8 +24,11 @@ import { TokenManager } from "./cline/tokenManager.js";
 import { ModelCatalog } from "./cline/models.js";
 import { LoginService } from "./services/loginService.js";
 import { ApiKeyManager } from "./services/apiKeys.js";
+import { FreeQuotaStore } from "./services/freeQuota.js";
+import { RateLimiter } from "./services/rateLimit.js";
+import { SweepRunner } from "./services/sweep.js";
 import { isAuthorized, registerOpenAIRoutes } from "./api/openai.js";
-import { openaiError } from "./api/http.js";
+import { extractApiKey, openaiError } from "./api/http.js";
 import { registerResponsesRoutes } from "./api/responses.js";
 import { registerAnthropicRoutes } from "./api/anthropic.js";
 import { registerAdminRoutes } from "./api/admin.js";
@@ -69,6 +72,17 @@ export function createApp(config: AppConfig = loadConfig()) {
   }
 
   const requests = new RequestLog();
+  const freeQuota = new FreeQuotaStore({ logger });
+  const rateLimit = new RateLimiter({
+    dataDir: config.dataDir,
+    logger,
+    defaults: {
+      globalPerMinute: config.rateLimitGlobalPerMinute,
+      keyPerMinute: config.rateLimitKeyPerMinute,
+    },
+  });
+
+  const sweep = new SweepRunner({ config, logger, store, tokens, pool, resolver, freeQuota });
 
   const deps = {
     config,
@@ -82,6 +96,9 @@ export function createApp(config: AppConfig = loadConfig()) {
     resolver,
     proxyResolver: resolver,
     apiKeys,
+    freeQuota,
+    rateLimit,
+    sweep,
   };
   const app = new Hono();
 
@@ -90,6 +107,42 @@ export function createApp(config: AppConfig = loadConfig()) {
   app.use("/v1/*", async (c, next) => {
     if (!isAuthorized(c, deps)) {
       return openaiError("Missing or invalid API key.", 401, { code: "invalid_api_key" });
+    }
+    await next();
+  });
+
+  /**
+   * Rate limit the model-call endpoints only.
+   *
+   * `/v1/models` is a catalog read that costs nothing upstream, and the admin
+   * and health routes are the operator's own — counting those would let a
+   * client's catalogue polling throttle the console someone is debugging with.
+   */
+  const MODEL_PATHS = ["/v1/chat/completions", "/v1/responses", "/v1/messages"];
+  app.use("*", async (c, next) => {
+    if (!MODEL_PATHS.includes(c.req.path)) {
+      await next();
+      return;
+    }
+    const key = deps.apiKeys.matches(
+      extractApiKey(c.req.header("authorization"), c.req.header("x-api-key")) ?? "",
+    );
+    const decision = await deps.rateLimit.acquire(key?.id ?? null, c.req.raw.signal);
+    if (!decision.allowed) {
+      const seconds = Math.max(1, Math.ceil(decision.retryAfterMs / 1000));
+      return openaiError(
+        decision.scope === "key"
+          ? `Rate limit exceeded for this API key (${decision.limit}/min). Retry in ${seconds}s, or use another key.`
+          : `Gateway rate limit exceeded (${decision.limit}/min). Retry in ${seconds}s.`,
+        429,
+        {
+          type: "rate_limit_error",
+          code: decision.scope === "key" ? "key_rate_limited" : "gateway_rate_limited",
+          // Set on the returned Response, not on the context: the handler
+          // returns its own Response, which would drop a context header.
+          extraHeaders: { "retry-after": String(seconds) },
+        },
+      );
     }
     await next();
   });

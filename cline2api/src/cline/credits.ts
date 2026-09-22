@@ -107,6 +107,31 @@ export interface UsageRecord {
   creditsUsed: number;
 }
 
+/**
+ * One model's share of a window's usage.
+ *
+ * `id` is a display id the catalog understands, reconstructed from the two
+ * fields upstream actually sends (`aiModelTypeName` + `aiModelName`). Those
+ * are not consistent: the same model arrives as `cline-free/kimi-k3` on one
+ * account and `Deepseek-v4.1-Flash` (a bare display name, no bucket) on
+ * another, so the bucket prefix is only added when the name does not already
+ * carry one. Without the bucket these would key as different models and the
+ * per-model totals would silently split.
+ */
+export interface ModelUsage {
+  id: string;
+  /** The bucket upstream billed it under: `cline-free`, `cline-pass`, `z-ai`, ... */
+  bucket: string | null;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  costUnits: number;
+  costUsd: number;
+  creditsMicroUsd: number;
+}
+
 /** Token and cost totals over one window, all zero when nothing was used. */
 export interface UsageTotals {
   requests: number;
@@ -130,6 +155,8 @@ export interface AccountCredits {
   balanceCredits: number | null;
   /** Totals over the requested window for this account. */
   window: UsageTotals;
+  /** The same window split by model, biggest by tokens first. */
+  models: ModelUsage[];
   /** Window bounds, epoch millis, echoed so the UI can label the column. */
   since: number;
   until: number;
@@ -266,7 +293,10 @@ function toUsageRecord(raw: unknown): UsageRecord | null {
   return {
     id,
     at,
-    model: readString(item, "aiModelName"),
+    model: normalizeModelId(
+      readString(item, "aiModelTypeName"),
+      readString(item, "aiModelName"),
+    ),
     operation: readString(item, "operation"),
     provider: readString(item, "aiInferenceProviderName"),
     promptTokens: readNumber(item, "promptTokens"),
@@ -276,6 +306,22 @@ function toUsageRecord(raw: unknown): UsageRecord | null {
     costMicroUsd: readNumber(item, "costUsd"),
     creditsUsed: readNumber(item, "creditsUsed"),
   };
+}
+
+/**
+ * Rebuild a usable model id from the ledger's two model fields.
+ *
+ * Upstream is inconsistent about which of the two is populated: a usage row
+ * carries either the full catalog id (`cline-free/kimi-k3`) or a bare display
+ * name (`Deepseek-v4.1-Flash`, `Muse Spark 1.3 Contributor`) plus a bucket in
+ * `aiModelTypeName`. A name that already looks like an id is kept as-is —
+ * prefixing it would produce `cline-free/cline-free/kimi-k3` and split one
+ * model's totals across two keys.
+ */
+export function normalizeModelId(bucket: string | null, name: string | null): string | null {
+  if (name === null) return bucket;
+  if (name.includes("/")) return name;
+  return bucket === null ? name : `${bucket}/${name}`;
 }
 
 /**
@@ -365,6 +411,56 @@ export function sumUsage(records: readonly UsageRecord[]): UsageTotals {
   return totals;
 }
 
+/** Bucket prefix of a normalized id, e.g. `cline-free` in `cline-free/kimi-k3`. */
+function bucketOf(id: string): string | null {
+  const slash = id.indexOf("/");
+  return slash > 0 ? id.slice(0, slash) : null;
+}
+
+/**
+ * Per-model totals over one window, biggest spender first.
+ *
+ * A record with no model at all is dropped rather than bucketed under a
+ * "unknown" row: on a free-tier account those are the requests upstream billed
+ * nothing for, and inventing a model name for them would make the table look
+ * like it covers more than it does.
+ */
+export function sumUsageByModel(records: readonly UsageRecord[]): ModelUsage[] {
+  const byId = new Map<string, ModelUsage>();
+  for (const record of records) {
+    if (record.model === null) continue;
+    let entry = byId.get(record.model);
+    if (entry === undefined) {
+      entry = {
+        id: record.model,
+        bucket: bucketOf(record.model),
+        requests: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        costUnits: 0,
+        costUsd: 0,
+        creditsMicroUsd: 0,
+      };
+      byId.set(record.model, entry);
+    }
+    entry.requests += 1;
+    entry.promptTokens += record.promptTokens;
+    entry.completionTokens += record.completionTokens;
+    entry.cachedTokens += record.cachedTokens;
+    entry.totalTokens += record.totalTokens;
+    entry.costUnits += record.costMicroUsd;
+    entry.creditsMicroUsd += record.creditsUsed;
+  }
+  const rows = [...byId.values()];
+  for (const row of rows) row.costUsd = row.costUnits / COST_UNITS_PER_USD;
+  // Token count, not cost: on free and Pass traffic every cost is zero, so
+  // sorting by cost would leave the busiest models in arbitrary order.
+  rows.sort((a, b) => b.totalTokens - a.totalTokens || a.id.localeCompare(b.id));
+  return rows;
+}
+
 /** The window an admin read covers, resolved from request options. */
 export interface UsageWindowRequest {
   /** Window length in millis. Clamped to [1 minute, MAX_WINDOW_MS]. */
@@ -427,6 +523,7 @@ export async function fetchAccountCredits(
       balanceUsd: null,
       balanceCredits: null,
       window: emptyTotals(),
+      models: [],
       since: window.since,
       until: window.until,
       windowMs: window.windowMs,
@@ -456,6 +553,7 @@ export async function fetchAccountCredits(
     balanceCredits:
       balanceMicroUsd === null ? null : balanceMicroUsd / MICRO_USD_PER_CREDIT,
     window: sumUsage(usages),
+    models: sumUsageByModel(usages),
     since: window.since,
     until: window.until,
     windowMs: window.windowMs,

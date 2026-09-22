@@ -20,6 +20,13 @@ export interface AppConfig {
    */
   readonly proxyApiKeys: readonly string[];
   readonly adminToken: string | null;
+  /**
+   * Rate-limit defaults. The live values live in `data/ratelimit.json` and are
+   * editable from the admin UI; these only seed a deployment that has no file
+   * yet, so the limit is never absent just because nobody opened the console.
+   */
+  readonly rateLimitGlobalPerMinute: number;
+  readonly rateLimitKeyPerMinute: number;
   /** Upstream Cline API origin, e.g. https://api.cline.bot */
   readonly clineApiBaseUrl: string;
   /** WorkOS API origin, e.g. https://api.workos.com */
@@ -89,6 +96,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataDir,
     proxyApiKeys: resolveProxyApiKeys(env),
     adminToken: readString(env, "ADMIN_TOKEN") ?? null,
+    rateLimitGlobalPerMinute: readInt(env, "RATE_LIMIT_GLOBAL_PER_MINUTE", 400),
+    rateLimitKeyPerMinute: readInt(env, "RATE_LIMIT_KEY_PER_MINUTE", 200),
     clineApiBaseUrl: stripTrailingSlash(
       readString(env, "CLINE_API_BASE_URL") ?? "https://api.cline.bot",
     ),

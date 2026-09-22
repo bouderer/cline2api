@@ -8,6 +8,7 @@ import type { AccountPool } from "./accountPool.js";
 import type { RequestLog } from "./requestLog.js";
 import type { TokenManager } from "../cline/tokenManager.js";
 import type { AccountStore } from "../store.js";
+import type { FreeQuotaStore } from "./freeQuota.js";
 import type { ProxyResolver } from "../cline/proxy.js";
 import { postChatCompletions } from "../cline/upstream.js";
 import { openaiError } from "../api/http.js";
@@ -23,6 +24,8 @@ export interface ProxyChatDeps {
   proxyResolver?: ProxyResolver;
   /** Optional: when present, every attempt is recorded for the admin UI. */
   requests?: RequestLog;
+  /** Optional: when present, free-tier quota failures are remembered. */
+  freeQuota?: FreeQuotaStore;
 }
 
 export type UpstreamOutcome =
@@ -273,7 +276,13 @@ export async function callUpstreamWithFailover(
         // fail over instead of surfacing the per-account error.
         if (isAccountScopedUpstreamError(upstream.status, text)) {
           cool(account.id, options.model);
-          failures.push(`${account.id}: ${describeAccountScopedError(upstream.status, text)}`);
+          const reason = describeAccountScopedError(upstream.status, text);
+          failures.push(`${account.id}: ${reason}`);
+          // A free-tier quota failure is the only observable signal that this
+          // account's free bucket is spent, so keep it for the admin view.
+          if (reason === "daily free limit" || reason === "inference cap") {
+            deps.freeQuota?.recordQuotaError(account.id, options.model, reason);
+          }
           deps.logger.warn("account cannot serve model, failing over", {
             accountId: account.id,
             model: options.model,

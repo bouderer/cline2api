@@ -390,6 +390,46 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <div class="card-foot" id="usagePager"></div>
       </div>
 
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>按模型用量</h2>
+            <div class="hint" id="modelUsageHint">—</div>
+          </div>
+          <button class="btn small" id="modelUsageReload">重新读取</button>
+        </div>
+        <div class="card-body tight" id="modelUsageBody">
+          <div class="muted sm">读取中…</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>免费额度</h2>
+            <div class="hint">上游没有查剩余额度的接口，这里只记录两种可观测信号：真实请求撞到 <span class="mono">Daily free limit</span> 的时刻，以及手动探测的结果。均为本地自然日。</div>
+          </div>
+          <div class="row" style="gap:8px">
+            <button class="btn small" id="freeQuotaReload">刷新</button>
+          </div>
+        </div>
+        <div class="card-body tight">
+          <div class="row" style="gap:8px; margin-bottom:10px; flex-wrap:wrap">
+            <input type="text" id="freeProbeModel" class="mono" style="min-width:260px"
+              title="探测用的免费模型，必须是免费桶里的模型，否则探测不到免费额度" />
+            <button class="btn small primary" id="freeProbeSelected">探测选中账号</button>
+            <button class="btn small" id="freeProbeExhausted">只探「已耗尽」</button>
+            <span class="xs muted" id="freeProbeStatus">—</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>账号</th><th class="nowrap">免费额度</th><th class="nowrap">依据</th><th>说明</th></tr></thead>
+              <tbody id="freeQuotaBody"><tr><td colspan="4" class="empty sm">加载中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="grid two" style="margin-top:14px">
         <div class="card">
           <div class="card-head">
@@ -561,7 +601,44 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>全局测活</h2>
+            <div class="hint" id="sweepHint">对全池每个账号发 1 次真实请求，确认那个账号现在真的能出结果。不传模型则按凭据阶段探测（省钱、不消耗额度）。</div>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="row" style="gap:8px; flex-wrap:wrap">
+            <label class="field" style="margin:0; min-width:300px">
+              <span>测试模型（可选，留空=只验凭据）</span>
+              <input type="text" id="sweepModel" class="mono" list="sweepModelList" placeholder="cline-free/kimi-k3" />
+            </label>
+            <datalist id="sweepModelList"></datalist>
+            <label class="row xs muted" style="gap:5px; margin:0; cursor:pointer" title="只测未被停用的账号">
+              <input type="checkbox" id="sweepActiveOnly" checked style="width:auto; margin:0" />
+              只测可用账号
+            </label>
+            <label class="row xs muted" style="gap:5px; margin:0; cursor:pointer" title="只测当前列表里被停用或最近报错的账号">
+              <input type="checkbox" id="sweepFailedOnly" style="width:auto; margin:0" />
+              只测失败账号
+            </label>
+            <label class="field" style="margin:0; max-width:110px">
+              <span>并发</span>
+              <input type="number" id="sweepConcurrency" min="1" max="24" value="6" />
+            </label>
+            <button class="btn primary" id="sweepStart">开始全局测活</button>
+            <button class="btn small" id="sweepStop" style="display:none">中止</button>
+          </div>
+          <div style="margin-top:12px; display:none" id="sweepProgressWrap">
+            <div class="bar"><i id="sweepProgressFill" style="width:0%"></i></div>
+          </div>
+          <div class="xs muted" id="sweepStatus" style="margin-top:8px; white-space:pre-wrap">—</div>
+          <div class="xs err" id="sweepFailures" style="margin-top:6px; white-space:pre-wrap"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
         <div class="card-head">
           <h2>账号列表</h2>
           <div class="row">
@@ -714,6 +791,37 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
               <button class="btn small" id="keySelect">全选</button>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <h2>限流</h2>
+            <div class="hint">只作用于模型调用接口（<span class="mono">/v1/chat/completions</span>、<span class="mono">/v1/responses</span>、<span class="mono">/v1/messages</span>）。密钥超过每分钟上限会立刻返回 429，方便客户端换密钥；全站超过上限则先等待约 10 秒，仍无空位才拒绝。</div>
+          </div>
+          <div class="row" style="gap:8px">
+            <span class="xs muted" id="rlEnabledLabel">—</span>
+            <button class="btn small" id="rlReset">清零计数</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="row" style="gap:12px; flex-wrap:wrap; align-items:flex-end">
+            <label class="field" style="margin:0; max-width:150px">
+              <span>全站 / 分钟</span>
+              <input type="number" id="rlGlobal" min="1" />
+            </label>
+            <label class="field" style="margin:0; max-width:150px">
+              <span>每个密钥 / 分钟</span>
+              <input type="number" id="rlKey" min="1" />
+            </label>
+            <label class="row xs" style="gap:5px; margin:0 0 6px; cursor:pointer">
+              <input type="checkbox" id="rlEnabled" style="width:auto; margin:0" />
+              启用限流
+            </label>
+            <button class="btn primary" id="rlSave" style="margin-bottom:2px">保存</button>
+          </div>
+          <div class="xs muted" id="rlUsage" style="margin-top:10px">—</div>
         </div>
       </div>
 
@@ -954,10 +1062,10 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (name === "models") loadModels();
     if (name === "play") loadPlayModels();
     if (name === "logs") loadLogs();
-    if (name === "accounts") { loadAccounts(); loadModels(); }
+    if (name === "accounts") { loadAccounts(); loadModels(); pollSweep(); }
     if (name === "proxies") loadProxyView();
-    if (name === "keys") loadKeys();
-    if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); }
+    if (name === "keys") { loadKeys(); loadRateLimit(); }
+    if (name === "overview") { loadStatus(); loadUsage(); loadMiniLogs(); loadModelUsage(); loadFreeQuota(); }
   }
   var navButtons = document.querySelectorAll("#nav button");
   for (var i = 0; i < navButtons.length; i++) {
@@ -1242,18 +1350,335 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     });
   }
 
+  /* ---------- pool-wide liveness sweep ---------- */
   /**
-   * Pool-wide headline counters for the overview stat cards.
+   * Drive the server-side sweep.
    *
-   * Separate from the per-row loop above on purpose: the rows only cover the
-   * page in view (each extra row costs three upstream calls), while these
-   * counters roll up the in-memory cache across the whole pool. The hint names
-   * the coverage — "based on 281/287" — because a cold cache means fewer rows
-   * contribute, and printing a partial sum as a total would be a quiet lie.
+   * The work happens server-side (a pool of hundreds takes minutes and must
+   * survive navigation), so this polls for progress rather than running the
+   * requests itself. Polling stops as soon as the sweep reports it is done.
    */
-  function renderPoolSummary() {
-    renderPoolSummaryAsync().catch(function () { /* hint already set */ });
+  var sweepTimer = null;
+
+  function sweepModelOptions() {
+    var list = $("sweepModelList");
+    clear(list);
+    // Free-bucket models first: a sweep is one real request per account, and
+    // free ones cost nothing — the cheapest way to answer "does this work".
+    var free = [], pass = [], rest = [];
+    (catalog || []).forEach(function (m) {
+      if (m.bucket === "free") free.push(m.id);
+      else if (m.bucket === "pass") pass.push(m.id);
+      else rest.push(m.id);
+    });
+    free.concat(pass, rest).forEach(function (id) {
+      var opt = document.createElement("option");
+      opt.value = id;
+      list.appendChild(opt);
+    });
   }
+
+  function renderSweep(sweep) {
+    var running = sweep && sweep.running;
+    $("sweepStart").disabled = running;
+    $("sweepStop").style.display = running ? "inline-block" : "none";
+    var wrap = $("sweepProgressWrap");
+    var status = $("sweepStatus");
+    var failures = $("sweepFailures");
+
+    if (!sweep) {
+      wrap.style.display = "none";
+      status.textContent = assignedModelHint();
+      failures.textContent = "";
+      return;
+    }
+
+    wrap.style.display = "block";
+    var pct = sweep.total ? Math.round(100 * sweep.done / sweep.total) : 100;
+    $("sweepProgressFill").style.width = pct + "%";
+    $("sweepProgressFill").parentNode.className = "bar" + (sweep.failed ? " warn" : "");
+
+    var secs = Math.round(((sweep.finishedAt || Date.now()) - sweep.startedAt) / 1000);
+    status.className = "xs " + (sweep.failed ? "warn" : (running ? "muted" : "ok"));
+    status.textContent = (running ? "进行中 " : (sweep.cancelled ? "已中止 " : "完成 ")) +
+      sweep.done + "/" + sweep.total + " · 通过 " + sweep.ok + " · 失败 " + sweep.failed +
+      " · 用时 " + secs + "s" +
+      (sweep.model ? " · 模型 " + sweep.model : " · 仅验凭据");
+
+    failures.textContent = sweep.failures && sweep.failures.length
+      ? "失败（最多列 50 个）：\n" + sweep.failures.map(function (f) {
+          return "  " + (f.email || f.id) + " — " + summarize(f.error, 80);
+        }).join("\n")
+      : "";
+  }
+
+  function assignedModelHint() {
+    return "模型留空 = 只验证凭据（不消耗额度）；填模型 = 每个账号发 1 次真实请求。";
+  }
+
+  function pollSweep() {
+    api("/admin/api/sweep").then(function (data) {
+      renderSweep(data.sweep);
+      if (data.sweep && data.sweep.running) {
+        sweepTimer = setTimeout(pollSweep, 2000);
+      } else {
+        sweepTimer = null;
+        // The sweep is what flips accounts between disabled and active.
+        loadAccounts();
+        loadStatus();
+      }
+    }).catch(function (e) {
+      $("sweepStatus").textContent = "测活状态读取失败：" + e.message;
+      sweepTimer = null;
+    });
+  }
+
+  function startSweep() {
+    var model = $("sweepModel").value.trim();
+    var payload = {
+      activeOnly: $("sweepActiveOnly").checked,
+      failedOnly: $("sweepFailedOnly").checked,
+      concurrency: Number($("sweepConcurrency").value) || 6,
+    };
+    if (model) payload.model = model;
+    if (model && !confirm("将用 " + model + " 对选中范围内的每个账号发 1 次真实请求，继续？")) return;
+    jsonApi("/admin/api/sweep", payload).then(function (data) {
+      if (!data.started) toast("已有一个测活在运行，正在显示它的进度", "err");
+      else toast("测活已开始", "ok");
+      renderSweep(data.sweep);
+      if (sweepTimer) clearTimeout(sweepTimer);
+      sweepTimer = setTimeout(pollSweep, 800);
+    }).catch(function (e) { toast("启动失败：" + e.message, "err"); });
+  }
+
+  /* ---------- rate limit ---------- */
+  function renderRateLimit(data) {
+    var s = data.settings || {};
+    $("rlGlobal").value = s.globalPerMinute || "";
+    $("rlKey").value = s.keyPerMinute || "";
+    $("rlEnabled").checked = s.enabled !== false;
+    $("rlUsage").textContent = "当前窗口：全站 " + (data.globalUsed || 0) +
+      " 次 · " + (data.keys || 0) + " 个密钥有请求";
+    $("rlEnabledLabel").textContent = s.enabled === false ? "已关闭（不限流）" : "已启用";
+  }
+
+  function loadRateLimit() {
+    api("/admin/api/rate-limit").then(renderRateLimit).catch(function (e) {
+      $("rlUsage").textContent = "读取失败：" + e.message;
+    });
+  }
+
+  function saveRateLimit() {
+    var payload = {
+      enabled: $("rlEnabled").checked,
+      globalPerMinute: Number($("rlGlobal").value),
+      keyPerMinute: Number($("rlKey").value),
+    };
+    jsonApi("/admin/api/rate-limit", payload, "PATCH").then(function (data) {
+      renderRateLimit(data);
+      toast("限流设置已保存", "ok");
+    }).catch(function (e) { toast("保存失败：" + e.message, "err"); });
+  }
+
+  /**
+   * Per-model usage over the same window as the account table.
+   *
+   * Reads the pool-wide rollup rather than the page rows, so the table is not
+   * tied to which page of accounts happens to be open. Coverage is shown for
+   * the same reason as the headline: only accounts read recently contribute.
+   */
+  function renderModelUsage(data) {
+    var body = $("modelUsageBody");
+    clear(body);
+    var models = data.models || [];
+    var rate = data.covered && data.total
+      ? (data.covered >= data.total ? "全池 " + data.total + " 个账号"
+        : "已统计 " + data.covered + "/" + data.total + " 个账号")
+      : "尚无数据";
+    $("modelUsageHint").textContent = windowLabel() + " · " + rate +
+      (models.length ? " · " + models.length + " 个模型" : "");
+
+    if (!models.length) {
+      body.className = "";
+      body.appendChild(el("div", "muted sm", "窗口内没有带模型信息的用量记录。"));
+      return;
+    }
+    body.className = "tight";
+
+    var table = el("table");
+    var thead = el("thead");
+    var htr = el("tr");
+    ["模型", "渠道", "请求", "Token", "缓存命中", "费用"].forEach(function (t, i) {
+      htr.appendChild(el("th", i >= 2 ? "nowrap num" : "nowrap", t));
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    var tbody = el("tbody");
+    models.forEach(function (m) {
+      var tr = el("tr");
+
+      var td1 = el("td");
+      td1.appendChild(el("div", "mono sm", m.id));
+      tr.appendChild(td1);
+
+      var td2 = el("td", "nowrap");
+      var bucket = m.bucket || "";
+      var kind = bucket === "cline-free" ? "free"
+        : (bucket === "cline-pass" ? "pass" : "warn");
+      td2.appendChild(el("span", "badge " + kind, bucket || "未知"));
+      tr.appendChild(td2);
+
+      tr.appendChild(el("td", "nowrap num sm", m.requests));
+
+      var td4 = el("td", "nowrap num sm");
+      td4.appendChild(el("div", null, fmtTok(m.totalTokens)));
+      td4.appendChild(el("div", "xs faint",
+        "入 " + fmtTok(m.promptTokens) + " / 出 " + fmtTok(m.completionTokens)));
+      tr.appendChild(td4);
+
+      // Cache hit rate is the number this table exists for: it is what tells
+      // apart a model whose prefix cache is working from one paying full price.
+      var td5 = el("td", "nowrap num sm");
+      var pct = m.promptTokens ? Math.round(100 * m.cachedTokens / m.promptTokens) : 0;
+      var cls = "sm " + (pct >= 50 ? "ok" : (pct > 0 ? "warn" : "faint"));
+      td5.appendChild(el("div", cls, m.cachedTokens ? (pct + "%") : "—"));
+      if (m.cachedTokens) td5.appendChild(el("div", "xs faint", fmtTok(m.cachedTokens)));
+      tr.appendChild(td5);
+
+      var td6 = el("td", "nowrap num sm");
+      if (m.costUsd) td6.textContent = fmtCost(m.costUsd);
+      else td6.appendChild(el("span", "faint", "免费/订阅"));
+      tr.appendChild(td6);
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    body.appendChild(table);
+  }
+
+  function loadModelUsage() {
+    var q = windowQuery("");
+    api("/admin/api/usage/by-model" + (q ? "?" + q : "")).then(function (data) {
+      renderModelUsage(data);
+    }).catch(function (e) {
+      var body = $("modelUsageBody");
+      clear(body);
+      body.className = "";
+      body.appendChild(el("div", "err sm", "模型用量读取失败：" + e.message));
+    });
+  }
+
+  /* ---------- free quota ---------- */
+  /**
+   * Free-tier quota signals.
+   *
+   * Upstream has no "remaining quota" endpoint, so the table shows what is
+   * observable: a request in real traffic that hit the free limit today, or a
+   * probe result. "未探测" is a real answer, not a failure — it means nothing
+   * has asked upstream about this account yet.
+   */
+  var freeQuotaRows = [];
+  function loadFreeQuota() {
+    api("/admin/api/free-quota").then(function (data) {
+      freeQuotaRows = data.accounts || [];
+      if (!$("freeProbeModel").value) $("freeProbeModel").value = data.probeModel || "";
+      renderFreeQuota();
+    }).catch(function (e) {
+      var body = $("freeQuotaBody");
+      clear(body);
+      var tr = el("tr");
+      var td = el("td", "empty err sm", "免费额度读取失败：" + e.message);
+      td.colSpan = 4;
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  function renderFreeQuota() {
+    var body = $("freeQuotaBody");
+    clear(body);
+    if (!freeQuotaRows.length) {
+      var tr0 = el("tr");
+      var td0 = el("td", "empty sm", "还没有账号。");
+      td0.colSpan = 4;
+      tr0.appendChild(td0);
+      body.appendChild(tr0);
+      return;
+    }
+    freeQuotaRows.forEach(function (row) {
+      var tr = el("tr");
+      var sig = row.signal;
+
+      var td1 = el("td");
+      td1.appendChild(el("div", null, row.email || row.id));
+      if (row.disabled) td1.appendChild(el("div", "xs faint", "已停用"));
+      tr.appendChild(td1);
+
+      var td2 = el("td", "nowrap");
+      if (sig && sig.state === "exhausted") td2.appendChild(el("span", "badge err", "今日已耗尽"));
+      else if (sig && sig.state === "ok") td2.appendChild(el("span", "badge pass", "尚有额度"));
+      else td2.appendChild(el("span", "badge warn", "未探测"));
+      tr.appendChild(td2);
+
+      var td3 = el("td", "nowrap xs faint");
+      if (sig) td3.textContent = (sig.probed ? "探测" : "真实请求") + " · " + fmtAgo(sig.at);
+      else td3.textContent = "—";
+      tr.appendChild(td3);
+
+      var td4 = el("td", "xs");
+      if (sig && sig.reason) {
+        td4.appendChild(el("div", sig.state === "exhausted" ? "xs warn" : "xs faint",
+          summarize(sig.reason, 70)));
+      }
+      if (sig && sig.model) td4.appendChild(el("div", "xs faint mono", sig.model));
+      if (!sig) td4.appendChild(el("span", "faint", "尚无信号"));
+      tr.appendChild(td4);
+
+      body.appendChild(tr);
+    });
+  }
+
+  /**
+   * Probe one account, then refresh just that row.
+   *
+   * Sequential by design for the batch paths: each probe is a real upstream
+   * request on one pinned account, so firing a pool-wide sweep in parallel
+   * would spike the very quota being measured.
+   */
+  function probeFreeQuota(accountId) {
+    var model = $("freeProbeModel").value.trim();
+    return jsonApi("/admin/api/accounts/" + encodeURIComponent(accountId) + "/free-quota",
+      model ? { model: model } : {}).then(function (result) {
+      return result;
+    });
+  }
+
+  function runFreeProbe(ids, label) {
+    if (!ids.length) { toast("没有可探测的账号", "err"); return; }
+    if (!confirm("将对 " + ids.length + " 个账号各发 1 次真实请求（" + label + "），继续？")) return;
+    var status = $("freeProbeStatus");
+    var done = 0, ok = 0, exhausted = 0, failed = 0;
+    status.textContent = "0/" + ids.length + " …";
+    (function step(i) {
+      if (i >= ids.length) {
+        status.textContent = ids.length + " 个：可用 " + ok + " · 已耗尽 " + exhausted + " · 失败 " + failed;
+        toast("探测完成", "ok");
+        loadFreeQuota();
+        return;
+      }
+      probeFreeQuota(ids[i]).then(function (r) {
+        if (r.outcome === "ok") ok++;
+        else if (r.outcome === "exhausted") exhausted++;
+        else failed++;
+      }).catch(function () { failed++; }).then(function () {
+        done++;
+        status.textContent = done + "/" + ids.length + " …";
+        step(i + 1);
+      });
+    })(0);
+  }
+
 
   function renderPoolSummaryData(data) {
     var t = data.totals || {};
@@ -1276,7 +1701,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   function scheduleSummaryPoll(data) {
     if (summaryPoll) { clearTimeout(summaryPoll); summaryPoll = null; }
     if (!data || !data.refreshing || data.covered >= data.total) return;
-    summaryPoll = setTimeout(function () { renderPoolSummary(); }, 4000);
+    summaryPoll = setTimeout(function () { renderPoolSummaryAsync().catch(function () {}); }, 4000);
   }
 
   function loadUsage(force, page) {
@@ -1384,6 +1809,9 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       $("sFree").textContent = data.counts.free;
       renderChips(data.counts);
       renderModels();
+      // The sweep's model picker is fed from the same catalog, free bucket
+      // first, so the two never disagree about what a valid id looks like.
+      sweepModelOptions();
       $("modelsNote").textContent = "共 " + data.counts.total + " 个模型 · 订阅 " + data.counts.pass +
         " · 免费 " + data.counts.free + " · 需 Credits " + data.counts.credits +
         "。列表来自上游 /api/v1/models 与 /api/v1/ai/cline/recommended-models 的合并结果。";
@@ -2640,6 +3068,18 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   $("refreshAll").onclick = function () { loadStatus(); loadUsage(true); loadAccounts(); loadMiniLogs(); loadModels(true); toast("已刷新"); };
   // Forced, not cached: the button exists precisely to re-read upstream now.
   $("usageReload").onclick = function () { loadUsage(true); };
+  $("modelUsageReload").onclick = function () { loadModelUsage(); toast("已刷新模型用量"); };
+  $("freeQuotaReload").onclick = function () { loadFreeQuota(); toast("已刷新免费额度"); };
+  $("freeProbeSelected").onclick = function () {
+    var ids = Object.keys(selectedIds).filter(function (id) { return selectedIds[id]; });
+    runFreeProbe(ids, "选中账号");
+  };
+  $("freeProbeExhausted").onclick = function () {
+    var ids = freeQuotaRows
+      .filter(function (row) { return row.signal && row.signal.state === "exhausted"; })
+      .map(function (row) { return row.id; });
+    runFreeProbe(ids, "标记为已耗尽的账号");
+  };
 
   /* ---------- window + account filter controls ---------- */
   function syncWindowControls() {
@@ -2718,6 +3158,24 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   $("proxySubmit").onclick = submitProxy;
   $("proxyReload").onclick = function () { loadProxyView(); toast("已刷新代理列表"); };
 
+  $("rlSave").onclick = saveRateLimit;
+  $("rlReset").onclick = function () {
+    if (!confirm("清零当前限流计数？只影响这一分钟的历史，不改设置。")) return;
+    api("/admin/api/rate-limit/reset", { method: "POST" }).then(function (data) {
+      renderRateLimit(data);
+      toast("计数已清零", "ok");
+    }).catch(function (e) { toast("清零失败：" + e.message, "err"); });
+  };
+
+  $("sweepStart").onclick = startSweep;
+  $("sweepStop").onclick = function () {
+    if (!confirm("中止正在运行的测活？已完成的判定会保留。")) return;
+    api("/admin/api/sweep/cancel", { method: "POST" }).then(function (data) {
+      renderSweep(data.sweep);
+      toast("已请求中止", "ok");
+    }).catch(function (e) { toast("中止失败：" + e.message, "err"); });
+  };
+
   $("keyAddBtn").onclick = function () {
     $("keyFormPanel").style.display = "block";
     $("keyResult").style.display = "none";
@@ -2736,6 +3194,8 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
   loadStatus();
   loadUsage();
   loadMiniLogs();
+  loadModelUsage();
+  loadFreeQuota();
   syncLogTimer();
 })();
 </script>
