@@ -3,6 +3,8 @@ import type { Context, Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import type { LoginMode, LoginService } from "../services/loginService.js";
 import { extractBearer, safeEqual } from "./http.js";
+import { readCookie, type AdminAuth } from "../services/adminAuth.js";
+import { AdminSettingsError, type AdminSettings } from "../services/adminSettings.js";
 import type { CredentialSaveInput } from "../store.js";
 import type { StoredAccount } from "../cline/types.js";
 import { ADMIN_PAGE } from "../webui/page.js";
@@ -13,11 +15,14 @@ import { probeFreeQuota, DEFAULT_FREE_PROBE_MODEL } from "../services/freeQuotaP
 import type { FreeQuotaStore } from "../services/freeQuota.js";
 import type { RateLimiter } from "../services/rateLimit.js";
 import type { SweepRunner } from "../services/sweep.js";
+import type { UsageLedger } from "../services/usageLedger.js";
 import { fetchSubscription, type SubscriptionInfo } from "../cline/subscription.js";
 import { fetchUsageLimits, type UsageWindow } from "../cline/usage.js";
-import { fetchAccountCredits, bucketUsage, bucketUsageByModel, resolveWindow, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageRecord, type UsageWindowRequest } from "../cline/credits.js";
-import { ProxyStore, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
+import { fetchAccountCredits, bucketUsage, bucketUsageByModel, resolveWindow, COST_UNITS_PER_USD, type AccountCredits, type ModelUsage, type ResolvedWindow, type UsageRecord, type UsageWindowRequest } from "../cline/credits.js";
+import { ProxyStore, isProxyMode, isProxyPriority, parseProxyUrl, redactProxyUrl } from "../services/proxyStore.js";
+import { probeProxyExit, probeProxyCline } from "../services/proxyExit.js";
 import type { ProxyResolver } from "../cline/proxy.js";
+import type { CapabilityIndex } from "../services/accountCapabilities.js";
 
 export interface AdminRouteDeps extends OpenAIRouteDeps {
   login: LoginService;
@@ -26,10 +31,20 @@ export interface AdminRouteDeps extends OpenAIRouteDeps {
   resolver: ProxyResolver;
   /** Free-tier quota signals: what traffic hit, plus on-demand probe results. */
   freeQuota: FreeQuotaStore;
+  /** Which accounts hold which plan, for routing Pass-only models. */
+  capabilities: CapabilityIndex;
   /** Live rate-limit settings and counters. */
   rateLimit: RateLimiter;
   /** Pool-wide liveness sweep, running server-side. */
   sweep: SweepRunner;
+  /** Token counts of traffic this gateway served, written as it happens. */
+  usageLedger: UsageLedger;
+  /** Username/password sessions for the console. */
+  adminAuth: AdminAuth;
+  /** Password and admin-token changes made from the settings page. */
+  adminSettings: AdminSettings;
+  /** The live admin token, which the settings page can rotate at runtime. */
+  getAdminToken: () => string | null;
 }
 
 function remoteAddress(c: Context): string | undefined {
@@ -74,12 +89,37 @@ function isLoopback(c: Context): boolean {
   return remote === undefined || isLoopbackAddress(remote);
 }
 
+const SESSION_COOKIE = "cline2api_session";
+
+/**
+ * A request is an admin when any one of these holds:
+ * - a live console session cookie, from a username/password login;
+ * - a Bearer `ADMIN_TOKEN`, which the registrar and scripts use;
+ * - the process is on loopback and no `ADMIN_TOKEN` is configured at all.
+ *
+ * The `?token=` query form is intentionally gone: it is what leaked the token
+ * into URLs, browser history, and `Referer`, and it is what the console lost
+ * on every navigation.
+ */
 function isAdminAuthorized(c: Context, deps: AdminRouteDeps): boolean {
-  const token = deps.config.adminToken;
+  const session = readCookie(c.req.header("cookie"), SESSION_COOKIE);
+  if (deps.adminAuth.authenticate(session)) return true;
+  const token = deps.getAdminToken();
   if (!token) return isLoopback(c);
-  const provided =
-    extractBearer(c.req.header("authorization")) ?? c.req.query("token") ?? null;
+  const provided = extractBearer(c.req.header("authorization"));
   return provided !== null && safeEqual(provided, token);
+}
+
+function sessionCookie(token: string, maxAgeSeconds: number, secure: boolean): string {
+  const parts = [
+    `${SESSION_COOKIE}=${token}`,
+    "HttpOnly",
+    "Path=/",
+    "SameSite=Lax",
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
 }
 
 /**
@@ -389,6 +429,14 @@ interface PoolCreditSummary {
     costUsd: number;
     balanceMicroUsd: number;
     balanceKnown: number;
+    /** Credits drawn from balances over the window, micro-USD. */
+    creditsUsedMicroUsd: number;
+    /** Accounts in the window that actually drew on a balance. */
+    creditsUsedKnown: number;
+    /** Accounts with a positive remaining balance. */
+    balancePositive: number;
+    /** Accounts at or below zero — they cannot serve paid models. */
+    balanceNegative: number;
   };
   /** Accounts whose cached rows contributed to this summary. */
   covered: number;
@@ -408,6 +456,19 @@ function summarizeCreditsPool(deps: AdminRouteDeps, options: { window?: UsageWin
     costUsd: 0,
     balanceMicroUsd: 0,
     balanceKnown: 0,
+    /**
+     * Credits drawn from balances over the window, micro-USD.
+     *
+     * Separate from `balanceMicroUsd`, which is the *remaining* balance and is
+     * a snapshot rather than a window sum: the two measure different things and
+     * adding them together would be meaningless. Zero across a free-tier or
+     * Pass pool, where traffic bills to the subscription instead.
+     */
+    creditsUsedMicroUsd: 0,
+    /** Accounts in the window that actually drew on a balance. */
+    creditsUsedKnown: 0,
+    balancePositive: 0,
+    balanceNegative: 0,
   };
   let covered = 0;
   const ids = new Set(deps.store.list().map((account) => account.id));
@@ -423,9 +484,13 @@ function summarizeCreditsPool(deps: AdminRouteDeps, options: { window?: UsageWin
     totals.cachedTokens += window.cachedTokens;
     totals.totalTokens += window.totalTokens;
     totals.costUsd += window.costUsd;
+    totals.creditsUsedMicroUsd += window.creditsMicroUsd;
+    if (window.creditsMicroUsd > 0) totals.creditsUsedKnown += 1;
     if (entry.row.balanceMicroUsd !== null && entry.row.balanceMicroUsd !== undefined) {
       totals.balanceMicroUsd += entry.row.balanceMicroUsd;
       totals.balanceKnown += 1;
+      if (entry.row.balanceMicroUsd > 0) totals.balancePositive += 1;
+      else totals.balanceNegative += 1;
     }
   }
   return {
@@ -509,10 +574,11 @@ function validateImportAccount(
   };
 }
 export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {
-  app.get("/", (c) => {
-    if (!isAdminAuthorized(c, deps)) {
-      return c.text("Admin UI is not exposed here. Set ADMIN_TOKEN or use localhost.", 403);
-    }
+  const serveAdminPage = (c: Context) => {
+    // The page is served to everyone and gates itself: with no session it
+    // shows the login screen, and every API call behind it is still guarded.
+    // Refusing the document here is what made the login page unreachable —
+    // the only way to see it was to already be authenticated.
     // The whole UI is one inlined HTML document with no asset URL to version,
     // so without this the browser applies heuristic caching and keeps serving
     // the previous build's markup and script after a redeploy — which reads as
@@ -521,10 +587,92 @@ export function registerAdminRoutes(app: Hono, deps: AdminRouteDeps): void {
       "cache-control": "no-store, must-revalidate",
       pragma: "no-cache",
     });
-  });
+  };
+  app.get("/", serveAdminPage);
+  // Client-side routes: every front-end path serves the same shell, so the
+  // History API router can resolve /models, /console, /quota, etc. on load.
+  app.get("/models", serveAdminPage);
+  app.get("/console", serveAdminPage);
+  app.get("/accounts", serveAdminPage);
+  app.get("/quota", serveAdminPage);
+  app.get("/proxies", serveAdminPage);
+  app.get("/keys", serveAdminPage);
+  app.get("/logs", serveAdminPage);
+  app.get("/settings", serveAdminPage);
 
   const guard = (c: Context): Response | null =>
     isAdminAuthorized(c, deps) ? null : c.json({ error: "unauthorized" }, 401);
+
+  app.post("/admin/api/auth/login", async (c) => {
+    const body = await c.req.json().catch(() => null) as { username?: unknown; password?: unknown } | null;
+    const username = typeof body?.username === "string" ? body.username : "";
+    const password = typeof body?.password === "string" ? body.password : "";
+    if (!deps.adminAuth.available()) {
+      return c.json({ error: "登录未配置：找不到 grok-iq 的管理员账号" }, 503);
+    }
+    if (!deps.adminAuth.verify(username, password)) {
+      return c.json({ error: "用户名或密码错误" }, 401);
+    }
+    const session = deps.adminAuth.createSession(username.trim());
+    const secure = new URL(c.req.url).protocol === "https:";
+    c.header("set-cookie", sessionCookie(session.token, session.maxAgeSeconds, secure));
+    return c.json({ ok: true, username: username.trim() });
+  });
+
+  app.post("/admin/api/auth/logout", (c) => {
+    deps.adminAuth.revoke(readCookie(c.req.header("cookie"), SESSION_COOKIE));
+    c.header("set-cookie", `${SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
+    return c.json({ ok: true });
+  });
+
+  app.get("/admin/api/auth/status", (c) => {
+    const username = deps.adminAuth.authenticate(readCookie(c.req.header("cookie"), SESSION_COOKIE));
+    return c.json({ authenticated: username !== null, username, loginAvailable: deps.adminAuth.available() });
+  });
+
+  app.get("/admin/api/settings", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const username = deps.adminAuth.authenticate(readCookie(c.req.header("cookie"), SESSION_COOKIE));
+    return c.json({
+      username,
+      passwordManaged: deps.config.grokIqDbPath !== null,
+      token: deps.adminSettings.tokenStatus(deps.getAdminToken()),
+      tokenManaged: deps.config.envFilePath !== null,
+    });
+  });
+
+  app.post("/admin/api/settings/password", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const username = deps.adminAuth.authenticate(readCookie(c.req.header("cookie"), SESSION_COOKIE));
+    if (!username) return c.json({ error: "请先登录后再修改密码" }, 403);
+    const body = await c.req.json().catch(() => null) as { currentPassword?: unknown; newPassword?: unknown } | null;
+    const currentPassword = typeof body?.currentPassword === "string" ? body.currentPassword : "";
+    const newPassword = typeof body?.newPassword === "string" ? body.newPassword : "";
+    try {
+      deps.adminSettings.changePassword(username, currentPassword, newPassword, (u, p) => deps.adminAuth.verify(u, p));
+    } catch (error) {
+      if (error instanceof AdminSettingsError) return c.json({ error: error.message }, 400);
+      throw error;
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post("/admin/api/settings/token", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const body = await c.req.json().catch(() => null) as { token?: unknown } | null;
+    const token = typeof body?.token === "string" ? body.token : "";
+    try {
+      const status = deps.adminSettings.setToken(token);
+      deps.logger.info("admin token rotated from the settings page");
+      return c.json({ ok: true, token: status });
+    } catch (error) {
+      if (error instanceof AdminSettingsError) return c.json({ error: error.message }, 400);
+      throw error;
+    }
+  });
 
   /**
    * Window selection for the credits routes.
@@ -927,16 +1075,27 @@ app.get("/admin/api/accounts", (c) => {
     const resolved = resolveWindow(windowQuery(c));
     const now = Date.now();
     const ids = new Set(deps.store.list().map((account) => account.id));
-    const records: UsageRecord[] = [];
-    let covered = 0;
-    for (const entry of creditsCache.values()) {
-      if (now - entry.at >= CREDITS_CACHE_TTL_MS) continue;
-      if (!ids.has(entry.row.id)) continue;
-      if (entry.row.windowMs !== resolved.windowMs) continue;
-      if (entry.row.snappedToDay !== resolved.snappedToDay) continue;
-      covered += 1;
-      records.push(...entry.records);
-    }
+    // The charts read what this gateway itself served. That is already on
+    // disk, so there is nothing to fetch and nothing to wait for — unlike the
+    // per-account sweep, which asks upstream and takes minutes.
+    const served = deps.usageLedger.range(resolved.since, resolved.until);
+    const records: UsageRecord[] = served.map((entry) => ({
+      id: "",
+      at: entry.at,
+      model: entry.model,
+      operation: null,
+      provider: null,
+      promptTokens: entry.promptTokens,
+      completionTokens: entry.completionTokens,
+      totalTokens: entry.totalTokens,
+      cachedTokens: entry.cachedTokens,
+      // Market cost captured at serve time, in the ledger's USD; the bucket
+      // field wants 1e-8-USD units (costUsd), so scale. Entries that predate
+      // cost capture have no costUsd and stay 0 rather than inventing a value.
+      costMicroUsd: Math.round((entry.costUsd ?? 0) * COST_UNITS_PER_USD),
+      creditsUsed: 0,
+    }));
+    const covered = new Set(served.map((entry) => entry.accountId).filter((id) => id !== null)).size;
     const buckets = bucketUsage(records, resolved);
     // The same records, bucketed per model too: the two charts then share one
     // set of bucket boundaries and can be read against each other.
@@ -1030,8 +1189,17 @@ app.get("/admin/api/accounts", (c) => {
   app.get("/admin/api/free-quota", (c) => {
     const denied = guard(c);
     if (denied) return denied;
+    const window = windowQuery(c);
     const accounts = deps.store.list();
     const signals = deps.freeQuota.snapshot(accounts.map((account) => account.id));
+    // The fullness meters read the same cache the usage table does, so on a
+    // cold cache every account would draw at zero. `refresh=1` starts the same
+    // pool sweep the usage page uses; without it the table still repaints from
+    // whatever the cache holds. The sweep is a background job either way, so
+    // the response below is what is known *now* — `refreshing` says a fuller
+    // answer is coming and `covered` says how many accounts the meters stand on.
+    const refresh = c.req.query("refresh") === "1";
+    const sweep = refresh ? sweepCreditsPool(deps, { window }) : { started: false };
     return c.json({
       accounts: accounts.map((account) => ({
         id: account.id,
@@ -1047,6 +1215,10 @@ app.get("/admin/api/accounts", (c) => {
       probeModel: DEFAULT_FREE_PROBE_MODEL,
       /** Free-tier ceiling per account per model, for the fullness bars. */
       freeLimitPerModel: deps.config.freeLimitTokensPerModel,
+      /** True while a sweep is still filling the cache. */
+      refreshing: sweep.started || poolSweeps.has(sweepKey(resolveWindow(window))),
+      /** Accounts whose cached row contributed a meter above. */
+      covered: accounts.reduce((n, account) => n + (creditsCache.has(account.id) ? 1 : 0), 0),
       checkedAt: Date.now(),
     });
   });
@@ -1083,6 +1255,37 @@ app.get("/admin/api/accounts", (c) => {
       { model },
     );
     return c.json(result);
+  });
+
+  /**
+   * Which accounts hold which plan, and the sweep that finds out.
+   *
+   * `POST` starts a pool-wide plan read. It is a per-account upstream call, so
+   * it is on demand rather than on page load — the same reasoning as the free
+   * quota probe. `GET` reports what is known so far and whether a sweep is
+   * still running, so the UI can poll instead of blocking on a job that takes
+   * minutes on a pool this size.
+   */
+  app.get("/admin/api/capabilities", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const stats = deps.capabilities.stats();
+    return c.json({
+      ...stats,
+      total: deps.store.count(),
+      sweeping: deps.capabilities.sweeping(),
+    });
+  });
+
+  app.post("/admin/api/capabilities/sweep", (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const sweep = deps.capabilities.sweep();
+    return c.json({
+      started: sweep.started,
+      accounts: sweep.accounts,
+      ...deps.capabilities.stats(),
+    });
   });
 
   /**
@@ -1222,31 +1425,263 @@ app.get("/admin/api/accounts", (c) => {
     const denied = guard(c);
     if (denied) return denied;
     const accounts = deps.store.list();
+    const all = deps.proxies.list().map((proxy) => ({
+      id: proxy.id,
+      label: proxy.label,
+      url: redactProxyUrl(proxy.url),
+      enabled: proxy.enabled,
+      createdAt: proxy.createdAt,
+      updatedAt: proxy.updatedAt,
+      lastError: proxy.lastError,
+      exitIp: proxy.exitIp,
+      exitIpCheckedAt: proxy.exitIpCheckedAt,
+      priority: proxy.priority,
+      usedBy: accounts.filter((account) => account.proxyId === proxy.id).length,
+    }));
+
+    // A rotating pool runs to hundreds of entries, so the list view pages
+    // rather than rendering all of them. Omitting `limit` still returns
+    // everything: the account view builds its proxy dropdown from this same
+    // endpoint and needs the complete set, not the first page of it.
+    const limitRaw = Number(c.req.query("limit"));
+    const offsetRaw = Number(c.req.query("offset"));
+    const query = (c.req.query("q") ?? "").trim().toLowerCase();
+    const filtered = query.length === 0
+      ? all
+      : all.filter((proxy) =>
+          `${proxy.label ?? ""} ${proxy.url} ${proxy.exitIp ?? ""}`.toLowerCase().includes(query));
+    const total = filtered.length;
+    const hasWindow = Number.isFinite(limitRaw) && limitRaw > 0;
+    const limit = hasWindow ? Math.min(Math.floor(limitRaw), 500) : total;
+    const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.floor(offsetRaw) : 0;
+    const page = filtered.slice(offset, offset + limit);
+
     return c.json({
-      proxies: deps.proxies.list().map((proxy) => ({
-        id: proxy.id,
-        label: proxy.label,
-        url: redactProxyUrl(proxy.url),
-        enabled: proxy.enabled,
-        createdAt: proxy.createdAt,
-        updatedAt: proxy.updatedAt,
-        lastError: proxy.lastError,
-        usedBy: accounts.filter((account) => account.proxyId === proxy.id).length,
-      })),
+      proxies: page,
+      total,
+      offset,
+      limit,
+      mode: deps.proxies.getMode(),
+      /** Enabled count across the whole pool, not just this page. */
+      enabledTotal: all.filter((proxy) => proxy.enabled).length,
     });
+  });
+
+  /**
+   * Add many proxies in one request.
+   *
+   * The registrar writes a list of hundreds at a time; one HTTP call per proxy
+   * would make that a seconds-long loop and leave a half-imported pool behind if
+   * it failed midway. Duplicates are reported rather than rejected, because the
+   * common case is re-importing a list that overlaps the existing pool.
+   */
+  app.post("/admin/api/proxies/bulk", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+
+    let body: { urls?: unknown; label?: unknown; enabled?: unknown; priority?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    const raw = typeof body.urls === "string" ? body.urls.split("\n") : body.urls;
+    if (!Array.isArray(raw)) return c.json({ error: "`urls` must be an array or newline-separated string" }, 400);
+    if (raw.length > 5000) return c.json({ error: "too many urls in one request (max 5000)" }, 400);
+    if (body.priority !== undefined && !isProxyPriority(body.priority)) {
+      return c.json({ error: "`priority` must be a non-negative integer" }, 400);
+    }
+
+    const existing = new Set(deps.proxies.list().map((proxy) => proxy.url));
+    const labelPrefix = typeof body.label === "string" ? body.label.trim() : "";
+    let added = 0;
+    let duplicate = 0;
+    const invalid: string[] = [];
+
+    for (const entry of raw) {
+      if (typeof entry !== "string") continue;
+      const line = entry.trim();
+      if (line.length === 0 || line.startsWith("#")) continue;
+      const parsed = parseProxyUrl(line);
+      if ("error" in parsed) {
+        if (invalid.length < 10) invalid.push(`${line.slice(0, 60)}: ${parsed.error}`);
+        continue;
+      }
+      if (existing.has(parsed.url)) {
+        duplicate += 1;
+        continue;
+      }
+      let label = labelPrefix.length > 0 ? labelPrefix : null;
+      try {
+        const host = new URL(parsed.url).hostname;
+        label = labelPrefix.length > 0 ? `${labelPrefix}-${host}` : host;
+      } catch {
+        // Keep the bare prefix; the URL was already validated.
+      }
+      deps.proxies.add({
+        url: parsed.url,
+        label,
+        enabled: body.enabled !== false,
+        priority: body.priority,
+      });
+      existing.add(parsed.url);
+      added += 1;
+    }
+
+    deps.logger.info("bulk proxies imported", { added, duplicate, invalid: invalid.length });
+    return c.json({ added, duplicate, invalid, total: deps.proxies.list().length });
+  });
+
+  /**
+   * Measure what address a proxy actually egresses from.
+   *
+   * Stored on the record so the list view can show it without probing on every
+   * page load — a probe per row per render would be hundreds of outbound
+   * requests each time an operator scrolled.
+   */
+  app.post("/admin/api/proxies/:id/probe", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const proxy = deps.proxies.get(c.req.param("id"));
+    if (!proxy) return c.json({ error: "unknown proxy" }, 404);
+
+    const result = await probeProxyExit(proxy.url, deps.logger);
+    if (result.ok) {
+      deps.proxies.update(proxy.id, {
+        exitIp: result.exitIp,
+        exitIpCheckedAt: Date.now(),
+        lastError: null,
+      });
+      // A clean probe is the only signal that a transport-parked exit is alive
+      // again — nothing else clears `unhealthy`, so a proxy that was pulled for
+      // "fetch failed" only returns to the pool on this path.
+      deps.resolver?.markHealthy(proxy.id);
+      return c.json({ ok: true, exitIp: result.exitIp, latencyMs: result.latencyMs });
+    }
+    deps.proxies.update(proxy.id, { lastError: result.error, exitIpCheckedAt: Date.now() });
+    return c.json({ ok: false, error: result.error });
+  });
+
+  /**
+   * Probe whether a proxy can serve a gated free model through Cline.
+   *
+   * Distinct from the exit-IP probe: that one only proves reachability, this
+   * one fires a real (free, 1-token) chat request through the proxy so the
+   * product-surface gate on `cline-free/*` is actually exercised. Borrows one
+   * live account's token; the account is chosen as the first enabled one and
+   * only its credential is used — the request still leaves through the proxy.
+   */
+  app.post("/admin/api/proxies/:id/probe-cline", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    const proxy = deps.proxies.get(c.req.param("id"));
+    if (!proxy) return c.json({ error: "unknown proxy" }, 404);
+
+    const account = deps.store.list().find((a) => !a.disabled);
+    if (!account) return c.json({ error: "no enabled account to borrow a token from" }, 503);
+
+    let authorization: string | null;
+    try {
+      authorization = await deps.tokens.getAuthorization(account.id);
+    } catch (error) {
+      return c.json({ error: `token resolution failed: ${(error as Error).message}` }, 502);
+    }
+    if (!authorization) return c.json({ error: "borrowed account needs re-login" }, 502);
+
+    const result = await probeProxyCline(proxy.url, deps.config, authorization, deps.logger);
+    deps.proxies.update(proxy.id, {
+      lastError: result.ok ? null : (result.error ?? result.detail ?? `HTTP ${result.status}`),
+    });
+    return c.json(result, result.ok ? 200 : 502);
+  });
+
+  /**
+   * Probe a batch of proxies, for filling the exit-IP column across a pool.
+   *
+   * Bounded and sequential on purpose: the pool can be hundreds of entries and
+   * each probe opens a connection through a third party, so an unbounded fan-out
+   * would be a burst of traffic at the provider for what is only a display
+   * value.
+   */
+  app.post("/admin/api/proxies/probe-batch", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    let body: { ids?: unknown; missingOnly?: unknown; limit?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    const limit = Number.isFinite(Number(body.limit)) && Number(body.limit) > 0
+      ? Math.min(Math.floor(Number(body.limit)), 100)
+      : 30;
+
+    const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === "string") : null;
+    let targets = deps.proxies.list().filter((proxy) => proxy.enabled);
+    if (ids) targets = targets.filter((proxy) => ids.includes(proxy.id));
+    else if (body.missingOnly !== false) targets = targets.filter((proxy) => proxy.exitIp === null);
+    targets = targets.slice(0, limit);
+
+    let ok = 0;
+    const failed: string[] = [];
+    for (const proxy of targets) {
+      const result = await probeProxyExit(proxy.url, deps.logger);
+      if (result.ok) {
+        deps.proxies.update(proxy.id, { exitIp: result.exitIp, exitIpCheckedAt: Date.now(), lastError: null });
+        ok += 1;
+      } else {
+        deps.proxies.update(proxy.id, { lastError: result.error, exitIpCheckedAt: Date.now() });
+        if (failed.length < 10) failed.push(`${proxy.label ?? proxy.id}: ${result.error}`);
+      }
+    }
+    const remaining = deps.proxies.list().filter((p) => p.enabled && p.exitIp === null).length;
+    return c.json({ probed: targets.length, ok, failed, remaining });
+  });
+
+  /**
+   * Choose how requests pick a proxy: pinned, sticky, or rotate.
+   *
+   * A three-way setting rather than an on/off switch because the two spread
+   * strategies solve different problems. Sticky holds one working address until
+   * it is refused, which uses each address up to its own limit and keeps
+   * connections alive; rotate spreads every request, which covers a pool that is
+   * smaller per-address headroom but larger in count. Pinned is the escape hatch
+   * that makes one account's egress reproducible.
+   */
+  app.post("/admin/api/proxies/mode", async (c) => {
+    const denied = guard(c);
+    if (denied) return denied;
+    let body: { mode?: unknown };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: "body must be valid JSON" }, 400);
+    }
+    if (!isProxyMode(body.mode)) {
+      return c.json({ error: "`mode` must be one of pinned, sticky, rotate" }, 400);
+    }
+    const mode = deps.proxies.setMode(body.mode);
+    // The resolver holds a sticky pick across requests; a mode change must not
+    // leave it held from the previous strategy.
+    deps.resolver.forgetSticky();
+    deps.logger.info("proxy mode changed", { mode });
+    return c.json({ mode });
   });
 
   app.post("/admin/api/proxies", async (c) => {
     const denied = guard(c);
     if (denied) return denied;
 
-    let body: { url?: unknown; label?: unknown; enabled?: unknown };
+    let body: { url?: unknown; label?: unknown; enabled?: unknown; priority?: unknown };
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
       return c.json({ error: "body must be valid JSON" }, 400);
     }
     if (typeof body.url !== "string") return c.json({ error: "`url` is required" }, 400);
+    if (body.priority !== undefined && !isProxyPriority(body.priority)) {
+      return c.json({ error: "`priority` must be a non-negative integer" }, 400);
+    }
 
     const parsed = parseProxyUrl(body.url);
     if ("error" in parsed) return c.json({ error: parsed.error }, 400);
@@ -1258,6 +1693,7 @@ app.get("/admin/api/accounts", (c) => {
       url: parsed.url,
       label: typeof body.label === "string" ? body.label : null,
       enabled: body.enabled !== false,
+      priority: body.priority,
     });
     deps.logger.info("proxy added", { proxyId: created.id });
     return c.json({ proxy: { ...created, url: redactProxyUrl(created.url) } }, 201);
@@ -1267,14 +1703,20 @@ app.get("/admin/api/accounts", (c) => {
     const denied = guard(c);
     if (denied) return denied;
 
-    let body: { url?: unknown; label?: unknown; enabled?: unknown };
+    let body: { url?: unknown; label?: unknown; enabled?: unknown; priority?: unknown };
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
       return c.json({ error: "body must be valid JSON" }, 400);
     }
 
-    const patch: { url?: string; label?: string | null; enabled?: boolean; lastError?: string | null } = {};
+    const patch: {
+      url?: string;
+      label?: string | null;
+      enabled?: boolean;
+      lastError?: string | null;
+      priority?: number;
+    } = {};
     if (typeof body.url === "string") {
       const parsed = parseProxyUrl(body.url);
       if ("error" in parsed) return c.json({ error: parsed.error }, 400);
@@ -1285,12 +1727,22 @@ app.get("/admin/api/accounts", (c) => {
     }
     if (body.label === null || typeof body.label === "string") patch.label = body.label;
     if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (body.priority !== undefined) {
+      if (!isProxyPriority(body.priority)) {
+        return c.json({ error: "`priority` must be a non-negative integer" }, 400);
+      }
+      patch.priority = body.priority;
+    }
     if (Object.keys(patch).length === 0) {
-      return c.json({ error: "nothing to update: pass `url`, `label` or `enabled`" }, 400);
+      return c.json({ error: "nothing to update: pass `url`, `label`, `enabled` or `priority`" }, 400);
     }
 
     const updated = deps.proxies.update(c.req.param("id"), patch);
     if (!updated) return c.json({ error: "unknown proxy" }, 404);
+    // A URL change is a fresh start: the exit that failed before is not the exit
+    // this request would take now, so any parked state from the old URL has to go
+    // with it, or the replacement would sit out of rotation for no reason.
+    if (patch.url) deps.resolver?.markHealthy(updated.id);
     return c.json({ proxy: { ...updated, url: redactProxyUrl(updated.url) } });
   });
 

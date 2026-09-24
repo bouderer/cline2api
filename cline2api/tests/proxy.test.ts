@@ -12,7 +12,11 @@ import path from "node:path";
 import test from "node:test";
 import type { AddressInfo } from "node:net";
 import { loadConfig } from "../src/config.js";
+import { createLogger } from "../src/logger.js";
+import { AccountStore } from "../src/store.js";
 import { createApp } from "../src/index.js";
+import { ProxyResolver } from "../src/cline/proxy.js";
+import { ProxyStore } from "../src/services/proxyStore.js";
 
 interface Recorded {
   url: string;
@@ -223,6 +227,8 @@ async function withGateway(
     refresh?: string;
     expires?: number;
     identity?: { email: string | null; accountId: string | null };
+    /** Extra env, for tests that need a short streaming timeout. */
+    env?: Record<string, string>;
   } = {},
 ): Promise<void> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-proxy-"));
@@ -237,6 +243,7 @@ async function withGateway(
     WORKOS_API_BASE_URL: upstream.url,
     LOG_LEVEL: "error",
     REQUEST_TIMEOUT_MS: "5000",
+    ...(options.env ?? {}),
   });
   const ctx = createApp(config);
   try {
@@ -286,6 +293,65 @@ test("streaming chat is passed through byte-for-byte with official headers", asy
     assert.equal(sent.stream_options.include_usage, true);
     assert.equal(sent.model, "mock/model-1");
   });
+});
+
+test("an upstream that dies mid-stream is reported instead of silently truncating", async () => {
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(
+      'data: {"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"half"},"finish_reason":null}]}\n\n',
+    );
+    // No finish_reason, no [DONE]: the connection just ends. A client reading
+    // this as a normal close is how a truncated answer gets mistaken for a
+    // complete one.
+    setTimeout(() => res.destroy(), 20);
+  });
+
+  await withGateway(upstream, async ({ app }) => {
+    const response = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        model: "mock/model-1",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const text = await response.text();
+    // The bytes upstream managed to send are preserved...
+    assert.match(text, /"content":"half"/);
+    // ...and the missing terminal marker is reported in its place.
+    assert.match(text, /upstream_stream_incomplete/);
+    assert.doesNotMatch(text, /\[DONE\]/);
+  });
+});
+
+test("a silent upstream stream is failed on the idle timeout", async () => {
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(": ping\n\n");
+    // Then nothing at all, forever.
+  });
+
+  await withGateway(
+    upstream,
+    async ({ app }) => {
+      const response = await app.request("/v1/chat/completions", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          model: "mock/model-1",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      const text = await response.text();
+      assert.match(text, /upstream_timeout/);
+    },
+    { env: { STREAM_IDLE_TIMEOUT_MS: "150" } },
+  );
 });
 
 test("non-streaming responses are unwrapped from a success/data envelope", async () => {
@@ -640,7 +706,11 @@ test("an account that cannot pay for the model fails over to one that can", asyn
     assert.equal(response.status, 200, "should have failed over instead of returning the 402");
     const json = (await response.json()) as { choices: Array<{ message: { content: string } }> };
     assert.equal(json.choices[0]?.message.content, "paid by acct-2");
-    assert.equal(upstream.requests.length, 2, "both accounts should have been tried");
+    // The resolver pre-probes the pool on startup, so the raw request count
+    // includes those round-trips. Only the chat-completions traffic belongs to
+    // the failover story this test is telling.
+    const chatCalls = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chatCalls.length, 2, "both accounts should have been tried");
   } finally {
     await upstream.close();
   }
@@ -762,7 +832,11 @@ test("a per-account daily quota error fails over to another account", async () =
     assert.equal(response.status, 200, "the daily-limit 429 must not be surfaced verbatim");
     const json = (await response.json()) as { choices: Array<{ message: { content: string } }> };
     assert.equal(json.choices[0]?.message.content, "served by acct-2");
-    assert.equal(upstream.requests.length, 2, "both accounts should have been tried");
+    // The resolver pre-probes the pool on startup, so the raw request count
+    // includes those round-trips. Only the chat-completions traffic belongs to
+    // the failover story this test is telling.
+    const chatCalls = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chatCalls.length, 2, "both accounts should have been tried");
   } finally {
     await upstream.close();
   }
@@ -807,5 +881,381 @@ test("unanswered parallel tool calls get replies and answers are pulled adjacent
     assert.deepEqual(shape, ["user", "assistant+calls", "tool:call_a", "tool:call_b", "user"]);
     assert.equal(seen[3]?.content, "(no tool output returned)");
     assert.equal(seen[2]?.content, "result a");
+  });
+});
+
+/**
+ * Bounds on how far one request may walk the pool.
+ *
+ * Failover is for the occasional dead account, not for a plan most of the pool
+ * lacks. Uncapped, a request for a model only a couple of accounts can serve
+ * turns into a pool-sized burst at the edge — which is what earns a 429 from
+ * Cloudflare, and what makes the next request fail the same way.
+ */
+
+test("an entitlement 403 fails over without a token refresh or a retry", async () => {
+  const upstream = await startMockUpstream();
+  // acct-1's plan does not cover the model. This arrives as a 403, the same
+  // status a revoked credential uses — so the two must be told apart by body.
+  upstream.setChatHandler((req, res) => {
+    if (String(req.headers.authorization).includes("seed-access")) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { code: "ENTITLEMENT_ERROR", message: "Error 403: the user is not subscribed to required model plan" },
+        }),
+      );
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { content: "served by acct-2" }, finish_reason: "stop" }] }));
+  });
+
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-proxy-"));
+  const expires = Date.now() + 3_600_000;
+  seedAccounts(dataDir, [
+    accountRecord("acct-1", "seed-access", "seed-refresh", expires),
+    accountRecord("acct-2", "second-access", "second-refresh", expires),
+  ]);
+  const config = loadConfig({
+    DATA_DIR: dataDir,
+    PROXY_API_KEY: "test-key",
+    CLINE_API_BASE_URL: upstream.url,
+    WORKOS_API_BASE_URL: upstream.url,
+    LOG_LEVEL: "error",
+    REQUEST_TIMEOUT_MS: "5000",
+  });
+  const { app } = createApp(config);
+
+  try {
+    const response = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "cline-pass/ent-test", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200);
+    const json = (await response.json()) as { choices: Array<{ message: { content: string } }> };
+    assert.equal(json.choices[0]?.message.content, "served by acct-2");
+
+    // Exactly one chat call each, and no refresh: the old code treated the 403
+    // as a credential failure, so it rotated the token and asked acct-1 again
+    // before moving on — two extra upstream calls per unentitled account.
+    const chats = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chats.length, 2, `expected one call per account, got ${chats.length}`);
+    assert.equal(
+      upstream.requests.filter((r) => r.url === "/api/v1/auth/refresh").length,
+      0,
+      "an entitlement failure is not a credential failure; it must not refresh",
+    );
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("a known-unentitled account is skipped on later requests", async () => {
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((req, res) => {
+    if (String(req.headers.authorization).includes("seed-access")) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { code: "ENTITLEMENT_ERROR", message: "Error 403: the user is not subscribed to required model plan" },
+        }),
+      );
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }));
+  });
+
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-proxy-"));
+  const expires = Date.now() + 3_600_000;
+  seedAccounts(dataDir, [
+    accountRecord("skip-1", "seed-access", "seed-refresh", expires),
+    accountRecord("skip-2", "second-access", "second-refresh", expires),
+  ]);
+  const config = loadConfig({
+    DATA_DIR: dataDir,
+    PROXY_API_KEY: "test-key",
+    CLINE_API_BASE_URL: upstream.url,
+    WORKOS_API_BASE_URL: upstream.url,
+    LOG_LEVEL: "error",
+    REQUEST_TIMEOUT_MS: "5000",
+  });
+  const { app } = createApp(config);
+
+  // Its own model name: the entitlement map is module-level and outlives a
+  // test, so sharing a model with another test would inherit its verdict.
+  const send = () =>
+    app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "cline-pass/skip-test", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+  try {
+    assert.equal((await send()).status, 200);
+    const afterFirst = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions").length;
+    assert.equal(afterFirst, 2);
+
+    // The second request must not re-ask the account already known to lack the
+    // plan: an entitlement does not change by waiting, so the call cannot
+    // succeed and only adds traffic.
+    assert.equal((await send()).status, 200);
+    const chats = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chats.length, 3, `expected acct-1 to be skipped, got ${chats.length} calls`);
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("a provider-wide 429 stops the walk instead of failing over the whole pool", async () => {
+  const upstream = await startMockUpstream();
+  // Cloudflare's shape: an HTML 429 with no error code in it. Nothing here says
+  // which account is at fault, because none is — the edge is refusing.
+  upstream.setChatHandler((_req, res) => {
+    res.writeHead(429, { "content-type": "text/html; charset=UTF-8" });
+    res.end('<!doctype html><meta charset="utf-8"><title>429</title>429 Too Many Requests');
+  });
+
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-proxy-"));
+  const expires = Date.now() + 3_600_000;
+  seedAccounts(
+    dataDir,
+    Array.from({ length: 6 }, (_, i) =>
+      accountRecord(`acct-${i + 1}`, `access-${i + 1}`, `refresh-${i + 1}`, expires),
+    ),
+  );
+  const config = loadConfig({
+    DATA_DIR: dataDir,
+    PROXY_API_KEY: "test-key",
+    CLINE_API_BASE_URL: upstream.url,
+    WORKOS_API_BASE_URL: upstream.url,
+    LOG_LEVEL: "error",
+    REQUEST_TIMEOUT_MS: "5000",
+  });
+  const { app } = createApp(config);
+
+  try {
+    const response = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "mock/model-1", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 429);
+    // One attempt, not six: walking the pool would multiply the traffic that
+    // caused the refusal and turn a burst into a ban.
+    const chats = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chats.length, 1, `expected the walk to stop, got ${chats.length} calls`);
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("a Pass model is routed at the accounts that hold Pass, not the pool in order", async () => {
+  // The shape this exists for: a large pool where only a couple of accounts
+  // hold Cline Pass. Round-robin would offer the request to account after
+  // account that cannot serve it, and the failover walk would never reach the
+  // ones that can — so the model would be effectively unusable however long the
+  // walk was allowed to run.
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((req, res) => {
+    if (String(req.headers.authorization).includes("pass-access")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "served by the Pass account" }, finish_reason: "stop" }] }));
+      return;
+    }
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: { code: "ENTITLEMENT_ERROR", message: "Error 403: the user is not subscribed to required model plan" },
+      }),
+    );
+  });
+
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-proxy-"));
+  const expires = Date.now() + 3_600_000;
+  // The Pass holder is last, so plain pool order would reach it only after
+  // every other account had been tried and refused.
+  const accounts = [
+    ...Array.from({ length: 20 }, (_, i) =>
+      accountRecord(`free-${i + 1}`, `free-access-${i + 1}`, `free-refresh-${i + 1}`, expires),
+    ),
+    accountRecord("pass-holder", "pass-access", "pass-refresh", expires),
+  ];
+  seedAccounts(dataDir, accounts);
+  const config = loadConfig({
+    DATA_DIR: dataDir,
+    PROXY_API_KEY: "test-key",
+    CLINE_API_BASE_URL: upstream.url,
+    WORKOS_API_BASE_URL: upstream.url,
+    LOG_LEVEL: "error",
+    REQUEST_TIMEOUT_MS: "5000",
+  });
+  const { app, capabilities } = createApp(config);
+
+  try {
+    // Seed the index as a completed sweep would: exactly one account holds Pass.
+    capabilities.record("pass-holder", true);
+    for (const account of accounts.slice(0, 20)) capabilities.record(account.id, false);
+
+    const response = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "cline-pass/routed", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200, "the Pass account must have been reached");
+    const json = (await response.json()) as { choices: Array<{ message: { content: string } }> };
+    assert.equal(json.choices[0]?.message.content, "served by the Pass account");
+
+    // One call, straight at the holder: not 21 attempts to rediscover what the
+    // index already knew.
+    const chats = upstream.requests.filter((r) => r.url === "/api/v1/chat/completions");
+    assert.equal(chats.length, 1, `expected a single call, got ${chats.length}`);
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("a cold capability index does not shortlist an empty Pass list", async () => {
+  // The trap: an index that has read nothing reports zero Pass holders, which
+  // means "not asked yet" rather than "nobody has it". Shortlisting on that
+  // would turn a working request into a 503, so routing stays on the pool order
+  // until the index actually knows something.
+  const upstream = await startMockUpstream();
+  await withGateway(upstream, async ({ app }) => {
+    const response = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "cline-pass/cold", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200, "a cold index must not block the request");
+    assert.ok(upstream.requests.some((r) => r.url === "/api/v1/chat/completions"));
+  });
+});
+
+// --- Failover tiers -------------------------------------------------------
+
+test("priority tiers: only the lowest tier serves until it cools off", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-tiers-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  // Tiers only govern the shared pool, so the pool must be the strategy under
+  // test: pinned mode ignores it and follows each account's own binding.
+  proxies.setMode("sticky");
+  const hot = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const warm = proxies.add({ url: "http://u:p@10.0.0.2:8080", priority: 1 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // Tier 0 is the only candidate while it is healthy.
+  assert.deepEqual(
+    resolver.forRequest("acct").proxyId,
+    hot.id,
+    "tier 0 should serve while healthy",
+  );
+
+  // Cool tier 0; tier 1 must take over.
+  resolver.reportRateLimited(hot.id);
+  assert.equal(
+    resolver.forRequest("acct").proxyId,
+    warm.id,
+    "tier 1 should absorb traffic once every tier-0 proxy is cooling",
+  );
+
+  // A proxy with no explicit priority still lands in tier 0, so pools written
+  // before tiers existed behave exactly as they used to.
+  const legacy = proxies.add({ url: "http://u:p@10.0.0.3:8080" });
+  assert.equal(legacy.priority, 0);
+});
+
+test("priority tiers: a higher tier that is itself cooling is never selected", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-tiers-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("sticky");
+  const hot = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const spare = proxies.add({ url: "http://u:p@10.0.0.9:8080", priority: 1 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  resolver.reportRateLimited(hot.id);
+  assert.equal(resolver.forRequest("acct").proxyId, spare.id);
+
+  // Everything in the pool is spent: the resolver falls back to returning a
+  // candidate rather than nothing, so the request still has one more attempt
+  // before the account-level failover budget gives up.
+  resolver.reportRateLimited(spare.id);
+  const fallback = resolver.forRequest("acct");
+  assert.ok(fallback, "an all-cooling pool must still offer a route");
+});
+
+test("transport failure parks the exit until a clean probe brings it back", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-unhealthy-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("rotate");
+  const dead = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const alive = proxies.add({ url: "http://u:p@10.0.0.2:8080", priority: 0 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // Before any failure both exits are in the pool.
+  const first = resolver.forRequest("acct");
+  assert.ok(first, "pool must offer a route");
+
+  // One transport failure parks it; the next request must not draw it.
+  resolver.reportTransportFailure(dead.id, "fetch failed");
+  assert.equal(
+    resolver.forRequest("acct").proxyId,
+    alive.id,
+    "a parked exit must not be offered again",
+  );
+
+  // It stays parked across repeated draws.
+  for (let i = 0; i < 5; i++) {
+    assert.equal(resolver.forRequest("acct").proxyId, alive.id);
+  }
+
+  // A clean probe is the only way back.
+  resolver.markHealthy(dead.id);
+  const back = resolver.forRequest("acct");
+  assert.ok(back, "a healed proxy must return to the pool");
+});
+
+test("pre-probe marks a dead failover proxy before it is needed", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-preprobe-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("rotate");
+  // Tier 0 is healthy; tier 1 is a dead proxy that would only be discovered
+  // the hard way when a burst downgrades and burns one request finding out.
+  const hot = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const dead = proxies.add({ url: "http://u:p@10.0.0.99:9999", priority: 1 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // While tier 0 serves, the resolver pre-probes tier 1 in the background.
+  resolver.forRequest("acct");
+  // Wait for the background probe to finish rather than guessing a timeout:
+  // probing a dead TCP endpoint takes however long the OS takes to refuse it,
+  // and a fixed sleep would flake on a loaded box.
+  return new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 15_000;
+    const tick = () => {
+      try {
+        const probing = (resolver as never as { probing: Map<string, Promise<void>> }).probing;
+        if (probing.size === 0) {
+          const parked = (resolver as never as { unhealthy: Map<string, number> }).unhealthy;
+          assert.ok(parked.has(dead.id), "dead tier-1 proxy should be parked by pre-probe");
+          resolve();
+        } else if (Date.now() > deadline) {
+          reject(new Error("probe did not finish in 15s"));
+        } else {
+          setTimeout(tick, 100);
+        }
+      } catch (e) { reject(e); }
+    };
+    tick();
   });
 });

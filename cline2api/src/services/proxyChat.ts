@@ -9,9 +9,12 @@ import type { RequestLog } from "./requestLog.js";
 import type { TokenManager } from "../cline/tokenManager.js";
 import type { AccountStore } from "../store.js";
 import type { FreeQuotaStore } from "./freeQuota.js";
+import type { UsageLedger } from "./usageLedger.js";
 import type { ProxyResolver } from "../cline/proxy.js";
+import { MAX_PROXY_SWITCHES } from "../cline/proxy.js";
 import { postChatCompletions } from "../cline/upstream.js";
 import { openaiError } from "../api/http.js";
+import type { CapabilityIndex } from "./accountCapabilities.js";
 
 export interface ProxyChatDeps {
   config: AppConfig;
@@ -26,10 +29,28 @@ export interface ProxyChatDeps {
   requests?: RequestLog;
   /** Optional: when present, free-tier quota failures are remembered. */
   freeQuota?: FreeQuotaStore;
+  /**
+   * Optional: which accounts hold which plan.
+   *
+   * Present, a Pass-only model is routed straight at the accounts that hold
+   * Pass instead of being offered to the pool in round-robin order. Absent, the
+   * old behaviour applies and failover discovers the same thing the expensive
+   * way — one upstream call per account it tries.
+   */
+  capabilities?: CapabilityIndex;
+  /** Optional: when present, served token counts are written to disk. */
+  usageLedger?: UsageLedger;
+}
+
+export interface ServedUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
 }
 
 export type UpstreamOutcome =
-  | { kind: "ok"; response: Response; accountId: string }
+  | { kind: "ok"; response: Response; accountId: string; recordUsage: (usage: ServedUsage) => void }
   | { kind: "error"; response: Response };
 
 /**
@@ -44,9 +65,52 @@ export type UpstreamOutcome =
 const cooldowns = new Map<string, number>();
 const COOLDOWN_MS = 90_000;
 
+/**
+ * Accounts known not to be entitled to a model, by account + model.
+ *
+ * Kept apart from `cooldowns` because the two mean different things. A cooldown
+ * is transient — a spent free quota refills, so the account is worth retrying
+ * after a pause, and cooling only moves it to the back of the queue. An
+ * entitlement is a property of the account's plan: it will not change by
+ * waiting, so the account is skipped entirely until this expires. Without that
+ * distinction a pool where two accounts hold a plan would still ask all of the
+ * others on every single request.
+ */
+const entitlements = new Map<string, number>();
+const ENTITLEMENT_MS = 6 * 60 * 60 * 1000;
+
 function cooldownKey(accountId: string, model: string): string {
   return accountId + "|" + model;
 }
+
+/** Whether this account has been seen to lack the plan for this model. */
+function isNotEntitled(accountId: string, model: string): boolean {
+  const key = cooldownKey(accountId, model);
+  const until = entitlements.get(key);
+  if (until === undefined) return false;
+  if (until <= Date.now()) {
+    entitlements.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markNotEntitled(accountId: string, model: string): void {
+  entitlements.set(cooldownKey(accountId, model), Date.now() + ENTITLEMENT_MS);
+}
+
+/**
+ * How many accounts one request may fail over through before giving up.
+ *
+ * Failover exists for a handful of dead accounts, not for a plan that most of
+ * the pool lacks. Uncapped, a request for a model only a couple of accounts can
+ * serve walks every account and turns one client call into a pool-sized burst
+ * at the edge. Measured against the live pool: eight attempts was still enough
+ * for repeated requests to trip Cloudflare's rate limit, so this is kept low —
+ * the capability index is what makes a Pass request reach the right account,
+ * not a longer walk.
+ */
+const MAX_FAILOVERS = 4;
 
 function isCooling(accountId: string, model: string): boolean {
   const until = cooldowns.get(cooldownKey(accountId, model));
@@ -79,6 +143,36 @@ function isAccountScopedUpstreamError(status: number, text: string): boolean {
   return /insufficient_credits|insufficient balance|credit balance|INFERENCE_CAP_ERROR|daily free limit|free limit reached|exceeded your current quota|quota exceeded/i.test(
     text,
   );
+}
+
+/**
+ * The account is signed in and healthy, but its plan does not cover this model.
+ *
+ * `ENTITLEMENT_ERROR` arrives as a **403**, which is the same status a revoked
+ * credential uses — so the 403 branch has to tell them apart by body. Treating
+ * this one as a credential failure is expensive twice over: the account gets a
+ * pointless token refresh, and then a second identical request, before the loop
+ * moves on. Across a pool where only a couple of accounts hold a given plan
+ * that is ~2 upstream calls per account per request, which is what turns one
+ * client request into enough traffic for Cloudflare to start answering 429.
+ */
+function isEntitlementError(status: number, text: string): boolean {
+  return status === 403 && /ENTITLEMENT_ERROR|not subscribed to required model plan/i.test(text);
+}
+
+/**
+ * An upstream 429 that names nothing account-specific.
+ *
+ * Upstream sits behind Cloudflare, and a 429 from the edge arrives as an HTML
+ * page with no error code in it. That is indistinguishable *by body* from a
+ * provider-wide rate limit — and it is emphatically not a per-account problem,
+ * so failing over to the next account sends another request at the same edge
+ * that is already refusing us. Continuing the loop is what turns a burst into a
+ * ban.
+ */
+function isProviderWideRateLimit(status: number, text: string): boolean {
+  if (status !== 429) return false;
+  return !isAccountScopedUpstreamError(status, text);
 }
 
 /** Short, log-safe reason for an account-scoped failure. */
@@ -143,9 +237,23 @@ export async function callUpstreamWithFailover(
      * account has to surface as a failure, not be silently served by another.
      */
     onlyAccountId?: string;
+    /**
+     * Caller address, carried through so the request log can show who asked.
+     * Not used for any decision; it exists because the answer to "why is this
+     * box busy" is usually an address, and the account id alone does not say
+     * which client sent it.
+     */
+    clientIp?: string | null;
   },
 ): Promise<UpstreamOutcome> {
   const startedAt = Date.now();
+  // Counted as the loop actually posts, so a request rejected before any
+  // upstream call is on record as costing nothing.
+  let upstreamCalls = 0;
+  // The exit that carried the last upstream call, for the request log. The
+  // limit that throttles a burst is per exit address, so the account id alone
+  // cannot explain a 429 — this is what says which address said no.
+  let usedExit: string | null = null;
   const record = (status: number, accountId: string | null, error: string | null): void => {
     deps.requests?.record({
       at: startedAt,
@@ -154,8 +262,25 @@ export async function callUpstreamWithFailover(
       status,
       durationMs: Date.now() - startedAt,
       accountId,
+      exitIp: usedExit,
       error,
+      clientIp: options.clientIp ?? null,
+      upstreamCalls,
     });
+  };
+
+  /**
+   * Write this request's token counts to the ledger once, when the response
+   * has actually been served.
+   *
+   * Called by the route after it has read the body: the ledger must reflect
+   * what the client received, and a request that failed over to another
+   * account before producing anything has no usage to record.
+   */
+  const recordUsage = (accountId: string) => (usage: {
+    promptTokens: number; completionTokens: number; cachedTokens: number; totalTokens: number;
+  }): void => {
+    deps.usageLedger?.record({ at: startedAt, model: options.model, accountId, ...usage });
   };
 
   const candidates =
@@ -178,17 +303,69 @@ export async function callUpstreamWithFailover(
 
   const failures: string[] = [];
 
+  // Accounts known to lack a plan for this model are dropped outright rather
+  // than moved to the back: an entitlement does not change by waiting, so a
+  // retry would only add an upstream call that cannot succeed.
+  let eligible = candidates.filter((account) => !isNotEntitled(account.id, options.model));
+
+  // `cline-pass/*` is held by a handful of accounts in a pool of hundreds, so
+  // round-robin almost never lands on one: the request is offered to account
+  // after account that cannot serve it, and the failover walk burns an upstream
+  // call on each without ever reaching the ones that would have worked.
+  //
+  // When the capability index knows who holds Pass, route this model straight
+  // at them. The guard on `known` matters: an index that has read nothing would
+  // report an empty Pass list, which means "not asked yet", not "nobody has it"
+  // — and shortlisting on that would turn a working request into a 503.
+  if (options.model.startsWith("cline-pass/")) {
+    const known = deps.capabilities?.stats().known ?? 0;
+    if (known > 0) {
+      const holders = new Set(deps.capabilities?.clinePassAccounts() ?? []);
+      const shortlist = eligible.filter((account) => holders.has(account.id));
+      if (shortlist.length > 0) eligible = shortlist;
+      // An empty shortlist means every Pass account is disabled or cooling;
+      // fall through to the full list so the request still has a chance.
+    }
+  }
+
   // Accounts that already failed to pay for this model go last: the pool is
   // round-robin, and a Pass-only account cannot serve credit-billed models.
   const ordered = [
-    ...candidates.filter((account) => !isCooling(account.id, options.model)),
-    ...candidates.filter((account) => isCooling(account.id, options.model)),
+    ...eligible.filter((account) => !isCooling(account.id, options.model)),
+    ...eligible.filter((account) => isCooling(account.id, options.model)),
   ];
 
+  if (ordered.length === 0) {
+    record(503, null, "no_entitled_accounts");
+    return {
+      kind: "error",
+      response: openaiError(
+        `No account in the pool is entitled to ${options.model}. ` +
+          "Add an account whose plan covers it, or pick a different model.",
+        503,
+        { type: "server_error", code: "no_entitled_accounts" },
+      ),
+    };
+  }
+
+  let attempts = 0;
+
   for (const account of ordered) {
+    if (attempts >= MAX_FAILOVERS) {
+      failures.push(`stopped after ${attempts} accounts`);
+      deps.logger.warn("failover budget exhausted", {
+        model: options.model,
+        attempts,
+        candidates: ordered.length,
+      });
+      break;
+    }
+    attempts += 1;
     // Resolved once per account: the agent is pooled, and looking it up per
-    // attempt would rebuild the map lookup on every retry.
-    const dispatcher = deps.proxyResolver?.forAccount(account.id);
+    // attempt would rebuild the map lookup on every retry. In sticky mode this
+    // starts DIRECT (undefined): the host address is the cleanest signal and is
+    // only abandoned for a proxy once it is refused (see initialRoute).
+    let route = deps.proxyResolver?.initialRoute(account.id);
 
     // Three ways out of this loop: success, a dead credential, or a failure
     // that belongs to the request rather than the account. `refresh` forces one
@@ -198,6 +375,12 @@ export async function callUpstreamWithFailover(
     let needRefresh = false;
     let escalated = false;
     let requestBody = body;
+    // Egress changes made while serving this one request, and whether the
+    // direct fallback has already been tried. A 429 is about the exit address,
+    // not the account, so the answer is to change address and try again rather
+    // than to walk the account pool.
+    let proxySwitches = 0;
+    let wentDirect = false;
 
     for (;;) {
       const forceRefresh = needRefresh;
@@ -221,23 +404,50 @@ export async function callUpstreamWithFailover(
 
       let upstream: Response;
       try {
+        upstreamCalls += 1;
+        usedExit = deps.proxyResolver?.describeExit(route?.proxyId) ?? "direct";
         upstream = await postChatCompletions(deps.config, requestBody, {
           authorization,
           taskId: options.taskId,
-          ...(dispatcher ? { dispatcher } : {}),
+          ...(route?.dispatcher ? { dispatcher: route.dispatcher } : {}),
           ...(options.signal ? { signal: options.signal } : {}),
         });
       } catch (error) {
-        failures.push(`${account.id}: network ${(error as Error).message}`);
+        const message = (error as Error).message;
+        failures.push(`${account.id}: network ${message}`);
         deps.logger.warn("upstream request failed", {
           accountId: account.id,
-          error: (error as Error).message,
+          error: message,
         });
+        // A transport failure through a proxy is not "the account is bad" — the
+        // hop itself is broken. Park that exit so the next request does not draw
+        // the same dead proxy and burn another account's attempt on it.
+        deps.proxyResolver?.reportTransportFailure(route?.proxyId, message);
         break;
       }
 
       if (upstream.status === 401 || upstream.status === 403) {
         const detail = await upstream.text().catch(() => "");
+
+        // A plan that does not cover this model, not a dead credential: the
+        // token is fine and refreshing it changes nothing. Remember the account
+        // cannot serve this model and move on — without the refresh-and-retry
+        // the credential path would do, which doubles the upstream calls for
+        // an answer that cannot differ.
+        if (isEntitlementError(upstream.status, detail)) {
+          markNotEntitled(account.id, options.model);
+          // A Pass-only model refused here is direct evidence this account does
+          // not hold Pass, which is what the index would otherwise have to
+          // spend a plan lookup to learn.
+          if (options.model.startsWith("cline-pass/")) deps.capabilities?.record(account.id, false);
+          failures.push(`${account.id}: not entitled to model`);
+          deps.logger.warn("account not entitled to model, failing over", {
+            accountId: account.id,
+            model: options.model,
+          });
+          break;
+        }
+
         failures.push(`${account.id}: upstream ${upstream.status}`);
         deps.logger.warn("upstream rejected credentials", {
           accountId: account.id,
@@ -290,11 +500,89 @@ export async function callUpstreamWithFailover(
           });
           break;
         }
+        // A 429 carrying nothing account-specific came from the edge, not from
+        // this account's quota: every other account would be refused by the
+        // same edge, so walking the rest of the pool just multiplies the
+        // traffic that caused it.
+        //
+        // What does help is leaving through a different address, which is the
+        // whole point of the proxy pool. So the same account retries on a new
+        // exit, and only once the pool has been walked (or the request has
+        // already spent its switch budget) does the request fall back to a
+        // direct connection — a worse address, but not another refused one.
+        if (isProviderWideRateLimit(upstream.status, text)) {
+          const limitedProxyId = route?.proxyId ?? null;
+          // Cool whatever address just refused us — a proxy id, or the host's
+          // own address when the route was direct (proxyId null). Cooling the
+          // direct address is what makes the NEXT request start on a proxy
+          // instead of re-paying one refused direct attempt every call.
+          deps.proxyResolver?.reportRateLimited(limitedProxyId);
+
+          const canSwitch = proxySwitches < MAX_PROXY_SWITCHES;
+          if (canSwitch) {
+            proxySwitches += 1;
+            // After a direct 429 the direct address is cooling, so forRequest
+            // hands back a proxy; after a proxy 429 it hands back a different
+            // (or the same single) proxy. Either way the address changes.
+            const next = deps.proxyResolver?.forRequest(account.id);
+            // No progress means the pool has nothing else to offer (no proxy,
+            // or every entry cooling). Retrying the same address is what turns
+            // a throttle into a block, so only continue on a real change.
+            if (next?.proxyId && next.proxyId !== limitedProxyId) {
+              deps.logger.warn("upstream rate limit: switching proxy exit", {
+                accountId: account.id,
+                model: options.model,
+                from: deps.proxyResolver?.describeExit(limitedProxyId) ?? "direct",
+                to: deps.proxyResolver?.describeExit(next.proxyId) ?? next.proxyId,
+                attempt: proxySwitches,
+              });
+              route = next;
+              continue;
+            }
+          }
+
+          // Out of switches (or nothing to switch to). If the refusal came from
+          // a proxy and we have not tried direct yet, fall back to the host
+          // address as the last resort.
+          if (limitedProxyId !== null && !wentDirect) {
+            wentDirect = true;
+            route = undefined;
+            deps.logger.warn("proxy exits exhausted: retrying direct", {
+              accountId: account.id,
+              model: options.model,
+              lastExit: deps.proxyResolver?.describeExit(limitedProxyId) ?? "direct",
+              switches: proxySwitches,
+            });
+            continue;
+          }
+
+          failures.push(`${account.id}: provider-wide rate limit`);
+          deps.logger.warn("provider-wide rate limit, not failing over", {
+            accountId: account.id,
+            model: options.model,
+            detail: text.slice(0, 200),
+          });
+          record(upstream.status, account.id, "provider-wide rate limit");
+          return {
+            kind: "error",
+            response: new Response(text || JSON.stringify({ error: { message: "Too Many Requests" } }), {
+              status: upstream.status,
+              headers: {
+                "content-type": upstream.headers.get("content-type") ?? "application/json",
+              },
+            }),
+          };
+        }
+
         deps.logger.warn("upstream error", {
           accountId: account.id,
           status: upstream.status,
           detail: text.slice(0, 300),
         });
+
+        // An error the classifier does not recognise is assumed to belong to
+        // the request rather than to this account, so it is returned as-is:
+        // failing over would repeat a request that is already malformed.
         record(upstream.status, account.id, text.slice(0, 300) || "upstream error");
         return {
           kind: "error",
@@ -313,7 +601,7 @@ export async function callUpstreamWithFailover(
         stream: options.stream,
       });
       record(200, account.id, null);
-      return { kind: "ok", response: upstream, accountId: account.id };
+      return { kind: "ok", response: upstream, accountId: account.id, recordUsage: recordUsage(account.id) };
     }
   }
 

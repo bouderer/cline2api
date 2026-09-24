@@ -14,8 +14,28 @@ export interface RequestLogEntry {
   status: number;
   durationMs: number;
   accountId: string | null;
+  /**
+   * Which egress hop carried this request, by exit IP.
+   *
+   * The account id says who served it; this says which address Cline saw. When
+   * a burst gets throttled, the account id is useless for the diagnosis — the
+   * limit is per exit address, so the operator needs to know which addresses
+   * were actually used and which one refused.
+   */
+  exitIp: string | null;
   /** Failure reason when status is not 2xx. */
   error: string | null;
+  /** Caller's address, as seen through the reverse proxy. Null when unknown. */
+  clientIp: string | null;
+  /**
+   * Upstream calls this request actually caused.
+   *
+   * The distinction matters because not every request the gateway answers is
+   * traffic at Cline: a request that is rejected on auth, or that finds no
+   * account, never leaves the host. Counting those as upstream load would
+   * overstate what a rate limit is measuring.
+   */
+  upstreamCalls: number;
 }
 
 export interface RequestLogStats {
