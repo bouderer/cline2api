@@ -30,8 +30,8 @@
 
 import fs from "fs";
 import path from "path";
-import { REGISTER_DIR, mailPath, dataPath, LOG_DIR } from "./paths.mjs";
-import { runBatch, ACCOUNTS_FILE, loadAccounts, saveAccounts, readList } from "./lib/batch.mjs";
+import { REGISTER_DIR, dataPath, LOG_DIR } from "./paths.mjs";
+import { runBatch, ACCOUNTS_FILE, loadAccounts, saveAccounts, loadInventory, parseMailLine } from "./lib/batch.mjs";
 import { pushAccounts, probeRemote, readPushConfig } from "./lib/push.mjs";
 
 const args = process.argv.slice(2);
@@ -47,14 +47,20 @@ function log(...parts) {
 
 
 function printStatus() {
+  const inventory = loadInventory();
   const accounts = loadAccounts();
-  const ok = accounts.filter((a) => a.ok);
-  const bad = accounts.filter((a) => !a.ok);
+  const inTargets = (a) => inventory.targetEmails.has(String(a.email || "").toLowerCase());
+  const ok = accounts.filter((a) => a.ok && inTargets(a));
+  const bad = accounts.filter((a) => !a.ok && inTargets(a));
+  const pending = inventory.targets.filter((l) => !ok.some((a) => String(a.email).toLowerCase() === parseMailLine(l).email));
   const pushed = ok.filter((a) => a.pushedAt).length;
 
   console.log("\n================== Cline 账号池 ==================");
+  console.log(`目标 web 号  : ${inventory.targets.length}（web_mail.txt，2 列）`);
+  console.log(`辅助接码邮箱: ${inventory.helpers.length}（可用，未用过）`);
   console.log(`已登录成功  : ${ok.length}`);
   console.log(`失败待重试  : ${bad.length}`);
+  console.log(`剩余未处理  : ${pending.length}`);
   console.log(`已推送远程  : ${pushed}`);
   console.log(`账号池文件  : ${ACCOUNTS_FILE}`);
   console.log(`最新凭据快照: ${CACHE_TOKEN_FILE}`);
@@ -171,12 +177,13 @@ async function main() {
     console.log("    node register.mjs --count 20 --concurrency 3");
     console.log("    node register.mjs --all --concurrency 2");
     console.log("    node register.mjs --all --concurrency 2 --no-push");
+    return;
   }
 
-  const webLines = readList(mailPath("all_web_mail.txt")).concat(readList(mailPath("web_mail.txt")));
-  const helperLines = readList(mailPath("new_mail.txt"));
-  if (!webLines.length) throw new Error("没有待登录邮箱，请检查 cline-register/config/mail/all_web_mail.txt");
-  if (!helperLines.length) throw new Error("没有辅助接码邮箱，请检查 cline-register/config/mail/new_mail.txt");
+  const inventory = loadInventory();
+  const webLines = inventory.targets;
+  if (!webLines.length) throw new Error("没有目标 web 号：web_mail.txt 里需要 邮箱----密码 格式的记录");
+  if (!inventory.helpers.length) throw new Error("没有可用的辅助接码邮箱：new_mail.txt / all_web_mail.txt 里需要 ≥4 列（第 4 列为 Graph refreshToken）且未被 used_mail.txt 标记");
 
   let accounts = loadAccounts();
   const done = new Set(accounts.filter((a) => a.ok).map((a) => a.email.toLowerCase()));
@@ -187,14 +194,14 @@ async function main() {
 
   let queue;
   if (specific) {
-    const hit = webLines.find((l) => l.toLowerCase().startsWith(specific.toLowerCase()));
-    if (!hit) throw new Error(`邮箱不在库存中: ${specific}`);
+    const hit = webLines.find((l) => parseMailLine(l).email === specific.trim().toLowerCase());
+    if (!hit) throw new Error(`邮箱不在 web_mail.txt 目标库存中（需要 2 列 邮箱----密码 格式）: ${specific}`);
     queue = [hit];
   } else if (args.includes("--retry")) {
     const failed = new Set(accounts.filter((a) => !a.ok).map((a) => a.email.toLowerCase()));
-    queue = webLines.filter((l) => failed.has(l.split("----")[0].trim().toLowerCase()));
+    queue = webLines.filter((l) => failed.has(parseMailLine(l).email));
   } else {
-    queue = webLines.filter((l) => !done.has(l.split("----")[0].trim().toLowerCase()));
+    queue = webLines.filter((l) => !done.has(parseMailLine(l).email));
   }
 
   if (!args.includes("--all")) {
@@ -203,6 +210,11 @@ async function main() {
   }
 
   if (!queue.length) { log("没有需要处理的账号"); printStatus(); return; }
+
+  // 收集本批次每个账号的结果，跑完后统一汇总
+  const batchOk = [];       // 成功的邮箱
+  const batchPushed = [];   // 已推送的邮箱
+  const batchFail = [];     // { email, error }
 
   // 走和 Web 控制台完全相同的批处理引擎
   const result = await runBatch({
@@ -219,11 +231,34 @@ async function main() {
         log(`本轮处理 ${evt.total} 个账号｜链路 ${evt.mode === "device" ? "设备码" : "回调"}｜并发 ${evt.concurrency}`);
         if (evt.push) log(`已启用边跑边推 → ${evt.remote}`);
         else log("未推送（--no-push）：本轮只写本地");
+      } else if (evt.type === "account-ok") {
+        batchOk.push(evt.email);
+        const doneN = batchOk.length + batchFail.length;
+        log(`[进度] ${doneN}/${evt.total} ｜ 成功 ${batchOk.length} ｜ 失败 ${batchFail.length} ｜ 剩 ${evt.total - doneN} ｜ √ ${evt.email}`);
+      } else if (evt.type === "account-pushed") {
+        batchPushed.push(evt.email);
+      } else if (evt.type === "account-fail") {
+        batchFail.push({ email: evt.email, error: evt.error });
+        const doneN = batchOk.length + batchFail.length;
+        log(`[进度] ${doneN}/${evt.total} ｜ 成功 ${batchOk.length} ｜ 失败 ${batchFail.length} ｜ 剩 ${evt.total - doneN} ｜ × ${evt.email}`);
       } else if (evt.type === "done") {
         log("");
-        log("================ 本轮结果 ================");
-        log(`成功 ${evt.ok} ｜ 失败 ${evt.fail} ｜ 已推送 ${evt.pushed} ｜ 耗时 ${(evt.ms / 60000).toFixed(1)} 分钟${evt.aborted ? "（已中止）" : ""}`);
-        log("==========================================");
+        log("================ 本批次注册情况 ================");
+        log(`共 ${evt.total} 个 ｜ 成功 ${evt.ok} ｜ 失败 ${evt.fail} ｜ 已推送 ${evt.pushed} ｜ 耗时 ${(evt.ms / 60000).toFixed(1)} 分钟${evt.aborted ? "（已中止）" : ""}`);
+        if (batchOk.length) {
+          log("");
+          log(`--- 成功 ${batchOk.length} 个 ---`);
+          batchOk.forEach((em, i) => {
+            const pushed = batchPushed.includes(em) ? "[已推送]" : "[未推送]";
+            log(`  ${i + 1}. ${em}  ${pushed}`);
+          });
+        }
+        if (batchFail.length) {
+          log("");
+          log(`--- 失败 ${batchFail.length} 个 ---`);
+          batchFail.forEach((it, i) => log(`  ${i + 1}. ${it.email} -> ${it.error}`));
+        }
+        log("=================================================");
       }
     },
   });

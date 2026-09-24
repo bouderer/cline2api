@@ -26,7 +26,7 @@ cline-register/
 │   ├── webpage.mjs           Web 控制台的页面（HTML/CSS/JS）
 │   └── push.mjs              推送到远程 cline2api
 ├── config/
-│   ├── mail/                 邮箱库存（见下）
+│   ├── mail/                 邮箱库存（web_mail / new_mail / all_web_mail / used_mail，见下）
 │   └── proxy/                可选代理池
 └── data/
     ├── accounts_cline.json   账号池（含已拿到 / 失败的凭据）
@@ -36,24 +36,21 @@ cline-register/
 
 ### 邮箱库存格式
 
-仓库里只提供**格式模板**，真实库存请自己填，填好后不会进版本库（`config/mail/*.txt` 已加入 `.gitignore`）：
+仓库里只提供**格式模板**，真实库存请自己填，填好后不会进版本库（`config/mail/*.txt` 已加入 `.gitignore`）。文件分工是**固定**的：
 
-| 模板 | 复制成 | 用途 |
+| 文件 | 角色 | 格式 |
 |---|---|---|
-| `config/mail/all_web_mail.example.txt` | `config/mail/all_web_mail.txt` | **待登录的目标账号** |
-| `config/mail/new_mail.example.txt` | `config/mail/new_mail.txt` | **辅助接码邮箱** |
+| `config/mail/web_mail.txt` | **目标 web 号**（要登录的账号） | `邮箱----密码`（严格 **2 列**） |
+| `config/mail/new_mail.txt` | **待用的辅助接码邮箱** | `邮箱----密码----clientId----refreshToken----...`（**≥4 列**，第 4 列为 Graph refreshToken） |
+| `config/mail/all_web_mail.txt` | 辅助邮箱**全量存档** | 同上（≥4 列） |
+| `config/mail/used_mail.txt` | **已用过的辅助邮箱**（注册机自动追加） | 无需手工维护 |
 
-`all_web_mail.txt` 每行：
+规则：
 
-```text
-邮箱----密码
-```
-
-`new_mail.txt` 每行：
-
-```text
-邮箱----密码----clientId----refreshToken----辅助邮箱----辅助邮箱密码
-```
+- **目标账号只从 `web_mail.txt` 取**，只收 2 列的 `邮箱----密码` 记录；
+- 辅助邮箱从 `new_mail.txt` + `all_web_mail.txt` 合并去重（按邮箱），并**剔除** `used_mail.txt` 里已标记的，以及账号池里已用过的；
+- **注册成功一个账号后**，用到的辅助邮箱整行追加进 `used_mail.txt` 标记已用（原库存文件不动、不删行）；
+- 辅助邮箱与目标账号是两套库存，不会把辅助号当目标号，也不会出现同号自接码。
 
 辅助邮箱用来接收微软在「异地登录保护」时下发的 6 位安全代码。接码走 Graph API 直连，无需打开邮件网页。
 
@@ -101,7 +98,7 @@ cp .env.example .env
 两条链路在登录过程中都会经过：
 
 1. 微软账号密码登录；
-2. 若触发「帮助保护你的帐户 → 添加电子邮件」，自动从 `new_mail.txt` 取一个辅助邮箱填入；
+2. 若触发「帮助保护你的帐户 → 添加电子邮件」，自动从辅助邮箱池（`new_mail.txt` + `all_web_mail.txt`）取一个填入；
 3. 用 Graph API 拉取 6 位安全代码并自动填入；
 4. 自动跳过 Windows Hello / Passkey 录入；
 5. 在 Cline 授权页点 `Authorize`（回调流程）。

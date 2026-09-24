@@ -4,26 +4,32 @@
  * 把「挑账号 → 并发登录 → 落盘 → 推送 → 统计」这段逻辑从 CLI 里抽出来，
  * 让 CLI（register.mjs）和 Web 控制台（web.mjs）共用同一套实现。
  *
- * 通过事件回调把进度吐给调用方，调用方决定怎么展示（终端打印 / SSE 推给浏览器）。
+ * 邮箱库存规则（见 lib/mailPool.mjs）：
+ *   目标 web 号   = config/mail/web_mail.txt（严格 2 列：邮箱----密码）
+ *   辅助接码邮箱  = new_mail.txt + all_web_mail.txt（≥4 列），
+ *                   剔除 used_mail.txt 与账号池里已用过的；
+ *                   注册成功后整行追加进 used_mail.txt 标记已用。
  */
 
 import fs from "fs";
 import path from "path";
-import { mailPath, dataPath } from "../paths.mjs";
+import { dataPath } from "../paths.mjs";
 import { loginOne, loginOneDevice } from "./cline_engine.mjs";
 import { createBrowserPool } from "./browserPool.mjs";
 import { pushAccounts, readPushConfig } from "./push.mjs";
+import {
+  loadWebMails,
+  loadHelperPool,
+  markHelperUsed,
+  parseMailLine,
+} from "./mailPool.mjs";
 
 // 并发上限可通过 REGISTER_MAX_CONCURRENCY 调整；内存充足就往上开。
 export const MAX_CONCURRENCY = Math.max(1, Number(process.env.REGISTER_MAX_CONCURRENCY) || 64);
 export const ACCOUNTS_FILE = dataPath("accounts_cline.json");
 const CACHE_TOKEN_FILE = dataPath("last-token.json");
 
-export function readList(file) {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, "utf-8").split(/\r?\n/)
-    .map((l) => l.trim()).filter((l) => l.includes("@") && l.includes("----"));
-}
+export { parseMailLine } from "./mailPool.mjs";
 
 export function loadAccounts() {
   try {
@@ -52,24 +58,41 @@ function updateCacheToken(rec) {
   } catch {}
 }
 
-/** 当前库存 / 已成功 / 剩余未处理 / 远端配置，用于前端展示。 */
-export function snapshot() {
-  const web = readList(mailPath("all_web_mail.txt")).concat(readList(mailPath("web_mail.txt")));
-  const helpers = readList(mailPath("new_mail.txt"));
+/** 汇总目标号 / 辅助邮箱 / 账号池三方状态，供快照与队列挑选。 */
+export function loadInventory() {
+  const targets = loadWebMails();
   const accounts = loadAccounts();
+  const usedHelpers = accounts.map((a) => a.helperEmail).filter(Boolean);
+  const helpers = loadHelperPool(usedHelpers);
+  return {
+    targets,
+    helpers,
+    targetEmails: new Set(targets.map((l) => parseMailLine(l).email)),
+    helperEmails: new Set(helpers.map((l) => parseMailLine(l).email)),
+    accounts,
+  };
+}
+
+/** 当前库存 / 已成功 / 剩余未处理 / 远端配置，用于前端展示。 */
+export function snapshot(inventory = loadInventory()) {
+  const accounts = inventory.accounts ?? loadAccounts();
   const ok = accounts.filter((a) => a.ok);
   const bad = accounts.filter((a) => !a.ok);
-  const okEmails = new Set(ok.map((a) => a.email.toLowerCase()));
-  const pending = web.filter((l) => !okEmails.has(l.split("----")[0].trim().toLowerCase()));
+  const okEmails = new Set(ok.map((a) => String(a.email || "").toLowerCase()));
+  const pending = inventory.targets.filter((l) => !okEmails.has(parseMailLine(l).email));
+  const targetOk = ok.filter((a) => inventory.targetEmails.has(String(a.email || "").toLowerCase()));
+  const targetBad = bad.filter((a) => inventory.targetEmails.has(String(a.email || "").toLowerCase()));
   const remote = readPushConfig();
 
   return {
-    inventory: web.length,
-    helpers: helpers.length,
-    ok: ok.length,
-    failed: bad.length,
+    inventory: inventory.targets.length,
+    helpers: inventory.helpers.length,
+    ok: targetOk.length,
+    failed: targetBad.length,
     pending: pending.length,
-    pushed: ok.filter((a) => a.pushedAt).length,
+    pushed: targetOk.filter((a) => a.pushedAt).length,
+    accountOk: ok.length,
+    accountFailed: bad.length,
     remote: { configured: Boolean(remote.base && remote.token), base: remote.base || null },
     maxConcurrency: MAX_CONCURRENCY,
     accountsFile: ACCOUNTS_FILE,
@@ -78,28 +101,28 @@ export function snapshot() {
 
 /**
  * 挑出这一轮要处理的账号队列。
- * @param {{ mode?: "pending"|"retry"|"all", email?: string, count?: number }} opts
+ * @param {{ mode?: "pending"|"retry"|"all", email?: string, count?: number, inventory?: object }} opts
  */
-export function buildQueue({ mode = "pending", email = "", count = 0 } = {}) {
-  const web = readList(mailPath("all_web_mail.txt")).concat(readList(mailPath("web_mail.txt")));
-  const accounts = loadAccounts();
-  const okEmails = new Set(accounts.filter((a) => a.ok).map((a) => a.email.toLowerCase()));
-  const failEmails = new Set(accounts.filter((a) => !a.ok).map((a) => a.email.toLowerCase()));
+export function buildQueue({ mode = "pending", email = "", count = 0, inventory = loadInventory() } = {}) {
+  const web = inventory.targets;
+  const accounts = inventory.accounts ?? loadAccounts();
+  const okEmails = new Set(accounts.filter((a) => a.ok).map((a) => String(a.email || "").toLowerCase()));
+  const failEmails = new Set(accounts.filter((a) => !a.ok).map((a) => String(a.email || "").toLowerCase()));
 
   let queue;
   if (email) {
-    const hit = web.find((l) => l.toLowerCase().startsWith(email.toLowerCase()));
-    if (!hit) throw new Error(`邮箱不在库存中: ${email}`);
+    const hit = web.find((l) => parseMailLine(l).email === email.trim().toLowerCase());
+    if (!hit) throw new Error(`邮箱不在目标账号库存中（目标号必须是 web_mail.txt 里 2 列的 邮箱----密码 记录）: ${email}`);
     queue = [hit];
   } else if (mode === "retry") {
-    queue = web.filter((l) => failEmails.has(l.split("----")[0].trim().toLowerCase()));
+    queue = web.filter((l) => failEmails.has(parseMailLine(l).email));
   } else if (mode === "all") {
     queue = web;
   } else {
-    queue = web.filter((l) => !okEmails.has(l.split("----")[0].trim().toLowerCase()));
+    queue = web.filter((l) => !okEmails.has(parseMailLine(l).email));
   }
   if (count > 0) queue = queue.slice(0, count);
-  return { queue, web, accounts };
+  return { queue, web, accounts, inventory };
 }
 
 /**
@@ -127,7 +150,7 @@ export async function runBatch({
   signal,
 } = {}) {
   const conc = Math.min(MAX_CONCURRENCY, Math.max(1, Number(concurrency) || 1));
-  const { queue, web, accounts: initialAccounts } = buildQueue({ mode, email, count });
+  const { queue, web, accounts: initialAccounts, inventory } = buildQueue({ mode, email, count });
 
   if (!queue.length) {
     onEvent({ type: "done", ok: 0, fail: 0, pushed: 0, pushFail: 0, total: 0, ms: 0, aborted: false });
@@ -141,8 +164,12 @@ export async function runBatch({
   // 所以并发能开得更高。想退回每账号独立 Chrome 就设 REGISTER_SHARED_BROWSER=false。
   const sharedBrowser = String(process.env.REGISTER_SHARED_BROWSER ?? "true").toLowerCase() !== "false";
   const pool = sharedBrowser ? createBrowserPool() : null;
-  const helperLines = readList(mailPath("new_mail.txt"));
-  if (!helperLines.length) throw new Error("没有辅助接码邮箱，请检查 config/mail/new_mail.txt");
+  const helperLines = inventory.helpers;
+  if (!helperLines.length) {
+    throw new Error(
+      "没有可用的辅助接码邮箱：new_mail.txt / all_web_mail.txt 里需要 ≥4 列格式（第 4 列为 Graph refreshToken），且未被 used_mail.txt 标记。",
+    );
+  }
 
   const remote = readPushConfig();
   const canPush = push && Boolean(remote.base && remote.token);
@@ -181,11 +208,15 @@ export async function runBatch({
 
   async function handleOne(index) {
     const line = queue[index];
-    const [webEmail, webPass] = line.split("----").map((s) => s.trim());
+    const [webEmail, webPass] = parseMailLine(line).fields;
     const idx = Math.max(0, web.indexOf(line));
-    const hs = helperLines[idx % helperLines.length].split("----").map((s) => s.trim());
+    const helperLine = helperLines[idx % helperLines.length];
+    const hs = parseMailLine(helperLine).fields;
     const helperEmail = hs[0];
     const helperRt = hs[3];
+    if (helperEmail.toLowerCase() === webEmail.toLowerCase()) {
+      throw new Error(`辅助邮箱与目标账号相同：${helperEmail}`);
+    }
 
     const emit = (level, text) =>
       onEvent({ type: "log", level, text, email: webEmail, index });
@@ -206,6 +237,7 @@ export async function runBatch({
         record,
       ]);
       updateCacheToken(rec);
+      markHelperUsed(helperLine, { targetEmail: webEmail });
       stats.ok += 1;
       emit("ok", `成功 ${webEmail}`);
       onEvent({ type: "account-ok", email: webEmail, index, total: queue.length });
@@ -272,9 +304,3 @@ export async function runBatch({
   onEvent({ type: "done", ...result });
   return result;
 }
-
-
-
-
-
-

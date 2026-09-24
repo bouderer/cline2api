@@ -235,6 +235,32 @@ async function safeQueryAll(page, selector, { retries = 3, delay = 700 } = {}) {
   return [];
 }
 
+/**
+ * 容错导航：高并发时 api.workos.com 挂在 Cloudflare 后面，
+ * 同一出口 IP 的密集连接会被限流，表现为
+ *   net::ERR_CONNECTION_CLOSED / net::ERR_TIMED_OUT / net::ERR_CONNECTION_RESET
+ * 这类是临时性网络错误，退避重试即可，不该直接判定账号失败。
+ */
+async function safeGoto(page, url, { log = () => {}, attempts = 3, timeout = 45000 } = {}) {
+  const TRANSIENT = /ERR_CONNECTION_CLOSED|ERR_TIMED_OUT|ERR_CONNECTION_RESET|ERR_CONNECTION_REFUSED|ERR_NETWORK_CHANGED|ERR_EMPTY_RESPONSE|ERR_SOCKET_NOT_CONNECTED|ERR_PROXY_CONNECTION_FAILED/i;
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e.message || e);
+      if (!TRANSIENT.test(msg)) throw e;         // 非网络类错误不重试
+      if (i === attempts) break;
+      // 退避：2s / 4s，给 Cloudflare 一点喘息时间
+      const wait = 2000 * i;
+      log(`     网络抖动（${msg.match(/ERR_[A-Z_]+/)?.[0] || "网络错误"}），${wait / 1000}s 后重试 ${i}/${attempts - 1}`);
+      await sleep(wait);
+    }
+  }
+  throw new Error(`页面加载失败（已重试 ${attempts} 次）: ${String(lastErr?.message || lastErr).slice(0, 160)}`);
+}
+
 /** 等元素出现，同样挡住导航竞态。超时返回 null，不抛错。 */
 async function safeWait(page, selector, { timeout = 20000 } = {}) {
   const deadline = Date.now() + timeout;
@@ -296,6 +322,17 @@ async function safeClick(page, selectorOrHandle, { log = () => {} } = {}) {
 }
 async function textOf(page) { try { return (await page.innerText("body")).replace(/\s+/g, " "); } catch { return ""; } }
 
+/** 从 URL 的 query 里抠授权码（仅限 cline 的回调端点，避免误伤其它带 code 参数的页面）。 */
+function pickCodeFromUrl(u) {
+  try {
+    const url = new URL(u);
+    const hostOk = /(^|\.)cline\.bot$/.test(url.hostname) || url.hostname === "127.0.0.1" || url.hostname === "localhost";
+    if (!hostOk) return null;
+    const code = url.searchParams.get("code");
+    return code && code.length > 8 ? code : null;
+  } catch { return null; }
+}
+
 /**
  * 自动完成微软登录 + 各类安全页（备用邮箱接码 / FIDO 跳过 / 同意 / Cline 授权）。
  * 返回 true 表示成功抵达本地回调。
@@ -352,6 +389,10 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
     const text = await textOf(page);
 
     if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) return true;
+    // 有的账号授权后停在 api.cline.bot 的回调端点（code 已在 URL 里，但页面不再 302 到本地）。
+    // 检测到任何带 code= 的 cline 回调 URL 就直接抠出来返回，不再干等本地监听。
+    const inlineCode = pickCodeFromUrl(url);
+    if (inlineCode) { log("   -> 从页面 URL 取得授权码"); return inlineCode; }
     if (/policy_denied|radar-challenge/.test(url)) {
       throw new Error(url.includes("radar-challenge") ? "被要求手机号验证（Radar）" : "Cline 拒绝授权（policy_denied）");
     }
@@ -408,14 +449,19 @@ export async function driveLogin({ page, webEmail, webPass, helperEmail, helperR
     );
     if (await safeVisible(btn)) { await safeClick(page, btn); continue; }
   }
-  // 步数用尽时，如果页面已经停在 Cline 授权页附近，再多等一会儿碰运气
+  // 步数用尽时，先看页面 URL 里是不是已经有授权码（api.cline.bot 回调落点）
   const lastUrl = page.url();
-  if (/app\\.cline\\.bot|authkit\\.cline\\.bot/.test(lastUrl)) {
+  const tailCode = pickCodeFromUrl(lastUrl);
+  if (tailCode) { log("   -> 步数用尽，但从页面 URL 取得授权码"); return tailCode; }
+  // 如果页面仍停在 Cline 授权页附近，再多等一会儿碰运气
+  if (/app\.cline\.bot|authkit\.cline\.bot|api\.cline\.bot/.test(lastUrl)) {
     log("   -> 步数用尽，但页面仍在授权流程中，额外等待 20 秒...");
     for (let i = 0; i < 10; i++) {
       await sleep(2000);
       const u = page.url();
       if (u.startsWith("http://127.0.0.1") || u.startsWith("http://localhost")) return true;
+      const c2 = pickCodeFromUrl(u);
+      if (c2) { log("   -> 从页面 URL 取得授权码"); return c2; }
       const b = await safeQuery(page, "button:has-text('Authorize'), button:has-text('授权'), #idSIButton9, input[type=submit]");
       if (await safeVisible(b)) await safeClick(page, b);
     }
@@ -455,11 +501,22 @@ export async function loginOne({ webEmail, webPass, helperEmail, helperRt, log =
   const lease = pool ? await pool.acquire() : await launch();
   const page = lease.page;
   try {
-    await page.goto(loc.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
-    await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: waiter.callbackUrl, log, signal });
+    await safeGoto(page, loc.toString(), { log });
+    let driveResult;
+    try {
+      driveResult = await driveLogin({ page, webEmail, webPass, helperEmail, helperRt, callbackUrl: waiter.callbackUrl, log, signal });
+    } catch (driveErr) {
+      const shot = path.join(LOG_DIR, `fail_${String(webEmail).split("@")[0]}_${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      driveErr.message = `${driveErr.message}｜截图: ${shot}`;
+      throw driveErr;
+    }
 
     log("3. 等待回调授权码");
-    const code = await Promise.race([waiter.code, sleep(20000).then(() => null)]);
+    // driveLogin 若返回字符串，说明已从页面 URL（api.cline.bot 回调落点）抠到了码，直接用；
+    // 否则（返回 true）正常等本地 HTTP 回调把码送过来。
+    let code = typeof driveResult === "string" && driveResult.length > 8 ? driveResult : null;
+    if (!code) code = await Promise.race([waiter.code, sleep(20000).then(() => null)]);
     if (!code) {
       const shot = path.join(LOG_DIR, `fail_${String(webEmail).split("@")[0]}.png`);
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
@@ -484,7 +541,7 @@ export async function loginOneDevice({ webEmail, webPass, helperEmail, helperRt,
   const lease = pool ? await pool.acquire() : await launch();
   const page = lease.page;
   try {
-    await page.goto(device.verification_uri_complete || device.verification_uri, { waitUntil: "domcontentloaded" });
+    await safeGoto(page, device.verification_uri_complete || device.verification_uri, { log });
     await sleep(2500);
     const c = await safeQuery(page, "button[type=submit]");
     if (c) { await safeClick(page, c); await sleep(2500); }

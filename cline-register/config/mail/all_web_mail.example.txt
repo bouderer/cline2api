@@ -1,10 +1,13 @@
-# 待登录的目标账号库存（模板）
+# 辅助邮箱全量存档（模板）
+#
+# 与 new_mail.txt 一样是辅助接码邮箱（>=4 列，第 4 列为 Graph refreshToken），
+# 这里放全量存档；注册机会把 new_mail.txt + all_web_mail.txt 合并去重后作为可用辅助池。
 #
 # 每行一个账号，格式：
-#   邮箱----密码
+#   邮箱----邮箱密码----GraphClientId----GraphRefreshToken----辅助邮箱----辅助邮箱密码
 #
-# 复制本文件为 all_web_mail.txt（或 web_mail.txt）后填入真实账号。
-# 这两个名字下的 .txt 已被 .gitignore 忽略，不会提交到仓库。
+# 复制本文件为 all_web_mail.txt 后填入真实账号。
+# 该文件已被 .gitignore 忽略，不会提交到仓库。
 #
 # 示例：
-# someone@outlook.com----TheirPassword123
+# helper@outlook.com----MailboxPassword----00000000-0000-0000-0000-000000000000----M.Cxxx_refresh_token_here$$----alias@example.com----AliasPassword

@@ -11,9 +11,9 @@
 import fs from "fs";
 import readline from "node:readline/promises";
 import { spawn } from "node:child_process";
-import { REGISTER_DIR, mailPath, dataPath } from "./paths.mjs";
+import { REGISTER_DIR, dataPath } from "./paths.mjs";
 import { readPushConfig } from "./lib/push.mjs";
-import { MAX_CONCURRENCY as REGISTER_MAX_CONCURRENCY } from "./lib/batch.mjs";
+import { MAX_CONCURRENCY as REGISTER_MAX_CONCURRENCY, loadInventory, parseMailLine } from "./lib/batch.mjs";
 
 const C = {
   reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
@@ -24,19 +24,12 @@ const paint = (c, s) => `${c}${s}${C.reset}`;
 const ACCOUNTS_FILE = dataPath("accounts_cline.json");
 const MAX_CONCURRENCY = REGISTER_MAX_CONCURRENCY;
 
-function readList(file) {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, "utf-8").split(/\r?\n/)
-    .map((l) => l.trim()).filter((l) => l.includes("@") && l.includes("----"));
-}
-
 function loadAccounts() {
   try {
     const p = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf-8"));
     return Array.isArray(p) ? p : [];
   } catch { return []; }
 }
-
 function banner() {
   console.log("");
   console.log(paint(C.cyan, "======================================================"));
@@ -46,13 +39,14 @@ function banner() {
 }
 
 function showState() {
-  const web = readList(mailPath("all_web_mail.txt")).concat(readList(mailPath("web_mail.txt")));
-  const helpers = readList(mailPath("new_mail.txt"));
+  const inventory = loadInventory();
+  const web = inventory.targets;
+  const helpers = inventory.helpers;
   const accounts = loadAccounts();
-  const ok = accounts.filter((a) => a.ok);
-  const bad = accounts.filter((a) => !a.ok);
-  const okEmails = new Set(ok.map((a) => a.email.toLowerCase()));
-  const pending = web.filter((l) => !okEmails.has(l.split("----")[0].trim().toLowerCase()));
+  const ok = accounts.filter((a) => a.ok && inventory.targetEmails.has(String(a.email || "").toLowerCase()));
+  const bad = accounts.filter((a) => !a.ok && inventory.targetEmails.has(String(a.email || "").toLowerCase()));
+  const okEmails = new Set(ok.map((a) => String(a.email || "").toLowerCase()));
+  const pending = web.filter((l) => !okEmails.has(parseMailLine(l).email));
   const remote = readPushConfig();
 
   console.log(paint(C.bold, "当前状态"));
@@ -90,7 +84,7 @@ async function main() {
 
   if (pending.length === 0) {
     console.log(paint(C.green, "没有待处理的账号了 —— 库存里的账号都已经登录成功。"));
-    console.log(paint(C.dim, "可以往 config/mail/all_web_mail.txt 里加新账号，或用 npm run retry 重试失败的。"));
+    console.log(paint(C.dim, "可以往 config/mail/web_mail.txt 加 2/4 列 webmail，或用 npm run retry 重试失败的。"));
     console.log("");
     return;
   }

@@ -26,6 +26,7 @@ cline-register/data/last-token.json
 
 # 邮箱库存（真实账号密码 / Graph refresh token）
 cline-register/config/mail/*.txt
+cline-register/config/mail/*.bak-*
 cline-register/config/mail/pending_skip.json
 !cline-register/config/mail/*.example.txt
 !cline-register/config/mail/.gitkeep

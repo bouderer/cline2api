@@ -1,0 +1,13 @@
+# 目标 web 号库存（模板）
+#
+# 这些是真正要登录 Cline 的目标账号，只有邮箱和密码两列。
+# 注册机只从 web_mail.txt 取目标账号。
+#
+# 每行一个账号，格式（严格 2 列）：
+#   邮箱----密码
+#
+# 复制本文件为 web_mail.txt 后填入真实账号。
+# 该文件已被 .gitignore 忽略，不会提交到仓库。
+#
+# 示例：
+# someone@outlook.com----TheirPassword123
