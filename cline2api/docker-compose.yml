@@ -3,6 +3,14 @@ services:
     build: .
     image: cline2api:latest
     restart: unless-stopped
+    # Cap the json-file driver: the gateway is chatty at info level and an
+    # unbounded log ate 3GB of a 59GB disk in 2.5 days. 3x50MB keeps enough
+    # history to debug a restart without threatening the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     # Bind to loopback by default; put nginx/Caddy in front for TLS.
     ports:
       - "127.0.0.1:8787:8787"
@@ -15,6 +23,12 @@ services:
       LOG_LEVEL: info
       PROXY_API_KEY: ${PROXY_API_KEY:?set PROXY_API_KEY in .env}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # grok-iq's database. Its single admin row is the console login, so the
+      # password stays in one place; the settings page writes a new one here.
+      GROKIQ_DB_PATH: ${GROKIQ_DB_PATH:-/grokiq/grokiq.db}
+      # The .env this container was started from, so the settings page can
+      # rotate ADMIN_TOKEN and have it survive the next restart.
+      ENV_FILE: /config/.env
     volumes:
       # Holds accounts.json and the generated client key. Back this up.
       # Defaults to ./data; set DATA_DIR_HOST when the live accounts live
@@ -22,9 +36,23 @@ services:
       # A mismatched path silently mounts an empty directory and the gateway
       # comes up with no accounts at all.
       - ${DATA_DIR_HOST:-./data}:/data
+      - ${GROKIQ_DATA_HOST:-/var/lib/docker/volumes/grok-iq_grokiq-data/_data}:/grokiq
+      - ${ENV_FILE_HOST:-.env}:/config/.env
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - default # compose's own project network
+      # new-api's channels address this gateway as `http://cline2api:8787`, so
+      # the container must sit on new-api's network under that alias. Declared
+      # here rather than attached by hand: a manual `docker network connect` is
+      # lost every time compose recreates the container, and the channels then
+      # fail with "lookup cline2api ... server misbehaving".
+      - cline-internal
+
+networks:
+  cline-internal:
+    external: true

@@ -27,6 +27,7 @@ const EXTERNALS = new Set([
   "fetch", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "confirm",
   "JSON", "String", "Number", "Boolean", "Array", "Object", "Math", "Date", "Map",
   "Set", "Promise", "Error", "RegExp", "TextDecoder", "URLSearchParams", "isNaN",
+  "AbortController", "Uint8Array", "crypto", "Array",
   "parseInt", "parseFloat", "isFinite", "encodeURIComponent", "decodeURIComponent", "require",
 ]);
 
@@ -85,7 +86,7 @@ test("every element id the admin script reaches for exists in the markup", () =>
     ...[...script.matchAll(/\$\("([\w-]+)"\)/g)].map((m) => m[1]),
     ...[...script.matchAll(/getElementById\("([\w-]+)"\)/g)].map((m) => m[1]),
     // ids the script builds by concatenation, e.g. "view-" + name
-    ...["overview", "models", "play", "accounts", "quota", "proxies", "keys", "logs"].map((v) => `view-${v}`),
+    ...["overview", "models", "play", "accounts", "quota", "proxies", "keys", "logs", "settings"].map((v) => `view-${v}`),
   ]);
   // Created at runtime by the script itself when the token is missing.
   referenced.delete("tokenPrompt");
@@ -96,10 +97,66 @@ test("every element id the admin script reaches for exists in the markup", () =>
 
 test("boot calls are all defined and routed through the view switcher", () => {
   // The boot sequence runs at the end of the IIFE; anything it touches must
-  // exist, and every hash route must map to a real section.
-  for (const view of ["overview", "models", "play", "accounts", "quota", "logs"]) {
-    assert.ok(markup.includes(`id="view-${view}"`), `missing section for hash route #${view}`);
-    assert.ok(markup.includes(`data-view="${view}"`), `missing nav button for #${view}`);
+  // exist, and every route must map to a real section and a nav link.
+  for (const view of ["overview", "models", "play", "accounts", "quota", "logs", "settings"]) {
+    assert.ok(markup.includes(`id="view-${view}"`), `missing section for route ${view}`);
+    assert.ok(markup.includes(`data-route="${view}"`), `missing nav link for ${view}`);
   }
-  assert.match(script, /show\(location\.hash\.slice\(1\)\s*\|\|\s*"overview"\)/);
+  assert.match(script, /show\(routeFromPath\(location\.pathname\)\s*,\s*false\)/);
 });
+
+/**
+ * Chart marks must not set their color through a `var()` in an SVG
+ * presentation attribute.
+ *
+ * Safari/WebKit does not resolve a CSS custom property in an SVG presentation
+ * attribute, so `fill="var(--s1)"` paints nothing there. The failure is quiet
+ * and looks like a loading bug rather than a styling one: the gridlines and
+ * axis labels come from stylesheet rules and still draw, so the chart shows an
+ * empty plot that reads as "the chart never loaded".
+ *
+ * The supported form is a class that sets the color (a stylesheet rule resolves
+ * the variable in every engine) plus `currentColor` in the attribute. This
+ * guards the whole page, not just the charts, in case another inline SVG picks
+ * the pattern up.
+ */
+test("no SVG presentation attribute is set from a CSS variable", () => {
+  // Attributes that SVG treats as presentation attributes and that a browser
+  // may or may not resolve a custom property in.
+  const PRESENTATION = [
+    "fill", "stroke", "stop-color", "color", "flood-color",
+    "lighting-color", "stroke-width", "stop-opacity", "fill-opacity",
+  ].join("|");
+  const pattern = new RegExp(`(?:${PRESENTATION})\\s*=\\s*["']?[^"'\\n]*var\\(`, "g");
+
+  // Comments legitimately quote the bad pattern while explaining why it is
+  // avoided, so strip them before scanning. The page is one big string, so this
+  // is a lexical strip rather than a parse: block comments and `//` runs are
+  // enough to cover the prose, and dropping the literal text of a comment can
+  // never hide real code.
+  const withoutComments = ADMIN_PAGE
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'\\])\/\/[^\n]*/g, "$1");
+
+  const hits = [...withoutComments.matchAll(pattern)].map((m) => m[0].trim());
+  assert.deepEqual(
+    hits,
+    [],
+    "SVG presentation attribute set from var(); WebKit will not resolve it — " +
+      "use a class that sets the color plus currentColor instead: " + hits.join(" | "),
+  );
+});
+
+test("every series color class the charts emit is defined in the stylesheet", () => {
+  // The marks reference .s1..s8; if the stylesheet stops defining one, the
+  // series silently paints as inherited ink instead of its slot color.
+  for (let slot = 1; slot <= 8; slot += 1) {
+    assert.match(
+      ADMIN_PAGE,
+      new RegExp(`\\.s${slot}\\s*\\{[^}]*color:\\s*var\\(--s${slot}\\)`),
+      `missing .s${slot} color rule`,
+    );
+  }
+  assert.match(script, /function seriesClass\(/, "seriesClass helper is gone");
+});
+

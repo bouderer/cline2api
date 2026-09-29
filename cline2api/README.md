@@ -327,6 +327,7 @@ npm run typecheck
 | `503 no_accounts` | 还没登录，或所有账号都需重新登录 → 打开管理台登录 |
 | 上游返回 `Unauthorized: ... latest version of Cline` | 凭证失效 → 重新登录；也可能是 `CLINE_CLIENT_VERSION` 过旧，可调高 |
 | 有响应但无打字机效果 | 前面的 nginx 没关 `proxy_buffering` |
+| 流式回答中途断开（`stream closed before response.completed`） | 上游连接中断没发 `[DONE]`。网关现在会补一个 `upstream_stream_incomplete` / `upstream_timeout` 错误帧说明原因，并记 WARN 日志；若整个回答没有真正结束就静默，超过 `STREAM_IDLE_TIMEOUT_MS`（默认 5 分钟）会主动失败，不再让连接一直挂着 |
 | 账号显示「需重新登录」 | refresh token 被撤销/过期，属于正常失效，重新登录即可 |
 | 模型名 404 | 用 `/v1/models` 返回的 ID，不要自己拼前缀 |
 | 调用返回 `empty response content` | 上游推理型模型在小 `max_tokens` 下把预算烧在思考上，正文为空。实测 `max_tokens: 16` 时 `cline-pass/glm-5.3`、`kimi-k3`、`deepseek-*`、`muse-spark` 都会这样，`qwen3.7-plus`、`minimax-m3`、`solar-pro4` 不会。调大 `max_tokens`（≥256）即可；关思考的开关（`reasoning_effort` / `thinking` / `enable_thinking`）实测都无效 |

@@ -489,13 +489,13 @@ export interface UsageBucket {
  * Split out so the by-time and by-model passes share one definition of the
  * bucket boundaries; if the two disagreed the series could not be read together.
  */
-export function bucketStepFor(window: ResolvedWindow, target = 48): number {
+export function bucketStepFor(window: ResolvedWindow, target = 240): number {
   const span = Math.max(1, window.until - window.since);
   const rough = span / target;
   const STEPS = [
     60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000,
-    60 * 60_000, 3 * 60 * 60_000, 6 * 60 * 60_000, 12 * 60 * 60_000,
-    24 * 60 * 60_000, 7 * 24 * 60 * 60_000,
+    60 * 60_000, 2 * 60 * 60_000, 3 * 60 * 60_000, 6 * 60 * 60_000,
+    12 * 60 * 60_000, 24 * 60 * 60_000,
   ];
   return STEPS.find((s) => s >= rough) ?? STEPS[STEPS.length - 1]!;
 }

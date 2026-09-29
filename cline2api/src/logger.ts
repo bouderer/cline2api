@@ -45,22 +45,26 @@ export interface Logger {
   warn(message: string, meta?: unknown): void;
   error(message: string, meta?: unknown): void;
   child(extraSecrets: readonly string[]): Logger;
+  /** Add a secret learned after startup, e.g. a rotated admin token. */
+  redact(secret: string): void;
 }
 
 export function createLogger(level: LogLevel, secrets: readonly string[] = []): Logger {
   const threshold = RANK[level];
+  const known = [...secrets];
   const emit = (at: LogLevel, message: string, meta?: unknown, extra: readonly string[] = []): void => {
     if (RANK[at] < threshold) return;
-    const line = `${new Date().toISOString()} ${at.toUpperCase().padEnd(5)} ${redactString(message, [...secrets, ...extra])}`;
+    const line = `${new Date().toISOString()} ${at.toUpperCase().padEnd(5)} ${redactString(message, [...known, ...extra])}`;
     const sink = at === "error" ? console.error : at === "warn" ? console.warn : console.log;
     if (meta === undefined) sink(line);
-    else sink(line, JSON.stringify(redactValue(meta, [...secrets, ...extra])));
+    else sink(line, JSON.stringify(redactValue(meta, [...known, ...extra])));
   };
   return {
     debug: (m, meta) => emit("debug", m, meta),
     info: (m, meta) => emit("info", m, meta),
     warn: (m, meta) => emit("warn", m, meta),
     error: (m, meta) => emit("error", m, meta),
-    child: (extraSecrets) => createLogger(level, [...secrets, ...extraSecrets]),
+    child: (extraSecrets) => createLogger(level, [...known, ...extraSecrets]),
+    redact: (secret) => { if (secret && !known.includes(secret)) known.push(secret); },
   };
 }

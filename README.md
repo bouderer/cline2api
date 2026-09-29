@@ -110,7 +110,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-your-own-key
 | 访问对象 | 凭证 | 请求头 |
 |---|---|---|
 | `/v1/*`（客户端） | `PROXY_API_KEY` | `Authorization: Bearer <key>` 或 `x-api-key: <key>` |
-| `/admin/*` 与管理台 | `ADMIN_TOKEN` | `Authorization: Bearer <token>` 或 `?token=<token>` |
+| `/admin/*` 与管理台 | `ADMIN_TOKEN` | `Authorization: Bearer <token>`（控制台改为账号密码登录，见下） |
 | 上游 `api.cline.bot` | Cline 账号令牌 | 网关内部持有，客户端看不到 |
 
 **未设置 `ADMIN_TOKEN` 时，管理接口只允许本机 loopback 访问。**

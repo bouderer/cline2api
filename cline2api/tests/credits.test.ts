@@ -439,7 +439,7 @@ test("bucketUsage picks a coarser step for a wider window", () => {
   assert.ok(stepOf(week) > stepOf(hour), "a week must not be bucketed as finely as an hour");
   // Neither window should explode into an unreadable number of points.
   const hourBuckets = bucketUsage([], { ...hour, windowMs: 3600_000, snappedToDay: false } as never);
-  assert.ok(hourBuckets.length <= 64, `too many buckets for an hour: ${hourBuckets.length}`);
+  assert.ok(hourBuckets.length <= 70, `too many buckets for an hour: ${hourBuckets.length}`);
 });
 
 test("bucketUsageByModel aligns every model to the same bucket boundaries", () => {

@@ -27,7 +27,14 @@ interface Recorded {
 }
 
 /** Upstream that answers the endpoints the admin surface touches. */
-async function startUpstream(options: { refreshOk?: boolean; chatHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => void } = {}) {
+async function startUpstream(options: {
+  refreshOk?: boolean;
+  chatHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => void;
+  /** Per-account balance in micro-USD. Negative is legal: accounts overspend. */
+  balance?: number;
+  /** Per-usage-record `creditsUsed`, in micro-USD. Zero on free/Pass traffic. */
+  creditsUsed?: number;
+} = {}) {
   const requests: Recorded[] = [];
   // Replaceable so a test can make the chat endpoint fail the way the real
   // upstream does when a free bucket is spent.
@@ -62,7 +69,7 @@ async function startUpstream(options: { refreshOk?: boolean; chatHandler?: (req:
         return json({ success: true, data: { id: "usr-mock" } });
       }
       if (/\/api\/v1\/users\/[^/]+\/balance$/.test(url.pathname)) {
-        return json({ success: true, data: { userId: "usr-mock", balance: 500_000 } });
+        return json({ success: true, data: { userId: "usr-mock", balance: options.balance ?? 500_000 } });
       }
       if (/\/api\/v1\/users\/[^/]+\/usages$/.test(url.pathname)) {
         return json({
@@ -72,7 +79,7 @@ async function startUpstream(options: { refreshOk?: boolean; chatHandler?: (req:
               {
                 id: "usg-1",
                 createdAt: new Date().toISOString(),
-                creditsUsed: 0,
+                creditsUsed: options.creditsUsed ?? 0,
                 costUsd: 39,
                 operation: "chat_completion",
                 aiInferenceProviderName: "vercel",
@@ -149,7 +156,7 @@ function makeDataDir(accounts: number): string {
 async function withGateway(
   accounts: number,
   run: (ctx: ReturnType<typeof createApp> & { dataDir: string; upstream: Awaited<ReturnType<typeof startUpstream>> }) => Promise<void>,
-  options: { refreshOk?: boolean } = {},
+  options: { refreshOk?: boolean; balance?: number; creditsUsed?: number } = {},
 ): Promise<void> {
   const upstream = await startUpstream(options);
   const dataDir = makeDataDir(accounts);
@@ -380,12 +387,25 @@ test("a per-account test requires a model and a known account", async () => {
 
 /* ---------------- proxy store ---------------- */
 
-test("parseProxyUrl accepts the supported schemes and rejects the rest", () => {
+test("parseProxyUrl accepts http(s) and rejects the rest with a reason", () => {
   assert.ok("url" in parseProxyUrl("http://user:pass@host:8080"));
-  assert.ok("url" in parseProxyUrl("socks5://host:1080"));
+  assert.ok("url" in parseProxyUrl("https://host:443"));
   assert.ok("error" in parseProxyUrl(""));
   assert.ok("error" in parseProxyUrl("not a url"));
   assert.ok("error" in parseProxyUrl("ftp://host:21"));
+});
+
+test("parseProxyUrl rejects SOCKS and points at the working alternative", () => {
+  // undici accepts a socks5:// URI but cannot authenticate it: every request
+  // dies as "SOCKS5 authentication timeout" long after the URL was saved and
+  // shown as working. Accepting it here is what made that failure look like a
+  // live proxy, so the parser refuses it and names the way out.
+  for (const scheme of ["socks5://host:1080", "socks4://host:1080"]) {
+    const result = parseProxyUrl(scheme);
+    assert.ok("error" in result, `${scheme} must be refused`);
+    assert.match(result.error, /HTTP CONNECT/);
+    assert.match(result.error, /http:\/\/user:pass@host:port/);
+  }
 });
 
 test("redactProxyUrl hides the password but keeps the username", () => {
@@ -585,7 +605,16 @@ test("credits summary rolls up the row cache without new upstream calls", async 
       covered: number;
       total: number;
       window: { windowMs: number };
-      totals: { requests: number; totalTokens: number; balanceKnown: number };
+      totals: {
+        requests: number;
+        totalTokens: number;
+        balanceKnown: number;
+        balanceMicroUsd: number;
+        balancePositive: number;
+        balanceNegative: number;
+        creditsUsedMicroUsd: number;
+        creditsUsedKnown: number;
+      };
     };
     assert.equal(summary.total, 30);
     // The mock answers one usage record of 9 tokens per account, so every
@@ -595,6 +624,20 @@ test("credits summary rolls up the row cache without new upstream calls", async 
     assert.equal(summary.totals.balanceKnown, summary.covered);
     assert.equal(summary.window.windowMs, 6 * 60 * 60 * 1000);
     assert.ok(summary.covered >= 5, `expected at least the 5 just-read rows, got ${summary.covered}`);
+
+    // The mock balance is a positive 500_000 micro-USD per account, so the
+    // pool total scales with coverage and lands entirely on the positive side.
+    assert.equal(summary.totals.balanceMicroUsd, summary.covered * 500_000);
+    assert.equal(summary.totals.balancePositive, summary.covered);
+    assert.equal(summary.totals.balanceNegative, 0);
+
+    // The usage record reports `creditsUsed: 0` — free-tier traffic — so the
+    // window's spend is zero and no account is counted as having drawn on its
+    // balance. This is the case that must not be confused with a missing read:
+    // balanceKnown is non-zero while creditsUsedKnown is not.
+    assert.equal(summary.totals.creditsUsedMicroUsd, 0);
+    assert.equal(summary.totals.creditsUsedKnown, 0);
+    assert.ok(summary.totals.balanceKnown > 0);
     // Zero upstream traffic: this is a pure cache rollup.
     assert.equal(upstream.requests.length, 0);
 
@@ -608,8 +651,49 @@ test("credits summary rolls up the row cache without new upstream calls", async 
   });
 });
 
-/* ---------------- per-model usage ---------------- */
+test("credits summary splits positive from overdrawn balances, and sums the window's spend", async () => {
+  // A negative balance is a real state, not a read failure: the account has
+  // overspent and cannot serve paid models until it is topped up. The split
+  // must survive the rollup, and the window's spend must stay a separate number
+  // from the balance — they are different quantities and adding them would be
+  // meaningless.
+  await withGateway(
+    10,
+    async ({ app }) => {
+      // refresh=1 bypasses the module-level row cache and pageSize covers the
+      // whole (10-account) fixture, so every row this summary rolls up carries
+      // this test's mock rather than a previous test's.
+      await app.request("/admin/api/credits?page=1&pageSize=10&hours=6&refresh=1", { headers: adminHeaders });
 
+      const summary = (await (
+        await app.request("/admin/api/credits/summary?hours=6", { headers: adminHeaders })
+      ).json()) as {
+        covered: number;
+        totals: {
+          balanceKnown: number;
+          balanceMicroUsd: number;
+          balancePositive: number;
+          balanceNegative: number;
+          creditsUsedMicroUsd: number;
+          creditsUsedKnown: number;
+        };
+      };
+
+      // Every covered row is overdrawn by the same amount, and every one of
+      // them reports spending 39 micro-USD of credits in the window.
+      assert.ok(summary.covered >= 5);
+      assert.equal(summary.totals.balanceKnown, summary.covered);
+      assert.equal(summary.totals.balanceNegative, summary.covered);
+      assert.equal(summary.totals.balancePositive, 0);
+      assert.equal(summary.totals.balanceMicroUsd, summary.covered * -19_229);
+      assert.equal(summary.totals.creditsUsedKnown, summary.covered);
+      assert.equal(summary.totals.creditsUsedMicroUsd, summary.covered * 39);
+    },
+    { balance: -19_229, creditsUsed: 39 },
+  );
+});
+
+/* ---------------- per-model usage ---------------- */
 test("the by-model rollup covers the pool from the credits cache, and says when it is empty", async () => {
   await withGateway(30, async ({ app, upstream }) => {
     // No rows read yet under this window: an empty table with honest coverage
@@ -731,11 +815,14 @@ test("a free-limit error becomes an exhausted signal, a provider 429 does not", 
 
 /* ---------------- timeline + free-quota fullness ---------------- */
 
-test("the timeline buckets the cached records and reports its coverage", async () => {
-  await withGateway(30, async ({ app, upstream }) => {
-    // The mock records every usage one second apart at "now", which lands in
-    // the newest bucket of any window.
-    await app.request("/admin/api/credits?page=1&pageSize=5&hours=6", { headers: adminHeaders });
+test("the timeline buckets the gateway's own ledger and reports its coverage", async () => {
+  await withGateway(30, async ({ app, upstream, usageLedger }) => {
+    // The charts read the gateway's own ledger, not the per-account cache, so
+    // seed the one the app is actually reading.
+    for (let i = 0; i < 5; i++) {
+      usageLedger.record({ at: Date.now(), model: "cline-free/Deepseek-v4.1-Flash", accountId: `acct-${i + 1}`, promptTokens: 4, completionTokens: 5, cachedTokens: 1, totalTokens: 9 });
+    }
+    usageLedger.flush();
     upstream.requests.length = 0;
 
     const body = (await (
@@ -748,10 +835,10 @@ test("the timeline buckets the cached records and reports its coverage", async (
     };
 
     assert.equal(body.total, 30);
-    assert.ok(body.covered >= 5, `expected the 5 rows just read, got ${body.covered}`);
+    assert.equal(body.covered, 5);
     assert.equal(body.window.windowMs, 6 * 60 * 60 * 1000);
     // Six hours is bucketed at a readable resolution, not one point per second.
-    assert.ok(body.buckets.length >= 6 && body.buckets.length <= 64, `got ${body.buckets.length} buckets`);
+    assert.ok(body.buckets.length >= 6 && body.buckets.length <= 256, `got ${body.buckets.length} buckets`);
     // Every record lands in exactly one bucket, so the sums must survive.
     const totalTokens = body.buckets.reduce((s, b) => s + b.totalTokens, 0);
     assert.equal(totalTokens, body.covered * 9);
@@ -785,8 +872,13 @@ test("free quota reports each account's per-model fill against the ceiling", asy
 });
 
 test("the timeline carries a per-model series aligned to its buckets", async () => {
-  await withGateway(30, async ({ app, upstream }) => {
-    await app.request("/admin/api/credits?page=1&pageSize=5&hours=6", { headers: adminHeaders });
+  await withGateway(30, async ({ app, upstream, usageLedger }) => {
+    // The charts read the gateway's own ledger, not the per-account cache, so
+    // seed the one the app is actually reading.
+    for (let i = 0; i < 5; i++) {
+      usageLedger.record({ at: Date.now(), model: "cline-free/Deepseek-v4.1-Flash", accountId: `acct-${i + 1}`, promptTokens: 4, completionTokens: 5, cachedTokens: 1, totalTokens: 9 });
+    }
+    usageLedger.flush();
     upstream.requests.length = 0;
 
     const body = (await (

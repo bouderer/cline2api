@@ -28,11 +28,24 @@ export class TokenManager {
   ) {}
 
   /** Returns a ready-to-send `Authorization` header, or null if re-login is needed. */
-  getAuthorization(accountId: string, options: { forceRefresh?: boolean } = {}): Promise<string | null> {
+  async getAuthorization(accountId: string, options: { forceRefresh?: boolean } = {}): Promise<string | null> {
+    const forceRefresh = options.forceRefresh === true;
     const pending = this.inflight.get(accountId);
-    if (pending) return pending;
-    const promise = this.resolve(accountId, options.forceRefresh === true).finally(() => {
-      this.inflight.delete(accountId);
+    if (pending !== undefined) {
+      if (!forceRefresh) {
+        // Any in-flight resolution yields a usable token, so ride along.
+        return pending;
+      }
+      // A forced refresh cannot ride along — the caller wants a real refresh to
+      // prove the refresh token still works (that is the whole point of a
+      // probe). It also must not run *concurrently* with the in-flight one:
+      // WorkOS rotates refresh tokens, so overlapping refreshes invalidate
+      // each other. Wait for the current one to settle, then do our own.
+      await pending.catch(() => null);
+    }
+    const promise = this.resolve(accountId, forceRefresh).finally(() => {
+      // Remove only our own entry: a later forced refresh may have replaced it.
+      if (this.inflight.get(accountId) === promise) this.inflight.delete(accountId);
     });
     this.inflight.set(accountId, promise);
     return promise;

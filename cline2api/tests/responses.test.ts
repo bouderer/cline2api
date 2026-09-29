@@ -234,6 +234,21 @@ async function translate(sse: string, model = "m"): Promise<string> {
   return text;
 }
 
+/**
+ * Parse the terminal `response.completed` envelope out of a translated stream.
+ * Frames are "event: <name>\ndata: <json>", and the stream ends with a bare
+ * `data: [DONE]` after the completed frame, so the naive "last data frame"
+ * trick reads the sentinel instead of JSON.
+ */
+function completedEnvelope(text: string): Record<string, any> {
+  const frames = text.split("\n\n").filter((chunk) => chunk.trim().length > 0);
+  const completed = frames.filter((chunk) => chunk.startsWith("event: response.completed")).pop();
+  assert.ok(completed !== undefined, "no response.completed frame in stream");
+  const data = completed.split("\n").find((line) => line.startsWith("data: "));
+  assert.ok(data !== undefined, "response.completed frame carries no data");
+  return JSON.parse(data.slice(6));
+}
+
 test("a chat SSE stream becomes responses SSE events", async () => {
   const text = await translate(
     'data: {"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}\n\n' +
@@ -263,7 +278,7 @@ test("a chat SSE stream becomes responses SSE events", async () => {
   ]);
   assert.match(text, /"delta":"Hel"/);
   assert.match(text, /"delta":"lo"/);
-  const completed = JSON.parse(text.slice(text.lastIndexOf("data: ") + 6).trim());
+  const completed = completedEnvelope(text);
   assert.equal(completed.type, "response.completed");
   const output = completed.response.output as Array<Record<string, unknown>>;
   assert.equal(output.length, 2);
@@ -281,7 +296,7 @@ test("streamed tool calls keep their own output items", async () => {
       'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
       "data: [DONE]\n\n",
   );
-  const completed = JSON.parse(text.slice(text.lastIndexOf("data: ") + 6).trim());
+  const completed = completedEnvelope(text);
   const output = completed.response.output as Array<Record<string, unknown>>;
   assert.deepEqual(output.map((item) => item.type), ["function_call", "function_call"]);
   assert.equal(output[0]?.name, "read");
@@ -362,13 +377,20 @@ async function startMockUpstream(): Promise<MockUpstream> {
       chatHandler = handler;
     },
     close: () =>
-      new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+      new Promise<void>((resolve, reject) => {
+        // The idle-timeout test leaves the chat response open on purpose.
+        // Cancelling the gateway's reader does not close that server-side
+        // socket, and server.close() waits for it forever — destroy it.
+        server.closeAllConnections?.();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
   };
 }
 
 async function withGateway(
   upstream: MockUpstream,
   run: (app: ReturnType<typeof createApp>["app"]) => Promise<void>,
+  options: { env?: Record<string, string> } = {},
 ): Promise<void> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cline2api-responses-"));
   fs.writeFileSync(
@@ -402,6 +424,7 @@ async function withGateway(
     WORKOS_API_BASE_URL: upstream.url,
     LOG_LEVEL: "error",
     REQUEST_TIMEOUT_MS: "5000",
+    ...(options.env ?? {}),
   });
   const { app } = createApp(config);
   try {
@@ -472,6 +495,55 @@ test("POST /v1/responses streams responses-shaped events", async () => {
     assert.equal(sent.stream, true);
     assert.deepEqual(sent.stream_options, { include_usage: true });
   });
+});
+
+test("a Responses stream cut short ends in response.failed, not a bare close", async () => {
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"half"},"finish_reason":null}]}\n\n');
+    // Dropped mid-answer: no finish_reason, no [DONE].
+    setTimeout(() => res.destroy(), 20);
+  });
+  await withGateway(upstream, async (app) => {
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ model: "mock/model-1", stream: true, input: "hi" }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /"delta":"half"/);
+    // A client that never sees response.completed cannot tell a finished
+    // answer from a truncated one; the failure event is what says which.
+    assert.match(text, /event: response.failed/);
+    assert.match(text, /stream_error/);
+    assert.doesNotMatch(text, /event: response.completed/);
+  });
+});
+
+test("a stalled Responses stream is failed on the idle timeout", async () => {
+  const upstream = await startMockUpstream();
+  upstream.setChatHandler((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(": ping\n\n");
+    // Then nothing, forever.
+  });
+  await withGateway(
+    upstream,
+    async (app) => {
+      const response = await app.request("/v1/responses", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ model: "mock/model-1", stream: true, input: "hi" }),
+      });
+      const text = await response.text();
+      assert.match(text, /event: response.failed/);
+      assert.match(text, /upstream_timeout/);
+      assert.doesNotMatch(text, /event: response.completed/);
+    },
+    { env: { STREAM_IDLE_TIMEOUT_MS: "150" } },
+  );
 });
 
 test("a small token budget that upstream answers with nothing is retried once, larger", async () => {

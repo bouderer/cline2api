@@ -2,6 +2,7 @@
  * Shared upstream call path: account selection, single-flight token refresh,
  * silent 401 retry and failover across accounts.
  */
+import crypto from "node:crypto";
 import type { AppConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import type { AccountPool } from "./accountPool.js";
@@ -50,7 +51,12 @@ export interface ServedUsage {
 }
 
 export type UpstreamOutcome =
-  | { kind: "ok"; response: Response; accountId: string; recordUsage: (usage: ServedUsage) => void }
+  | {
+      kind: "ok";
+      response: Response;
+      accountId: string;
+      recordUsage: (usage: ServedUsage) => void;
+    }
   | { kind: "error"; response: Response };
 
 /**
@@ -205,6 +211,41 @@ export function isEmptyContentError(text: string): boolean {
 }
 
 /**
+ * Wrap a successful upstream response so its body is counted as it streams to
+ * the client, then report the total to the persisted request log.
+ *
+ * Returns the original response untouched when there is no body to count or no
+ * log to report to, so this never becomes the reason a response fails. The
+ * counting is a pass-through TeeStream: every byte the client reads is a byte
+ * that crossed the egress hop, which is what the proxy invoice measures. The
+ * completion line is joined to the entry by `requestId`; response size is only
+ * known when the stream ends, long after the entry line was written.
+ */
+function countResponseBody(
+  response: Response,
+  requests: RequestLog | undefined,
+  requestId: string,
+): Response {
+  if (!requests || !response.body) return response;
+  let bytes = 0;
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      bytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    flush() {
+      requests.complete(requestId, bytes);
+    },
+  });
+  const countedBody = response.body.pipeThrough(counter);
+  return new Response(countedBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
  * Copy of a request body with a small output budget raised; null when the
  * caller already asked for room to think, or when it set no budget at all —
  * upstream's own default is larger than ours, so adding one would shrink it.
@@ -219,6 +260,47 @@ export function withRaisedTokenBudget(body: unknown): unknown | null {
   const current = record[field] as number;
   if (current >= ESCALATED_MAX_TOKENS) return null;
   return { ...record, [field]: ESCALATED_MAX_TOKENS };
+}
+
+/**
+ * One-off provider pin for a single paid model.
+ *
+ * z-ai/glm-5.3-flash: OpenRouter serves this id from a dozen hosts. Pinning
+ * InferenceNet bills at that host's list price ($0.045/M prompt) instead of
+ * the routing mix's average (verified 2026-09-25: unpinned calls landed on
+ * Z.AI at $0.15/M, pinned calls billed at the InferenceNet rate). The pin
+ * exists purely to pick the cheapest served price; quality is identical.
+ *
+ * Every other paid model is left unpinned on purpose: pinning buys nothing
+ * (billing follows the model id, not the provider) and the wrong slug 404s
+ * the request outright.
+ *
+ * Buckets that ignore the field entirely are not listed here: `cline-free/*`,
+ * `cline-pass/*`, `vmc/*`, `private/*`, `stealth/*` all resolve server-side.
+ */
+const MODEL_PROVIDER_PIN: Readonly<Record<string, string>> = {
+  "z-ai/glm-5.3-flash": "inference-net",
+};
+
+export interface PinResult {
+  body: unknown;
+  pinned: boolean;
+}
+
+export function applyProviderPin(body: unknown): PinResult {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { body, pinned: false };
+  }
+  const record = body as Record<string, unknown>;
+  const model = typeof record.model === "string" ? record.model : "";
+  // Never pin client-pinned models: an explicit `provider` in the request wins.
+  if (record.provider !== undefined) return { body, pinned: false };
+  const pin: string | undefined = MODEL_PROVIDER_PIN[model];
+  if (pin === undefined) return { body, pinned: false };
+  return {
+    body: { ...record, provider: { only: [pin] } },
+    pinned: true,
+  };
 }
 
 export async function callUpstreamWithFailover(
@@ -247,6 +329,16 @@ export async function callUpstreamWithFailover(
   },
 ): Promise<UpstreamOutcome> {
   const startedAt = Date.now();
+  // Correlation id joining the persisted entry line with its later
+  // completion line (response bytes are only known when the stream ends).
+  const requestId = crypto.randomUUID();
+  // Provider pin: paid catalog models are pinned to the vendor's own
+  // first-party endpoint for quality determinism. Billing is unaffected
+  // (Cline bills by model id, not by which provider served it), and the
+  // stream flag is untouched — a pinned request keeps the caller's own
+  // streaming preference.
+  const pin = applyProviderPin(body);
+  if (pin.pinned) body = pin.body;
   // Counted as the loop actually posts, so a request rejected before any
   // upstream call is on record as costing nothing.
   let upstreamCalls = 0;
@@ -254,8 +346,19 @@ export async function callUpstreamWithFailover(
   // limit that throttles a burst is per exit address, so the account id alone
   // cannot explain a 429 — this is what says which address said no.
   let usedExit: string | null = null;
+  // Request-side byte accounting for the persisted trail: the proxy bill is
+  // per byte, so "which exit carried how much" needs sizes, and the request
+  // body is the half we already hold. One serialization is cheap next to the
+  // upstream call it describes.
+  let reqBytes: number | undefined;
+  try {
+    reqBytes = Buffer.byteLength(JSON.stringify(body));
+  } catch {
+    reqBytes = undefined;
+  }
   const record = (status: number, accountId: string | null, error: string | null): void => {
     deps.requests?.record({
+      id: requestId,
       at: startedAt,
       model: options.model,
       stream: options.stream,
@@ -266,6 +369,7 @@ export async function callUpstreamWithFailover(
       error,
       clientIp: options.clientIp ?? null,
       upstreamCalls,
+      reqBytes,
     });
   };
 
@@ -521,6 +625,23 @@ export async function callUpstreamWithFailover(
           const canSwitch = proxySwitches < MAX_PROXY_SWITCHES;
           if (canSwitch) {
             proxySwitches += 1;
+            // Direct-first applies to the mid-request walk as well: the host
+            // address is the cheapest and cleanest hop, so the moment its
+            // cooldown has expired a request bouncing off proxies must return
+            // to it instead of walking further down the proxy tiers. (The
+            // request only started on a proxy because direct was cooling, and
+            // long streams routinely outlive that 60s window.)
+            if (limitedProxyId !== null && !wentDirect && !deps.proxyResolver?.directCooling()) {
+              wentDirect = true;
+              route = undefined;
+              deps.logger.warn("direct egress recovered mid-request: preferring it over proxies", {
+                accountId: account.id,
+                model: options.model,
+                from: deps.proxyResolver?.describeExit(limitedProxyId) ?? limitedProxyId,
+                attempt: proxySwitches,
+              });
+              continue;
+            }
             // After a direct 429 the direct address is cooling, so forRequest
             // hands back a proxy; after a proxy 429 it hands back a different
             // (or the same single) proxy. Either way the address changes.
@@ -601,7 +722,17 @@ export async function callUpstreamWithFailover(
         stream: options.stream,
       });
       record(200, account.id, null);
-      return { kind: "ok", response: upstream, accountId: account.id, recordUsage: recordUsage(account.id) };
+      // Count response bytes as they stream to the client, and emit the
+      // completion line for the persisted trail when the stream ends. The
+      // proxy bill is mostly response side (streamed completions dwarf the
+      // request), so this is the number that reconciles with the invoice.
+      const counted = countResponseBody(upstream, deps.requests, requestId);
+      return {
+        kind: "ok",
+        response: counted,
+        accountId: account.id,
+        recordUsage: recordUsage(account.id),
+      };
     }
   }
 

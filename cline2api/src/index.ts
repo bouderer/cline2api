@@ -10,7 +10,7 @@
  *   /healthz              liveness
  */
 import { serve } from "@hono/node-server";
-import { resolve } from "node:path";
+import path, { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Hono } from "hono";
 import { loadConfig, type AppConfig } from "./config.js";
@@ -32,6 +32,10 @@ import { extractApiKey, openaiError } from "./api/http.js";
 import { registerResponsesRoutes } from "./api/responses.js";
 import { registerAnthropicRoutes } from "./api/anthropic.js";
 import { registerAdminRoutes } from "./api/admin.js";
+import { AdminAuth, readGrokIqAdmin } from "./services/adminAuth.js";
+import { AdminSettings } from "./services/adminSettings.js";
+import { UsageLedger } from "./services/usageLedger.js";
+import { CapabilityIndex } from "./services/accountCapabilities.js";
 
 export function createApp(config: AppConfig = loadConfig()) {
   const logger = createLogger(config.logLevel, [
@@ -71,7 +75,12 @@ export function createApp(config: AppConfig = loadConfig()) {
     logger.info(`client API key generated: ${plaintext} (id ${record.id})`);
   }
 
-  const requests = new RequestLog();
+  const requests = new RequestLog(1000, {
+    dir: path.join(config.dataDir, "requestlog"),
+    retainDays: 30,
+    logger,
+  });
+  const usageLedger = new UsageLedger({ dataDir: config.dataDir, logger });
   const freeQuota = new FreeQuotaStore({ logger });
   const rateLimit = new RateLimiter({
     dataDir: config.dataDir,
@@ -83,6 +92,28 @@ export function createApp(config: AppConfig = loadConfig()) {
   });
 
   const sweep = new SweepRunner({ config, logger, store, tokens, pool, resolver, freeQuota });
+  const capabilities = new CapabilityIndex({ config, logger, store, tokens, resolver });
+  // Rebuild the index in the background on boot: the persisted file is only a
+  // warm cache (TTL-gated), and a fresh sweep both verifies it and fills any
+  // accounts the file has never read. Without this a restart leaves
+  // `cline-pass/*` falling through to a full pool walk until someone clicks
+  // rescan in the admin UI.
+  capabilities.sweep();
+
+  // Mutable so the settings page can rotate it without a restart. The logger
+  // redacts it, so a rotation must keep the redaction list current too.
+  let adminToken = config.adminToken;
+  const adminAuth = new AdminAuth({
+    loadCredential: () => (config.grokIqDbPath ? readGrokIqAdmin(config.grokIqDbPath) : null),
+  });
+  const adminSettings = new AdminSettings({
+    grokIqDbPath: config.grokIqDbPath,
+    envFilePath: config.envFilePath,
+    applyToken: (token) => {
+      adminToken = token;
+      logger.redact(token);
+    },
+  });
 
   const deps = {
     config,
@@ -97,8 +128,13 @@ export function createApp(config: AppConfig = loadConfig()) {
     proxyResolver: resolver,
     apiKeys,
     freeQuota,
+    usageLedger,
+    capabilities,
     rateLimit,
     sweep,
+    adminAuth,
+    adminSettings,
+    getAdminToken: () => adminToken,
   };
   const app = new Hono();
 
@@ -161,7 +197,7 @@ export function createApp(config: AppConfig = loadConfig()) {
     return c.json({ error: { message: "Internal gateway error", type: "server_error" } }, 500);
   });
 
-  return { app, config, logger, store, apiKeys };
+  return { app, config, logger, store, apiKeys, usageLedger, capabilities };
 }
 
 const entry = process.argv[1];

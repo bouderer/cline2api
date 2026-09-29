@@ -1259,3 +1259,101 @@ test("pre-probe marks a dead failover proxy before it is needed", () => {
     tick();
   });
 });
+
+test("sticky failover releases back to the cheaper tier once it recovers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-sticky-release-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("sticky");
+  const hot = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const metered = proxies.add({ url: "http://u:p@10.0.0.9:8080", priority: 1 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // Tier 0 cools off; sticky falls to the metered tier.
+  resolver.reportRateLimited(hot.id);
+  assert.equal(
+    resolver.forRequest("acct").proxyId,
+    metered.id,
+    "tier 1 absorbs traffic while every tier-0 proxy cools",
+  );
+
+  // The tier-0 cooldown expires. The very next request must fall back to
+  // tier 0 instead of holding the metered exit — holding it is what turns a
+  // one-minute blip into a day of paid residential traffic.
+  const cooling = (resolver as never as { cooling: Map<string, number> }).cooling;
+  cooling.set(hot.id, Date.now() - 1);
+  assert.equal(
+    resolver.forRequest("acct").proxyId,
+    hot.id,
+    "sticky must release the failover tier once a cheaper tier is ready",
+  );
+
+  // And it stays there: subsequent requests keep drawing tier 0.
+  for (let i = 0; i < 5; i++) {
+    assert.equal(resolver.forRequest("acct").proxyId, hot.id);
+  }
+});
+
+test("sticky hold survives while no cheaper tier is usable", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-sticky-hold-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("sticky");
+  const dead = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const metered = proxies.add({ url: "http://u:p@10.0.0.9:8080", priority: 1 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // Park the only tier-0 proxy (transport failure = out until probed clean).
+  resolver.reportTransportFailure(dead.id, "fetch failed");
+  assert.equal(resolver.forRequest("acct").proxyId, metered.id);
+
+  // With tier 0 still parked, the sticky hold on the metered proxy must
+  // persist — releasing it would only churn exits without anything cheaper
+  // to move to.
+  for (let i = 0; i < 5; i++) {
+    assert.equal(
+      resolver.forRequest("acct").proxyId,
+      metered.id,
+      "the hold must survive while no cheaper tier is usable",
+    );
+  }
+
+  // Once the operator probes tier 0 clean, the next request releases.
+  resolver.markHealthy(dead.id);
+  assert.equal(resolver.forRequest("acct").proxyId, dead.id);
+});
+
+test("direct-first: direct egress resumes the moment its cooldown expires", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cline-direct-first-"));
+  const logger = createLogger("error");
+  const proxies = new ProxyStore(dir, logger);
+  const store = new AccountStore(dir, logger);
+  proxies.setMode("sticky");
+  const hot = proxies.add({ url: "http://u:p@10.0.0.1:8080", priority: 0 });
+  const resolver = new ProxyResolver({ proxies, store, logger });
+
+  // Fresh resolver, direct not cooling: the route is direct (undefined).
+  assert.equal(
+    resolver.initialRoute("acct"),
+    undefined,
+    "with a clean direct address, requests must not touch any proxy",
+  );
+
+  // Direct gets refused: it cools, and routes fall to the proxy tier.
+  resolver.reportRateLimited(null);
+  const routed = resolver.initialRoute("acct");
+  assert.ok(routed, "while direct cools, a proxy must carry the request");
+  assert.equal(routed!.proxyId, hot.id);
+
+  // Direct recovers (cooldown expires): the very next request is direct
+  // again — it must not keep riding the proxy just because sticky holds one.
+  const coolingUntil = (resolver as never as { directCoolingUntil: number });
+  coolingUntil.directCoolingUntil = Date.now() - 1;
+  assert.equal(
+    resolver.initialRoute("acct"),
+    undefined,
+    "direct egress must resume immediately once its cooldown expires",
+  );
+});

@@ -47,7 +47,7 @@ export async function postChatCompletions(
       method: "POST",
       headers: buildUpstreamHeaders(config, context),
       body: JSON.stringify(body),
-      ...(context.signal ? { signal: context.signal } : { signal: AbortSignal.timeout(600_000) }),
+      ...(context.signal ? { signal: context.signal } : { signal: AbortSignal.timeout(config.upstreamHardTimeoutMs) }),
     },
     context.dispatcher,
   );

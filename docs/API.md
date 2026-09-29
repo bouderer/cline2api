@@ -45,7 +45,7 @@ Cline2API 是一个自托管反代网关：客户端只访问本网关，网关�
 +---------+---------+        +----------+-----------+        +----------+-----------+
           |                             |                               |
           | Authorization: Bearer       | x-api-key: <PROXY_KEY>        | Bearer ADMIN_TOKEN
-          | <PROXY_API_KEY>             | 或 Authorization: Bearer      | 或 ?token=<ADMIN_TOKEN>
+          | <PROXY_API_KEY>             | 或 Authorization: Bearer      | 或登录后的会话 Cookie
           v                             v                               v
 +------------------------------------------------------------------------------------------+
 |                              Cline2API (Hono, 默认 127.0.0.1:8787)                      |
@@ -267,11 +267,7 @@ Content-Type: application/json
 Authorization: Bearer <ADMIN_TOKEN>
 ```
 
-或：
-
-```text
-?token=<ADMIN_TOKEN>
-```
+`?token=` 查询参数已移除。控制台改为账号密码登录：`POST /admin/api/auth/login`，用户名和密码与 grok-iq 的管理员账号相同，成功后服务端下发 HttpOnly Cookie `cline2api_session`。刷新页面、切换路径、新开标签都带着这个 Cookie，不再需要在地址栏携带任何令牌。注册机和脚本继续使用上面的 Bearer 令牌，不需要登录。
 
 管理 API 鉴权失败返回：
 
@@ -887,17 +883,13 @@ Content-Type: application/json
 
 ## 6. 管理台 API
 
-管理台首页和管理 API 都使用 `ADMIN_TOKEN`。所有 `/admin/api/*` 请求都支持：
+管理 API 使用 `ADMIN_TOKEN`，以请求头携带：
 
 ```http
 Authorization: Bearer $ADMIN_TOKEN
 ```
 
-或：
-
-```text
-?token=$ADMIN_TOKEN
-```
+`?token=` 已移除。控制台用 grok-iq 的管理员账号密码登录，会话保存在 HttpOnly Cookie `cline2api_session` 中。
 
 如果未设置 `ADMIN_TOKEN`，仅 loopback 可访问。当前 loopback 判断为：
 
@@ -933,13 +925,13 @@ Admin UI is not exposed here. Set ADMIN_TOKEN or use localhost.
 |---|---|
 | 方法 | `GET` |
 | 路径 | `/` |
-| 鉴权 | `Authorization: Bearer <ADMIN_TOKEN>` 或 `?token=<ADMIN_TOKEN>`；未设置 token 时仅 loopback |
+| 鉴权 | `Authorization: Bearer <ADMIN_TOKEN>`；控制台用账号密码登录；未设置 token 且未登录时仅 loopback |
 | 请求体 | 无 |
 | 成功响应 | `text/html`，管理台页面 |
 | 失败响应 | 非授权访问时 `403 text/plain` |
 
 ```bash
-curl -L "http://127.0.0.1:8787/?token=$ADMIN_TOKEN" -o admin.html
+curl -L "http://127.0.0.1:8787/" -o admin.html
 ```
 
 成功响应：
@@ -991,7 +983,7 @@ curl http://127.0.0.1:8787/healthz
 | 方法 | `GET` |
 | 路径 | `/admin/api/status` |
 | 鉴权 | 管理令牌 |
-| 请求头 | `Authorization: Bearer <ADMIN_TOKEN>`，或使用 `?token=` |
+| 请求头 | `Authorization: Bearer <ADMIN_TOKEN>` |
 | 请求体 | 无 |
 
 ```bash
@@ -1369,7 +1361,7 @@ curl -X POST \
 |---|---|
 | 方法 | `POST` |
 | 路径 | `/admin/api/accounts/import` |
-| 鉴权 | `Authorization: Bearer <ADMIN_TOKEN>` 或 `?token=<ADMIN_TOKEN>` |
+| 鉴权 | `Authorization: Bearer <ADMIN_TOKEN>` |
 | 必需请求头 | `Content-Type: application/json` |
 | 请求体上限 | 2 MiB（2,097,152 bytes）；声明或实际 UTF-8 字节数超限返回 413 |
 | 条目上限 | `accounts` 最多 5000 条 |

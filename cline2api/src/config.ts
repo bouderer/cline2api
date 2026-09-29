@@ -21,6 +21,17 @@ export interface AppConfig {
   readonly proxyApiKeys: readonly string[];
   readonly adminToken: string | null;
   /**
+   * grok-iq's SQLite database, whose single admin row is the console login.
+   * Null when unset: the console then has no password login and falls back to
+   * `ADMIN_TOKEN` plus the loopback bypass.
+   */
+  readonly grokIqDbPath: string | null;
+  /**
+   * The `.env` file `ADMIN_TOKEN` is read from, so the settings page can
+   * rewrite it and have the new token survive a restart. Null disables that.
+   */
+  readonly envFilePath: string | null;
+  /**
    * Rate-limit defaults. The live values live in `data/ratelimit.json` and are
    * editable from the admin UI; these only seed a deployment that has no file
    * yet, so the limit is never absent just because nobody opened the console.
@@ -43,6 +54,25 @@ export interface AppConfig {
   /** WorkOS OAuth client id used by the official Cline environment. */
   readonly workOsClientId: string;
   readonly requestTimeoutMs: number;
+  /**
+   * How long a streaming response may go *silently* before the gateway gives
+   * up on upstream and closes the client's stream.
+   *
+   * This is deliberately not `requestTimeoutMs`: thinking models can reason for
+   * minutes before the first token without the connection being dead, so a
+   * wall-clock cap would cut healthy streams. An idle cap only fires when
+   * upstream has sent nothing at all for this long.
+   */
+  readonly streamIdleTimeoutMs: number;
+  /**
+   * Wall-clock ceiling on a single upstream request, streaming or not. Unlike
+   * `streamIdleTimeoutMs` this caps total time regardless of activity, so it
+   * only exists to reap a stream that is technically still alive but will never
+   * produce a usable answer. Thinking models on large contexts legitimately
+   * reason for many minutes, so this is set well above the idle timeout — it is
+   * a last-resort guard, not the thing that ends a normal long turn.
+   */
+  readonly upstreamHardTimeoutMs: number;
   /** Refresh this long before the access token expires (default 5 min). */
   readonly refreshBufferMs: number;
   /** Keep a still-valid token if a refresh fails transiently within this grace. */
@@ -105,6 +135,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataDir,
     proxyApiKeys: resolveProxyApiKeys(env),
     adminToken: readString(env, "ADMIN_TOKEN") ?? null,
+    grokIqDbPath: readString(env, "GROKIQ_DB_PATH") ?? null,
+    envFilePath: readString(env, "ENV_FILE") ?? null,
     rateLimitGlobalPerMinute: readInt(env, "RATE_LIMIT_GLOBAL_PER_MINUTE", 400),
     rateLimitKeyPerMinute: readInt(env, "RATE_LIMIT_KEY_PER_MINUTE", 200),
     freeLimitTokensPerModel: readInt(env, "FREE_LIMIT_TOKENS_PER_MODEL", 15_000_000),
@@ -118,6 +150,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       readString(env, "WORKOS_CLIENT_ID") ??
       "client_01K3A541FN8TA3EPPHTD2325AR",
     requestTimeoutMs: readInt(env, "REQUEST_TIMEOUT_MS", 30_000),
+    streamIdleTimeoutMs: readInt(env, "STREAM_IDLE_TIMEOUT_MS", 300_000),
+    upstreamHardTimeoutMs: readInt(env, "UPSTREAM_HARD_TIMEOUT_MS", 3_000_000),
     refreshBufferMs: readInt(env, "REFRESH_BUFFER_MS", 5 * 60 * 1000),
     retryableTokenGraceMs: readInt(env, "RETRYABLE_TOKEN_GRACE_MS", 30_000),
     clientName: readString(env, "CLINE_CLIENT_NAME") ?? "cline-sdk",

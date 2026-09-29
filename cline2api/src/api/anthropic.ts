@@ -11,7 +11,14 @@ import type { Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import { isAuthorized, recordKeyUse } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
-import { SSE_HEADERS, openaiError, readReasoning, sanitizeOpenAIMessages } from "./http.js";
+import { captureUsage, recordJsonUsage } from "../services/usageCapture.js";
+import {
+  SSE_HEADERS,
+  clientAddress,
+  openaiError,
+  readReasoning,
+  sanitizeOpenAIMessages,
+} from "./http.js";
 
 interface TextBlock { type: "text"; text: string }
 interface ImageBlock {
@@ -515,21 +522,23 @@ export function registerAnthropicRoutes(app: Hono, deps: OpenAIRouteDeps): void 
     const outcome = await callUpstreamWithFailover(deps, openaiBody, {
       taskId: randomUUID(),
       model: body.model,
+    clientIp: clientAddress(c),
       stream: wantsStream,
       ...(c.req.raw.signal ? { signal: c.req.raw.signal } : {}),
     });
     if (outcome.kind === "error") return outcome.response;
     recordKeyUse(deps, c, body.model);
 
-    const { response: upstream, accountId } = outcome;
+    const { response: upstream, accountId, recordUsage } = outcome;
     if (wantsStream && upstream.body) {
-      return new Response(translateStreamToAnthropic(upstream.body, body.model), {
+      return new Response(translateStreamToAnthropic(captureUsage(upstream.body, recordUsage), body.model), {
         status: 200,
         headers: { ...SSE_HEADERS, "x-account": accountId },
       });
     }
 
     const raw = await upstream.text();
+    recordJsonUsage(raw, recordUsage);
     let completion: OpenAICompletion;
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;

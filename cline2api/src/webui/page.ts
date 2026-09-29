@@ -1299,6 +1299,11 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
           <p>最近 200 条请求，只存在内存，重启即清空。</p>
         </div>
         <div class="actions">
+          <select id="logSource" class="sm" style="width:auto">
+            <option value="persisted:1000">磁盘·近1000条</option>
+            <option value="persisted:5000">磁盘·近5000条</option>
+            <option value="memory:200">内存·实时(≤200)</option>
+          </select>
           <label class="switch"><input type="checkbox" id="logAuto" checked /> 自动刷新</label>
           <button class="btn" id="logReload">刷新</button>
         </div>
@@ -1308,6 +1313,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
         <div class="stat"><div class="k">本次启动请求</div><div class="v num" id="logTotal">—</div></div>
         <div class="stat"><div class="k">最近 5 分钟</div><div class="v num" id="logRecent">—</div></div>
         <div class="stat"><div class="k">失败</div><div class="v num err" id="logFailed">—</div></div>
+        <div class="stat"><div class="k">当前显示</div><div class="v num" id="logShown">—</div></div>
       </div>
 
       <div class="row" style="margin-top:14px">
@@ -1321,8 +1327,8 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
       <div class="card" style="margin-top:14px">
         <div class="table-wrap">
           <table>
-            <thead><tr><th class="nowrap">时间</th><th>模型</th><th class="nowrap" style="width:70px">状态</th><th class="nowrap" style="width:90px">耗时</th><th class="nowrap" style="width:120px">来源 IP</th><th class="nowrap" style="width:120px">出口 IP</th><th class="nowrap" style="width:70px">上游调用</th><th>账号 / 错误</th></tr></thead>
-            <tbody id="logsBody"><tr><td colspan="8" class="empty sm">加载中…</td></tr></tbody>
+            <thead><tr><th class="nowrap">时间</th><th>模型</th><th class="nowrap" style="width:70px">状态</th><th class="nowrap" style="width:90px">耗时</th><th class="nowrap" style="width:90px">响应大小</th><th class="nowrap" style="width:120px">来源 IP</th><th class="nowrap" style="width:120px">出口 IP</th><th class="nowrap" style="width:70px">上游调用</th><th>账号 / 错误</th></tr></thead>
+            <tbody id="logsBody"><tr><td colspan="9" class="empty sm">加载中…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1609,6 +1615,15 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
     if (v >= 1e3) return (v / 1e3).toFixed(1) + "K";
     return String(v);
+  }
+  /** Byte sizes for the request log's response-size column. */
+  function fmtBytes(n) {
+    if (n === null || n === undefined) return "—";
+    var v = Number(n) || 0;
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + " GB";
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + " MB";
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + " KB";
+    return v + " B";
   }
   function fmtUsd(micro) {
     if (micro === null || micro === undefined) return "—";
@@ -5423,18 +5438,23 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
   /* ---------- logs ---------- */
   function loadLogs() {
-    api("/admin/api/requests?limit=100").then(function (data) {
+    var sel = ($("logSource") && $("logSource").value) || "persisted:1000";
+    var parts = sel.split(":");
+    var url = "/admin/api/requests?limit=" + (parts[1] || "1000") +
+      (parts[0] === "persisted" ? "&source=persisted" : "");
+    api(url).then(function (data) {
       logData = data.entries;
       $("logTotal").textContent = data.stats.total;
       $("logRecent").textContent = data.stats.last5Minutes;
       $("logFailed").textContent = data.stats.failed;
+      if ($("logShown")) $("logShown").textContent = data.entries.length;
       renderLogs();
     }).catch(function (e) {
       var body = $("logsBody");
       clear(body);
       var tr = el("tr");
       var td = el("td", "empty err sm", "日志读取失败：" + e.message);
-      td.colSpan = 8;
+      td.colSpan = 9;
       tr.appendChild(td);
       body.appendChild(tr);
     });
@@ -5450,7 +5470,7 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
     if (!rows.length) {
       var tr = el("tr");
       var td = el("td", "empty sm", logData.length ? "当前筛选下没有记录。" : "还没有请求记录。");
-      td.colSpan = 7;
+      td.colSpan = 9;
       tr.appendChild(td);
       body.appendChild(tr);
       return;
@@ -5474,6 +5494,12 @@ export const ADMIN_PAGE = String.raw`<!doctype html>
 
       var td4 = el("td", "nowrap sm num", e.durationMs + " ms");
       tr.appendChild(td4);
+
+      // Response size, known only for persisted entries (it is reported when
+      // the stream ends). The proxy bill is mostly this side, so it is the
+      // column that reconciles an invoice; a dash means "not recorded".
+      var rb = typeof e.respBytes === "number" ? fmtBytes(e.respBytes) : "—";
+      tr.appendChild(el("td", "nowrap sm num" + (typeof e.respBytes === "number" ? "" : " faint"), rb));
 
       var tdIp = el("td", "nowrap sm mono", e.clientIp || "—");
       tr.appendChild(tdIp);

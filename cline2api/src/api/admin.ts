@@ -1450,6 +1450,17 @@ app.get("/admin/api/accounts", (c) => {
       ? all
       : all.filter((proxy) =>
           `${proxy.label ?? ""} ${proxy.url} ${proxy.exitIp ?? ""}`.toLowerCase().includes(query));
+    // Priority-first ordering: the operator's own tier-0 entries lead, the
+    // metered failover pool sorts to the back, and within a tier enabled rows
+    // come before disabled ones (a wall of disabled pool entries should not
+    // bury the live proxies). Stable tiebreak on createdAt keeps the order
+    // from shuffling between page loads.
+    filtered.sort(
+      (a, b) =>
+        a.priority - b.priority ||
+        Number(b.enabled) - Number(a.enabled) ||
+        a.createdAt - b.createdAt,
+    );
     const total = filtered.length;
     const hasWindow = Number.isFinite(limitRaw) && limitRaw > 0;
     const limit = hasWindow ? Math.min(Math.floor(limitRaw), 500) : total;
@@ -1785,8 +1796,14 @@ app.get("/admin/api/accounts", (c) => {
     if (denied) return denied;
     if (!deps.requests) return c.json({ entries: [], stats: { total: 0, ok: 0, failed: 0, last5Minutes: 0 } });
     const requested = Number.parseInt(c.req.query("limit") ?? "100", 10);
-    const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 200) : 100;
-    return c.json({ entries: deps.requests.list(limit), stats: deps.requests.stats() });
+    // `source=persisted` reads the on-disk JSONL trail instead of the in-memory
+    // ring, which caps at the constructor limit (1000). The cap here is what
+    // keeps one response from loading a whole day's file; the UI pages within it.
+    const persisted = c.req.query("source") === "persisted";
+    const cap = persisted ? 5000 : 200;
+    const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, cap) : 100;
+    const entries = persisted ? deps.requests.listPersisted(limit) : deps.requests.list(limit);
+    return c.json({ entries, stats: deps.requests.stats(), source: persisted ? "persisted" : "memory" });
   });
 
   /**

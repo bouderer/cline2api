@@ -17,7 +17,15 @@ import type { Hono } from "hono";
 import type { OpenAIRouteDeps } from "./openai.js";
 import { isAuthorized, recordKeyUse, unwrapEnvelope } from "./openai.js";
 import { callUpstreamWithFailover } from "../services/proxyChat.js";
-import { SSE_HEADERS, openaiError, readReasoning, sanitizeOpenAIMessages } from "./http.js";
+import { captureUsage, recordJsonUsage } from "../services/usageCapture.js";
+import {
+  SSE_HEADERS,
+  idleWatchdog,
+  openaiError,
+  readReasoning,
+  sanitizeOpenAIMessages,
+  clientAddress,
+} from "./http.js";
 
 /* ------------------------------------------------------------------- types */
 
@@ -235,6 +243,21 @@ export function responsesToOpenAI(body: ResponsesRequest): Json {
   if (typeof body.temperature === "number") out.temperature = body.temperature;
   if (typeof body.top_p === "number") out.top_p = body.top_p;
 
+  // Thinking effort: Responses clients send `reasoning.effort`, chat-completions
+  // upstreams read `reasoning_effort`. Dropping it left reasoning models on the
+  // gateway's default budget — a long thinking stream resets the idle watchdog
+  // forever, so an over-eager model could occupy a request until the hard
+  // upstream timeout with no answer at all. Passing the knob through is what
+  // lets a client actually dial thinking down.
+  const reasoning = isObject(body.reasoning) ? body.reasoning : undefined;
+  const effort =
+    typeof reasoning?.effort === "string"
+      ? reasoning.effort
+      : typeof body.reasoning_effort === "string"
+        ? body.reasoning_effort
+        : undefined;
+  if (effort !== undefined) out.reasoning_effort = effort;
+
   const tools = toChatTools(body.tools);
   if (tools.length > 0) out.tools = tools;
   const toolChoice = toChatToolChoice(body.tool_choice);
@@ -395,9 +418,19 @@ function sse(event: string, data: Json): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-/** Split an upstream SSE body into individual `data:` payloads. */
-async function* iterateSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+/**
+ * Split an upstream SSE body into individual `data:` payloads.
+ *
+ * `onReader` hands the caller the reader it holds, which is the only handle
+ * that can detach a stream mid-read: `body.cancel()` rejects while a reader
+ * owns the stream, so a client disconnect has to cancel through this one.
+ */
+async function* iterateSSE(
+  body: ReadableStream<Uint8Array>,
+  onReader?: (reader: ReadableStreamDefaultReader<Uint8Array>) => void,
+): AsyncGenerator<string> {
   const reader = body.getReader();
+  onReader?.(reader);
   const decoder = new TextDecoder();
   let buffer = "";
   try {
@@ -433,8 +466,10 @@ export function translateStreamToResponses(
   body: ReadableStream<Uint8Array>,
   model: string,
   request?: ResponsesRequest,
+  options: { idleTimeoutMs?: number } = {},
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
+  const idleMs = options.idleTimeoutMs ?? 0;
   const responseId = newId("resp");
   const createdAt = Math.floor(Date.now() / 1000);
   const output: Json[] = [];
@@ -453,11 +488,30 @@ export function translateStreamToResponses(
   let cachedTokens = 0;
   let reasoningTokens = 0;
   let status: "completed" | "incomplete" = "completed";
+  /** Set by cancel(): the client left, so a bare close is not a failure. */
+  let clientGone = false;
+  /** Set once response.failed has been emitted; blocks the completed envelope. */
+  let terminated = false;
+  /** Upstream's active reader, published by iterateSSE so cancel() can use it. */
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const write = (event: string, data: Json): void => {
         controller.enqueue(encoder.encode(sse(event, { type: event, sequence_number: sequence++, ...data })));
+      };
+      /** Safety net for a failure thrown while writing the guard's own error. */
+      const writeFailure = (code: string, message: string): void => {
+        // Recorded even when the write itself fails: either way this response
+        // did not finish, so the completion envelope must not follow.
+        terminated = true;
+        try {
+          write("response.failed", {
+            response: { ...envelope("incomplete"), status: "failed", error: { code, message } },
+          });
+        } catch {
+          // Controller already closed.
+        }
       };
       const envelope = (state: "in_progress" | "completed" | "incomplete"): Json =>
         responseEnvelope({
@@ -549,115 +603,184 @@ export function translateStreamToResponses(
         return index;
       };
 
-      try {
-        for await (const line of iterateSSE(body)) {
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (payload.length === 0 || payload === "[DONE]") continue;
+      // A silent upstream is failed explicitly rather than left to hang: an
+      // answer that never arrives is indistinguishable from a dead connection
+      // on the client's side, and the terminal event is what tells them apart.
+      const idle = idleWatchdog(idleMs);
+      // Armed here, not only after a line arrives. The gap *before* the first
+      // line is exactly what this timeout exists for, and arming later left the
+      // first race pending on a promise that never settled -- so an upstream
+      // that accepted the request and then went silent held the response open
+      // until the client gave up, at any configured timeout.
+      if (idleMs > 0) idle.arm();
 
-          let chunk: OpenAICompletion & { choices?: Array<OpenAIChoice & { delta?: Json }> };
-          try {
-            chunk = JSON.parse(payload) as typeof chunk;
-          } catch {
-            continue;
-          }
-          if (chunk.usage) {
-            // Last-write-wins per field, and only for fields actually present:
-            // a trailing chunk carrying just the totals must not wipe out the
-            // cache/reasoning breakdown an earlier one already reported.
-            promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
-            completionTokens = chunk.usage.completion_tokens ?? completionTokens;
-            cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
-            reasoningTokens =
-              chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
-          }
-          const choice = chunk.choices?.[0];
-          if (!choice) continue;
-          if (choice.finish_reason === "length") status = "incomplete";
-
-          const delta = (choice as { delta?: Json }).delta ?? {};
-          const reasoning = readReasoning(delta);
-          if (reasoning !== null) {
-            if (openKind !== "reasoning") {
-              closeItem();
-              open("reasoning", { type: "reasoning", id: newId("rs"), summary: [] });
-            }
-            openText += reasoning;
-            write("response.reasoning_summary_text.delta", {
-              item_id: openItem?.id,
-              output_index: openIndex,
-              summary_index: 0,
-              delta: reasoning,
-            });
-          }
-
-          const content = delta.content;
-          if (typeof content === "string" && content.length > 0) {
-            if (openKind !== "message") {
-              closeItem();
-              open("message", { type: "message", id: newId("msg"), status: "in_progress", role: "assistant", content: [] });
-            }
-            openText += content;
-            write("response.output_text.delta", {
-              item_id: openItem?.id,
-              output_index: openIndex,
-              content_index: 0,
-              delta: content,
-            });
-          }
-
-          const toolCalls = delta.tool_calls;
-          if (Array.isArray(toolCalls)) {
-            for (const raw of toolCalls as Json[]) {
-              const toolIndex = typeof raw.index === "number" ? raw.index : 0;
-              const fn = isObject(raw.function) ? raw.function : {};
-              let index = toolItems.get(toolIndex);
-              if (index === undefined) {
-                closeItem();
-                index = open("function_call", {
-                  type: "function_call",
-                  id: newId("fc"),
-                  call_id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : newId("call"),
-                  name: typeof fn.name === "string" ? fn.name : "unknown_tool",
-                  arguments: "",
-                  status: "in_progress",
-                });
-                toolItems.set(toolIndex, index);
-              }
-              const args = fn.arguments;
-              if (typeof args === "string" && args.length > 0) {
-                openArgs += args;
-                write("response.function_call_arguments.delta", {
-                  item_id: openItem?.id,
-                  output_index: index,
-                  delta: args,
-                });
-              }
-            }
-          }
-        }
-
-        closeItem();
-        if (!created) {
-          // Upstream produced nothing at all: still answer with a well-formed
-          // envelope so a Responses client sees an empty turn, not a broken stream.
-          created = true;
-          write("response.created", { response: envelope("in_progress") });
-          write("response.in_progress", { response: envelope("in_progress") });
-        }
-        write("response.completed", { response: envelope(status) });
-        controller.close();
-      } catch (error) {
+      /**
+       * Translate one upstream `data:` payload. Split out from the read loop so
+       * that loop stays a plain "get a line, hand it over" with the idle and
+       * teardown handling clearly separate from the dialect conversion.
+       */
+      const consume = (payload: string): void => {
+        let chunk: OpenAICompletion & { choices?: Array<OpenAIChoice & { delta?: Json }> };
         try {
-          const message = (error as Error).message;
-          write("response.failed", {
-            response: { ...envelope("incomplete"), status: "failed", error: { code: "stream_error", message } },
-          });
+          chunk = JSON.parse(payload) as typeof chunk;
         } catch {
-          // controller already closed
+          return;
         }
+        if (chunk.usage) {
+          // Last-write-wins per field, and only for fields actually present:
+          // a trailing chunk carrying just the totals must not wipe out the
+          // cache/reasoning breakdown an earlier one already reported.
+          promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
+          completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+          cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+          reasoningTokens =
+            chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
+        }
+        const choice = chunk.choices?.[0];
+        if (!choice) return;
+        if (choice.finish_reason === "length") status = "incomplete";
+
+        const delta = (choice as { delta?: Json }).delta ?? {};
+        const reasoning = readReasoning(delta);
+        if (reasoning !== null) {
+          if (openKind !== "reasoning") {
+            open("reasoning", { type: "reasoning", id: newId("rs"), summary: [] });
+          }
+          openText += reasoning;
+          write("response.reasoning_summary_text.delta", {
+            item_id: openItem?.id,
+            output_index: openIndex,
+            summary_index: 0,
+            delta: reasoning,
+          });
+        }
+
+        const content = delta.content;
+        if (typeof content === "string" && content.length > 0) {
+          if (openKind !== "message") {
+            closeItem();
+            open("message", { type: "message", id: newId("msg"), status: "in_progress", role: "assistant", content: [] });
+          }
+          openText += content;
+          write("response.output_text.delta", {
+            item_id: openItem?.id,
+            output_index: openIndex,
+            content_index: 0,
+            delta: content,
+          });
+        }
+
+        const toolCalls = delta.tool_calls;
+        if (!Array.isArray(toolCalls)) return;
+        for (const raw of toolCalls as Json[]) {
+          const toolIndex = typeof raw.index === "number" ? raw.index : 0;
+          const fn = isObject(raw.function) ? raw.function : {};
+          let index = toolItems.get(toolIndex);
+          if (index === undefined) {
+            closeItem();
+            index = open("function_call", {
+              type: "function_call",
+              id: newId("fc"),
+              call_id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : newId("call"),
+              name: typeof fn.name === "string" ? fn.name : "unknown_tool",
+              arguments: "",
+              status: "in_progress",
+            });
+            toolItems.set(toolIndex, index);
+          }
+          const args = fn.arguments;
+          if (typeof args === "string" && args.length > 0) {
+            openArgs += args;
+            write("response.function_call_arguments.delta", {
+              item_id: openItem?.id,
+              output_index: index,
+              delta: args,
+            });
+          }
+        }
+      };
+
+      /**
+       * Read upstream and translate, stopping early on an idle timeout. Kept in
+       * its own async function so the generator's `finally` — which detaches
+       * upstream — runs before the completion events are written below.
+       */
+      const pump = async (): Promise<void> => {
+        const iterator = iterateSSE(body, (reader) => {
+          upstreamReader = reader;
+        })[Symbol.asyncIterator]();
+        try {
+          for (;;) {
+            const step = await Promise.race([iterator.next(), idle.signal]);
+            if (step === "idle") {
+              writeFailure("upstream_timeout", `Upstream sent nothing for ${Math.round(idleMs / 1000)}s.`);
+              return;
+            }
+            if (step === "stop" || step.done) return;
+            // Any upstream line counts as activity, including one this
+            // translator ignores: the timeout is about the connection, not the
+            // content.
+            idle.arm();
+            if (step.value.startsWith("data:")) consume(step.value.slice(5).trim());
+          }
+        } finally {
+          // Detach upstream *before* closing the generator. A generator
+          // suspended on a pending `read()` cannot be closed by `return()` —
+          // the request is queued until that read settles — so awaiting it
+          // first would deadlock on exactly the case this timeout exists for.
+          // Cancelling the reader settles the read, and the generator unwinds
+          // on its own.
+          try {
+            await upstreamReader?.cancel(undefined);
+          } catch {
+            // Already cancelled, or released.
+          }
+          try {
+            await iterator.return(undefined);
+          } catch {
+            // Already closed by a client-driven cancel.
+          }
+        }
+      };
+
+      try {
+        await pump();
+      } catch (error) {
+        if (!clientGone) writeFailure("stream_error", (error as Error).message);
         controller.close();
+        return;
       }
+
+      closeItem();
+      // A failed response is terminal: `response.completed` after it would
+      // claim success for an answer that is already known to be broken.
+      if (terminated) {
+        controller.close();
+        return;
+      }
+      if (!created) {
+        // Upstream produced nothing at all: still answer with a well-formed
+        // envelope so a Responses client sees an empty turn, not a broken stream.
+        created = true;
+        write("response.created", { response: envelope("in_progress") });
+        write("response.in_progress", { response: envelope("in_progress") });
+      }
+      write("response.completed", { response: envelope(status) });
+      // A Responses stream must end with data: [DONE]; without it a strict SSE
+      // client (Codex CLI) reports "stream disconnected before completion".
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+    cancel(reason) {
+      // Set before anything else, so the teardown that follows is not reported
+      // as an upstream failure. The client left; that is not an answer.
+      clientGone = true;
+      // Cancel through the reader the generator holds: `body.cancel()` rejects
+      // while the stream is locked, and cancelling the reader is what detaches
+      // upstream anyway. No reader yet (still connecting) falls back to the body.
+      const reader = upstreamReader;
+      if (reader) void reader.cancel(reason).catch(() => undefined);
+      else void body.cancel(reason).catch(() => undefined);
     },
   });
 }
@@ -701,21 +824,28 @@ export function registerResponsesRoutes(app: Hono, deps: OpenAIRouteDeps): void 
     const outcome = await callUpstreamWithFailover(deps, upstreamBody, {
       taskId: randomUUID(),
       model: body.model,
+    clientIp: clientAddress(c),
       stream: wantsStream,
       ...(c.req.raw.signal ? { signal: c.req.raw.signal } : {}),
     });
     if (outcome.kind === "error") return outcome.response;
     recordKeyUse(deps, c, body.model);
 
-    const { response: upstream, accountId } = outcome;
+    const { response: upstream, accountId, recordUsage } = outcome;
     if (wantsStream && upstream.body) {
-      return new Response(translateStreamToResponses(upstream.body, body.model, body), {
-        status: 200,
-        headers: { ...SSE_HEADERS, "x-account": accountId },
-      });
+      return new Response(
+        translateStreamToResponses(captureUsage(upstream.body, recordUsage), body.model, body, {
+          idleTimeoutMs: deps.config.streamIdleTimeoutMs,
+        }),
+        {
+          status: 200,
+          headers: { ...SSE_HEADERS, "x-account": accountId },
+        },
+      );
     }
 
     const raw = await upstream.text();
+    recordJsonUsage(raw, recordUsage);
     let completion: OpenAICompletion;
     try {
       completion = unwrapEnvelope(JSON.parse(raw)) as OpenAICompletion;

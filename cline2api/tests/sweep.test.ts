@@ -113,8 +113,18 @@ function makeRunner(
     tokens,
     pool,
     // No proxies in these tests; the resolver is only consulted for an account
-    // that has a proxy assigned, which none of them do.
-    resolver: { forAccount: () => undefined } as unknown as ProxyResolver,
+    // that has a proxy assigned, which none of them do. Every method the
+    // request path touches is stubbed: initialRoute picks the route,
+    // describeExit/report* annotate the request log and failure handling.
+    resolver: {
+      forAccount: () => undefined,
+      forRequest: () => undefined,
+      initialRoute: () => undefined,
+      describeExit: () => "direct",
+      directCooling: () => false,
+      reportRateLimited: () => undefined,
+      reportTransportFailure: () => undefined,
+    } as unknown as ProxyResolver,
     freeQuota: new FreeQuotaStore({ logger }),
   });
 }

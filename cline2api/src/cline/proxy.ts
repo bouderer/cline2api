@@ -39,6 +39,30 @@ export interface ProxyRoute {
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
 
 /**
+ * How long a transport failure parks an exit, by tier.
+ *
+ * Tier 1 is the rotating residential pool: its exit IP changes every couple
+ * of hours, so the same URL that just failed may be a fresh healthy exit in
+ * minutes. Tier 0 is a stable named proxy: a failure there more likely means
+ * the hop itself is down, so it parks ~6x longer — but not forever. A parked
+ * tier-0 exit that never returns silently shrinks the cheap tier and pushes
+ * traffic onto the metered pool, which is exactly the cost spiral the tiers
+ * exist to prevent.
+ */
+const TIER1_PARK_MS = 5 * 60_000;
+const TIER0_PARK_MS = 30 * 60_000;
+
+/**
+ * Minimum spacing between background pre-probes of the same proxy.
+ *
+ * Pre-probing keeps the failover tier warm, but without a floor every sticky
+ * release re-probes the entire next tier — and each probe is a session on a
+ * metered residential pool. One probe per proxy per 10 minutes keeps the tier
+ * measured without turning churn into spend.
+ */
+const PREPROBE_MIN_INTERVAL_MS = 10 * 60_000;
+
+/**
  * Hard stop on consecutive switches, per request.
  *
  * If every proxy in the pool is being refused, walking all of them on one
@@ -55,6 +79,9 @@ export const MAX_PROXY_SWITCHES = 3;
 
 export class ProxyResolver {
   private readonly agents = new Map<string, { url: string; agent: Dispatcher }>();
+
+  /** Last background pre-probe per proxy, for the PREPROBE_MIN_INTERVAL floor. */
+  private readonly lastProbeAt = new Map<string, number>();
 
   /** Probes running in the background, keyed by proxy id. */
   private readonly probing = new Map<string, Promise<void>>();
@@ -119,6 +146,7 @@ export class ProxyResolver {
   private probe(proxy: { id: string; url: string; priority: number }): Promise<void> {
     const existing = this.probing.get(proxy.id);
     if (existing) return existing;
+    this.lastProbeAt.set(proxy.id, Date.now());
     const task = (async () => {
       const { probeProxyExit } = await import("../services/proxyExit.js");
       // A short timeout for the pre-warm: this is background work, not the
@@ -134,9 +162,29 @@ export class ProxyResolver {
           lastError: null,
         });
       } else {
-        const until = proxy.priority > 0 ? Date.now() + 5 * 60_000 : Number.MAX_SAFE_INTEGER;
+        // Probe failed: park on the same finite tier schedule as a transport
+        // failure and schedule the next attempt, so a hop that is transiently
+        // down returns on its own instead of waiting for an operator. The old
+        // behavior parked tier 0 here "until probed clean" — but this branch
+        // IS the probe, so a single failed attempt (a 3s timeout during a
+        // network blip) parked the exit for the rest of the process's life,
+        // permanently shrinking the cheap tier and pushing traffic onto the
+        // metered pool.
+        if (!this.deps.proxies.get(proxy.id)) {
+          // Deleted from the store mid-probe: stop the retry chain.
+          this.probing.delete(proxy.id);
+          return;
+        }
+        const until = proxy.priority > 0
+          ? Date.now() + TIER1_PARK_MS
+          : Date.now() + TIER0_PARK_MS;
         this.unhealthy.set(proxy.id, until);
         this.deps.proxies.update(proxy.id, { lastError: result.error });
+        const retry = setTimeout(() => {
+          const current = this.deps.proxies.get(proxy.id);
+          if (current && current.enabled) void this.probe(current);
+        }, until - Date.now());
+        retry.unref?.();
       }
       this.probing.delete(proxy.id);
     })();
@@ -241,6 +289,11 @@ export class ProxyResolver {
       const nextTier = minPriority + 1;
       usable
         .filter((proxy) => proxy.priority === nextTier)
+        // Throttled: without this floor, every sticky release re-probes the
+        // whole next tier, and on a metered residential pool each probe is a
+        // paid session. The healing probe scheduled by reportTransportFailure
+        // is separate and not subject to this floor.
+        .filter((proxy) => now - (this.lastProbeAt.get(proxy.id) ?? 0) >= PREPROBE_MIN_INTERVAL_MS)
         .forEach((proxy) => void this.probe(proxy));
       return chosen;
     }
@@ -270,14 +323,49 @@ export class ProxyResolver {
     return this.buildAgent(proxy.id, proxy.url);
   }
 
+  /**
+   * True when some enabled proxy in a cheaper tier (lower priority number) is
+   * currently usable: not cooling from a 429 and not parked by a transport
+   * failure. Used to decide whether a sticky hold on a failover tier should be
+   * released.
+   */
+  private cheaperTierReady(held: StoredProxy, now: number): boolean {
+    let list: StoredProxy[];
+    try {
+      list = this.deps.proxies.list();
+    } catch {
+      return false;
+    }
+    return list.some(
+      (proxy) =>
+        proxy.enabled &&
+        proxy.id !== held.id &&
+        proxy.priority < held.priority &&
+        (this.cooling.get(proxy.id) ?? 0) <= now &&
+        (this.unhealthy.get(proxy.id) ?? 0) <= now,
+    );
+  }
+
   /** The sticky pick, replacing it when it is gone, disabled or cooling off. */
   private stickyProxy(): StoredProxy | undefined {
     const now = Date.now();
     if (this.sticky) {
       const current = this.deps.proxies.get(this.sticky.proxyId);
       const spent = (this.cooling.get(this.sticky.proxyId) ?? 0) > now;
-      if (current && current.enabled && !spent && current.url === this.sticky.url) return current;
-      // The held entry was removed, disabled, or edited to a new address.
+      if (current && current.enabled && !spent && current.url === this.sticky.url) {
+        // Do not hold a failover tier once a cheaper tier has recovered.
+        // Sticky exists to keep one exit address stable across requests, but
+        // a hold placed while tier 0 was briefly cooling must not pin traffic
+        // to the (metered) residential pool for the rest of the day: that
+        // turns a seconds-long tier-0 blip into GBs of paid proxy traffic.
+        if (!this.cheaperTierReady(current, now)) return current;
+        this.deps.logger.info("cheaper proxy tier recovered, releasing sticky failover", {
+          releasing: this.describeExit(current.id),
+          releasingPriority: current.priority,
+        });
+      }
+      // The held entry was removed, disabled, edited to a new address, or is a
+      // failover-tier hold that a recovered cheaper tier has superseded.
       this.sticky = null;
     }
     const pool = this.candidates();
@@ -413,16 +501,32 @@ export class ProxyResolver {
     if (!proxyId) return;
     const proxy = this.deps.proxies.get(proxyId);
     const tier = proxy?.priority ?? 0;
-    // Tier 1 gets 5 minutes; tier 0 stays until probed. The exact number is a
-    // guess at the pool's rotation cadence, not a measurement.
-    const until = tier > 0 ? Date.now() + 5 * 60_000 : Number.MAX_SAFE_INTEGER;
+    // Both tiers park for a finite window and heal by re-probe. Tier 0 used to
+    // park "until an operator probes it clean", but a single transient blip
+    // then silently shrank the cheap tier for the rest of the process's life
+    // (observed live: one timeout at 17:15 left tier 0 at 2 of 3 until a
+    // restart), which pushes traffic toward the metered pool. Park tier 0
+    // longer than the rotating pool — a named exit is less likely to heal on
+    // its own — but never forever: on release, re-probe before serving.
+    const until = tier > 0
+      ? Date.now() + TIER1_PARK_MS
+      : Date.now() + TIER0_PARK_MS;
     this.unhealthy.set(proxyId, until);
     if (this.sticky?.proxyId === proxyId) this.sticky = null;
     this.deps.logger.warn("proxy transport failure, parking exit", {
       exit: this.describeExit(proxyId),
       error: error.slice(0, 120),
-      retryInMs: until === Number.MAX_SAFE_INTEGER ? "until probed" : 5 * 60_000,
+      tier,
+      retryInMs: until - Date.now(),
     });
+    // Schedule the healing probe at the end of the park window so a recovered
+    // hop re-enters rotation on its own: success clears `unhealthy` and
+    // refreshes the exit IP; failure re-parks via probe()'s own handling.
+    const delay = until - Date.now();
+    const timer = setTimeout(() => {
+      void this.probe({ id: proxyId, url: proxy?.url ?? "", priority: tier });
+    }, delay);
+    timer.unref?.();
   }
 
   /** Clear the parked state after a successful probe. */
